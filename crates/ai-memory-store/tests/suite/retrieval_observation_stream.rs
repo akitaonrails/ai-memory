@@ -800,3 +800,226 @@ async fn the_rowid_span_probe_seeks_the_rowid_ordered_index_and_matches_the_aggr
         "a project with no observations has no span"
     );
 }
+
+#[test]
+fn page_filter_can_match_session_pages() {
+    assert!(PageFilter::default().can_match_session_pages());
+    for matching in ["", "s", "sessions", "sessions/", "sessions/abc"] {
+        let filter = PageFilter {
+            path_prefix: Some(matching),
+            ..PageFilter::default()
+        };
+        assert!(
+            filter.can_match_session_pages(),
+            "prefix {matching:?} should be able to match session pages"
+        );
+    }
+    for disjoint in ["decisions/", "notes/", "sessions-archive/", "Sessions/"] {
+        let filter = PageFilter {
+            path_prefix: Some(disjoint),
+            ..PageFilter::default()
+        };
+        assert!(
+            !filter.can_match_session_pages(),
+            "prefix {disjoint:?} cannot match session pages"
+        );
+    }
+    // Metadata-only filters are resolved by the indexed pre-flight check, not
+    // statically rejected, because frontmatter on a session page can override
+    // kind, tier, or tags.
+    assert!(
+        PageFilter {
+            kind: Some("decision"),
+            tier: Some("semantic"),
+            tag: Some("non-session"),
+            path_prefix: None,
+        }
+        .can_match_session_pages()
+    );
+}
+
+#[tokio::test]
+async fn filtered_path_prefix_skips_observation_stream_and_returns_decision_hits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let sid = session(&store, ws, proj).await;
+    session_page(&store, ws, proj, sid, "session summary").await;
+    observe(&store, ws, proj, sid, "zircon rollout decision in session").await;
+    let mut decision = page(
+        ws,
+        proj,
+        "decisions/zircon.md",
+        "We chose the zircon rollout plan.",
+    );
+    decision.tier = Tier::Semantic;
+    store.writer.upsert_page(decision).await.unwrap();
+
+    let decisions_filter = PageFilter {
+        path_prefix: Some("decisions/"),
+        ..PageFilter::default()
+    };
+    assert!(
+        !store
+            .reader
+            .active_streams(false, decisions_filter)
+            .contains(&"observation")
+    );
+    let (hits, timings) = store
+        .reader
+        .hybrid_search_scopes(
+            &[(ws, proj)],
+            HybridSearch {
+                query: "zircon",
+                vector: None,
+                limit: 10,
+                expiry_cutoff_us: None,
+                include_superseded: false,
+                explain: true,
+                owner: &ai_memory_core::OwnerFilter::Any,
+                filter: decisions_filter,
+            },
+        )
+        .await
+        .unwrap();
+    let timings = timings.expect("explain timings");
+    assert!(
+        timings.observation_ms.is_none(),
+        "path_prefix=decisions/ must skip the observation stream: {timings:?}"
+    );
+    let hit_paths: Vec<&str> = hits.iter().map(|(h, _)| h.path.as_str()).collect();
+    assert_eq!(hit_paths, vec!["decisions/zircon.md"]);
+
+    let sessions_filter = PageFilter {
+        path_prefix: Some("sessions/"),
+        ..PageFilter::default()
+    };
+    assert!(
+        store
+            .reader
+            .active_streams(false, sessions_filter)
+            .contains(&"observation")
+    );
+    let (session_hits, session_timings) = store
+        .reader
+        .hybrid_search_scopes(
+            &[(ws, proj)],
+            HybridSearch {
+                query: "zircon",
+                vector: None,
+                limit: 10,
+                expiry_cutoff_us: None,
+                include_superseded: false,
+                explain: true,
+                owner: &ai_memory_core::OwnerFilter::Any,
+                filter: sessions_filter,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(session_timings.expect("timings").observation_ms.is_some());
+    assert_eq!(session_hits.len(), 1);
+    assert_eq!(
+        session_hits[0].0.path.as_str(),
+        format!("sessions/{sid}.md")
+    );
+}
+
+#[tokio::test]
+async fn preflight_skips_observation_votes_when_metadata_filter_excludes_all_session_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let sid = session(&store, ws, proj).await;
+    let mut sess_page = page(ws, proj, &format!("sessions/{sid}.md"), "session summary");
+    sess_page.frontmatter_json = serde_json::json!({"tags": ["wanted"]});
+    store.writer.upsert_page(sess_page).await.unwrap();
+    observe(&store, ws, proj, sid, "preflightneedle from session").await;
+
+    let mut decision = page(
+        ws,
+        proj,
+        "decisions/preflight.md",
+        "preflightneedle from decision",
+    );
+    decision.tier = Tier::Semantic;
+    decision.frontmatter_json = serde_json::json!({"tags": ["non-session"]});
+    store.writer.upsert_page(decision).await.unwrap();
+
+    for filter in [
+        PageFilter {
+            kind: Some("decision"),
+            ..PageFilter::default()
+        },
+        PageFilter {
+            tag: Some("non-session"),
+            ..PageFilter::default()
+        },
+        PageFilter {
+            tier: Some("semantic"),
+            ..PageFilter::default()
+        },
+    ] {
+        let (hits, _) = store
+            .reader
+            .hybrid_search_scopes(
+                &[(ws, proj)],
+                HybridSearch {
+                    query: "preflightneedle",
+                    vector: None,
+                    limit: 10,
+                    expiry_cutoff_us: None,
+                    include_superseded: false,
+                    explain: true,
+                    owner: &ai_memory_core::OwnerFilter::Any,
+                    filter,
+                },
+            )
+            .await
+            .unwrap();
+        let hit_paths: Vec<&str> = hits.iter().map(|(h, _)| h.path.as_str()).collect();
+        assert_eq!(
+            hit_paths,
+            vec!["decisions/preflight.md"],
+            "filter {filter:?} should return only the decision hit"
+        );
+        assert!(
+            hits[0]
+                .1
+                .as_ref()
+                .and_then(|d| d.observation_rank)
+                .is_none(),
+            "decision hit must not carry an observation vote for {filter:?}"
+        );
+    }
+
+    // A tag that a session page carries still receives observation votes.
+    let (tagged_hits, _) = store
+        .reader
+        .hybrid_search_scopes(
+            &[(ws, proj)],
+            HybridSearch {
+                query: "preflightneedle",
+                vector: None,
+                limit: 10,
+                expiry_cutoff_us: None,
+                include_superseded: false,
+                explain: true,
+                owner: &ai_memory_core::OwnerFilter::Any,
+                filter: PageFilter {
+                    tag: Some("wanted"),
+                    ..PageFilter::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(tagged_hits.len(), 1);
+    assert_eq!(tagged_hits[0].0.path.as_str(), format!("sessions/{sid}.md"));
+    assert_eq!(
+        tagged_hits[0].1.as_ref().and_then(|d| d.observation_rank),
+        Some(1)
+    );
+}

@@ -32,6 +32,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `codex.cmd` shim (a native `codex.exe` still wins), and a failed start now
   names the executable and keeps the OS error. (#2404)
 
+- Skipped the observation retrieval stream when a query's `path_prefix`
+  cannot match `sessions/` pages (and omitted `"observation"` from
+  `streams_active`), and added an indexed pre-flight check so metadata
+  filters (`kind`, `tier`, `tag`) that exclude all session pages avoid
+  scanning `observations_fts` and `observations_cjk_fts`. (#2427)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)

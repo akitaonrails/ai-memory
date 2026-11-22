@@ -4024,7 +4024,7 @@ impl AiMemoryServer {
         }
         // Computed once: `explain` returns it to the caller, and the opt-in
         // retrieval history records it as the call's `source` (#2038).
-        let active_streams = self.reader.active_streams(query_vec.is_some());
+        let active_streams = self.reader.active_streams(query_vec.is_some(), filter);
         let streams_active = explain.then(|| active_streams.clone());
         let hits: Vec<QueryHit> = hits
             .into_iter()

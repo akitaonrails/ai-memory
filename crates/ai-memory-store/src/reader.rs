@@ -1110,6 +1110,19 @@ impl PageFilter<'_> {
             || self.tag.is_some()
     }
 
+    /// Whether this filter can match any `sessions/<uuid>.md` page.
+    ///
+    /// Only `path_prefix` is checked statically: session pages always live
+    /// under `sessions/`, whereas `kind`, `tier`, and `tag` can be overridden
+    /// in a session page's frontmatter and are checked against the database.
+    #[must_use]
+    pub fn can_match_session_pages(&self) -> bool {
+        match self.path_prefix {
+            Some(prefix) => prefix.starts_with("sessions/") || "sessions/".starts_with(prefix),
+            None => true,
+        }
+    }
+
     /// An ` AND …` predicate over the pages row `alias`, taking each bound
     /// value's placeholder from `placeholder`, and those values in order.
     fn sql(&self, alias: &str, mut placeholder: impl FnMut() -> String) -> (String, Vec<Value>) {
@@ -4629,6 +4642,8 @@ impl ReaderPool {
         // The ranked observation window must contain only sessions whose
         // latest page survives the page filter. Otherwise a common excluded
         // kind or tag can crowd a rare eligible session out before mapping.
+        let (preflight_kept, preflight_kept_params) =
+            filter.sql("candidate_page", numbered_placeholders(4));
         let (candidate_kept, candidate_kept_params) =
             filter.sql("candidate_page", numbered_placeholders(8));
         // The session pages' lookup takes anonymous `?`s after its IN list.
@@ -4638,6 +4653,36 @@ impl ReaderPool {
             .min(OBSERVATION_STREAM_MAX_ROWS);
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
+            // Cheap indexed pre-flight on `idx_pages_latest_path`: when no
+            // latest unexpired session page survives the filter (for example
+            // `kind = "decision"`, `tier = "semantic"`, or a tag no session
+            // page carries), skip `observations_fts` and `observations_cjk_fts`
+            // altogether instead of scanning every matching observation row.
+            let has_eligible_session_page: bool = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT EXISTS( \
+                       SELECT 1 FROM pages AS candidate_page \
+                       WHERE candidate_page.workspace_id = ?1 \
+                         AND candidate_page.project_id = ?2 \
+                         AND candidate_page.is_latest = 1 \
+                         AND candidate_page.path GLOB 'sessions/*' \
+                         {candidate_not_expired}{preflight_kept} \
+                     )",
+                    candidate_not_expired = not_expired("candidate_page", "?3"),
+                ))?;
+                let mut preflight_params = vec![
+                    Value::Blob(workspace_id.as_bytes().to_vec()),
+                    Value::Blob(project_id.as_bytes().to_vec()),
+                    Value::Integer(cutoff),
+                ];
+                preflight_params.extend(preflight_kept_params);
+                stmt.query_row(params_from_iter(preflight_params.iter()), |row| {
+                    row.get::<_, bool>(0)
+                })?
+            };
+            if !has_eligible_session_page {
+                return Ok(Vec::new());
+            }
             // `observations_fts` spans every project, and bm25 runs for every
             // match before the scope filter can drop it. The project's rowid
             // span bounds the index scan to the stretch of the log where
@@ -8803,7 +8848,11 @@ impl ReaderPool {
     /// The streams [`Self::hybrid_search_scopes`] runs for a query, in the
     /// order `memory_query` reports them as `streams_active`.
     #[must_use]
-    pub fn active_streams(&self, has_query_vector: bool) -> Vec<&'static str> {
+    pub fn active_streams(
+        &self,
+        has_query_vector: bool,
+        filter: PageFilter<'_>,
+    ) -> Vec<&'static str> {
         let mut streams = vec!["fts", "entity"];
         if has_query_vector {
             streams.push("vector");
@@ -8812,7 +8861,7 @@ impl ReaderPool {
             }
         }
         streams.push("graph");
-        if self.tuning.observation_stream {
+        if self.tuning.observation_stream && filter.can_match_session_pages() {
             streams.push("observation");
         }
         streams
@@ -8866,8 +8915,9 @@ impl ReaderPool {
             )
             .await?;
         timings.entity_ms = elapsed_ms(started);
+        let run_observation_stream = tuning.observation_stream && filter.can_match_session_pages();
         // Stream-off hot path keeps moving the query without a clone.
-        let observation_query = if tuning.observation_stream {
+        let observation_query = if run_observation_stream {
             query.clone()
         } else {
             String::new()
@@ -8980,7 +9030,7 @@ impl ReaderPool {
         timings.graph_ms = elapsed_ms(started);
         // R1: the observation-evidence stream. It votes only for latest
         // session pages, so it does not seed graph expansion.
-        let observation_votes = if tuning.observation_stream {
+        let observation_votes = if run_observation_stream {
             let started = explain.then(std::time::Instant::now);
             let votes = self
                 .observation_stream_votes(
