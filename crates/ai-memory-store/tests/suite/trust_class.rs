@@ -6,7 +6,7 @@ use ai_memory_core::{
     PageEvidenceKind, PagePath, ProjectId, Sanitized, Sanitizer, SessionId, SourceObservations,
     Tier, TrustClass, WorkspaceId,
 };
-use ai_memory_store::Store;
+use ai_memory_store::{MergeProjectPage, Store};
 use tempfile::TempDir;
 
 async fn setup_store() -> (TempDir, Store, WorkspaceId, ProjectId, SessionId) {
@@ -293,6 +293,96 @@ async fn citationless_rewrite_inherits_superseded_trust_class_preventing_launder
         .unwrap();
     assert_eq!(
         store.reader.page_trust_class(v3).await.unwrap(),
+        Some(TrustClass::OperatorAuthored),
+    );
+}
+
+#[tokio::test]
+async fn merge_project_collision_takes_the_less_trusted_head_class() {
+    let (_dir, store, ws, _proj, _sid) = setup_store().await;
+    // Fresh projects: `setup_store` leaves a session open in its own, and a
+    // merge refuses a source with an open session.
+    let source = store
+        .writer
+        .get_or_create_project(ws, "source", None)
+        .await
+        .unwrap();
+    let target = store
+        .writer
+        .get_or_create_project(ws, "target", None)
+        .await
+        .unwrap();
+    let mut plan = Vec::new();
+    for (path, source_class) in [
+        ("notes/fetched.md", TrustClass::ToolResult),
+        ("notes/typed.md", TrustClass::OperatorAuthored),
+    ] {
+        let source_page_id = store
+            .writer
+            .upsert_page(page_with(
+                ws,
+                source,
+                path,
+                "source body",
+                Vec::new(),
+                Some(source_class),
+            ))
+            .await
+            .unwrap();
+        let target_page_id = store
+            .writer
+            .upsert_page(page_with(
+                ws,
+                target,
+                path,
+                "target body",
+                Vec::new(),
+                Some(TrustClass::OperatorAuthored),
+            ))
+            .await
+            .unwrap();
+        plan.push(MergeProjectPage {
+            path: PagePath::new(path).unwrap(),
+            source_page_id,
+            target_page_id: Some(target_page_id),
+            // The combined version `Wiki::merge_project` builds, with no
+            // class of its own.
+            merged_page: Some(page_with(
+                ws,
+                target,
+                path,
+                "target body\n\n<!-- ai-memory:merged-from default/source -->\n\nsource body",
+                Vec::new(),
+                None,
+            )),
+        });
+    }
+    let summary = store
+        .writer
+        .merge_project(ws, source, target, plan, true)
+        .await
+        .unwrap();
+    assert_eq!(summary.page_conflicts, 2);
+
+    // Adversarial: the merged page carries the source's tool-result text, so
+    // it must not keep the target head's `operator_authored` class.
+    assert_eq!(
+        store
+            .reader
+            .page_trust_class_by_path(ws, target, "notes/fetched.md")
+            .await
+            .unwrap(),
+        Some(TrustClass::ToolResult),
+        "a merged page must not be more trusted than its source head"
+    );
+
+    // Legitimate control: two operator-authored heads stay operator-authored.
+    assert_eq!(
+        store
+            .reader
+            .page_trust_class_by_path(ws, target, "notes/typed.md")
+            .await
+            .unwrap(),
         Some(TrustClass::OperatorAuthored),
     );
 }

@@ -29,7 +29,8 @@ version in [`docs/changelog/`](docs/changelog/):
   hook ingress (`user-prompt` -> `operator_authored`, `post-tool-use` ->
   `tool_result`, assistant/lifecycle -> `model_generated`), compiled pages
   derive their least-trusted class from `page_sources` (and fold on
-  byte-identical accumulation), citationless rewrites such as
+  byte-identical accumulation), a `merge-project` path collision takes the less
+  trusted class of the two pages it combines (#2398), citationless rewrites such as
   `memory_patch_page` inherit the superseded version's `trust_class` so a patch
   cannot launder `tool_result` into `operator_authored`, zero-LLM rule-based
   `sessions/<id>.md` pages derive their class from the session's observations
