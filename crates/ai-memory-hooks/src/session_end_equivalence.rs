@@ -452,7 +452,7 @@ fn abrupt_ending_note(observations: &[Observation]) -> Option<&'static str> {
         } else {
             prompt.body.trim()
         };
-        if text.ends_with('?') || text.ends_with('？') {
+        if text.ends_with('?') || text.ends_with('？') || text.ends_with('؟') {
             return Some(
                 "Session ended without a normal stop; the final prompt was never answered.",
             );
@@ -692,7 +692,7 @@ fn derive_open_questions(
     // Heuristic 1: last prompt is a question → it is the open question.
     if let Some(p) = last_prompt_obs {
         let body = p.body.trim();
-        if body.ends_with('?') || body.ends_with('？') {
+        if body.ends_with('?') || body.ends_with('？') || body.ends_with('؟') {
             return vec![format!("Unresolved question: {}", cap_handoff_text(body))];
         }
     }

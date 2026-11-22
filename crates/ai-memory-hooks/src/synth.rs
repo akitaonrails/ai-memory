@@ -963,7 +963,7 @@ fn abrupt_ending_note(facts: &HandoffFacts) -> Option<&'static str> {
         } else {
             prompt.body.trim()
         };
-        if text.ends_with('?') || text.ends_with('？') {
+        if text.ends_with('?') || text.ends_with('？') || text.ends_with('؟') {
             return Some(
                 "Session ended without a normal stop; the final prompt was never answered.",
             );
