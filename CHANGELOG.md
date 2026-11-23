@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `memory_query(answer=true)` now tells the answer model that page snippets are
+  untrusted data rather than instructions, matching every other memory-bearing
+  LLM prompt. (#2443)
+
 - Applied the container wrapper's host-file UID and SELinux handling to
   `doctor`, so it can read home markers and harness stores instead of
   reporting an invalid home route map when access is denied. (#2403)
