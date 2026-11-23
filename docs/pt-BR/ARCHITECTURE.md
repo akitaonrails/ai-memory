@@ -290,8 +290,9 @@ a partir dos caminhos de hooks.
    enviadas ou recebidas (incluindo histórico reivindicado/cancelado) ou dados de
    autoaperfeiçoamento; o histórico de continuidade gerenciada, portanto, mantém o escopo de seu projeto
    ativo mesmo quando nenhuma sessão de hook de ciclo de vida tiver sido capturada.
-   O mesmo ciclo agendado de varredura também executa um `UPDATE` em lote
-   de `close_abandoned_sessions` em todo o armazenamento. Uma sessão sem atividade
+   Quando `[sessions] idle_end_after_hours` é `0`, o ciclo agendado de varredura
+   também executa um `UPDATE` em lote de `close_abandoned_sessions` em todo
+   o armazenamento. Uma sessão sem atividade
    por 48 horas e sem `SessionEnd` tem seu `ended_at` definido a partir de sua própria última
    atividade, sem página de resumo e sem uso. Isso evita que
    `open_session_count` cresça em sessões que ninguém continua, sendo mais
