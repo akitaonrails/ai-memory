@@ -69,7 +69,10 @@ pub use decay::{
 pub use error::{
     AmbiguousMatch, AmbiguousProjectHolder, AmbiguousProjectHolders, StoreError, StoreResult,
 };
-pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
+pub use grants::{
+    GrantFilter, GrantListing, GrantOutcome, ProjectGrant, WorkspaceGrantFilter,
+    WorkspaceGrantListing,
+};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,

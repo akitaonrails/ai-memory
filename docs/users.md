@@ -770,7 +770,7 @@ what they may reach (#708):
 | Mode | Who reaches the project |
 |---|---|
 | `open` (default) | Every authenticated user, which is what every project was before access modes existed. |
-| `restricted` | The root operator, the user who created it, and users holding a grant on it. |
+| `restricted` | The root operator, the user who created it, and users holding a grant on it or on its workspace. |
 
 Every existing project is `open` after upgrading, so nothing changes until an
 operator restricts one:
@@ -795,6 +795,31 @@ ones who should keep access; nothing is granted automatically.
   its workspace takes its grants with it. Every grant, level change and revoke
   is recorded in the audit log (`grant_access` / `revoke_access`, with who did
   it), so "who could reach this, and since when" stays answerable.
+- **A workspace grant** covers every project of a workspace, including the
+  ones created after it (#2444). Ask for it by name with `--all-projects` in
+  place of `--project`:
+
+  ```sh
+  ai-memory user grant  --user alice --workspace acme --all-projects --level write
+  ai-memory user revoke --user alice --workspace acme --all-projects
+  ```
+
+  Leaving `--project` out without `--all-projects` is an error, so a forgotten
+  flag never widens a grant. Over REST the same routes take
+  `"all_projects": true` in place of `"project"`.
+
+  A user who holds a project grant and a workspace grant gets the higher
+  level. The two are separate: revoking the workspace grant leaves project
+  grants in force, and revoking a project grant leaves the workspace grant.
+  `user grants` and `project grants` list workspace grants as `workspace/*`
+  rows; the REST listings return them in a separate `workspace_grants` array.
+
+  A workspace grant has three limits. It never reaches a project of another
+  workspace. It does not allow writing the workspace's shared `_profile`
+  scope, which still needs root or a `write` grant on that project. And it
+  follows the workspace, not the project: a project moved to another workspace
+  comes under that workspace's grants. Changes are recorded in the audit log
+  as `grant_workspace_access` / `revoke_workspace_access`.
 - **Cross-project messages** respect access too: delivering into a restricted
   project's inbox needs `write` on it (otherwise the mailbox would be a way
   around its grants), and so do popping its inbox and cancelling its outbox,

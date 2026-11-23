@@ -1,5 +1,6 @@
 //! Grant management for `ai-memory user grant|revoke|grants` and `ai-memory
-//! project grants` (#708).
+//! project grants` (#708). A grant covers one project, or with
+//! `--all-projects` every project of a workspace.
 //!
 //! Thin HTTP client over `/admin/users/{username}/grant|revoke|grants` and
 //! `/admin/projects/grants`. The caller's bearer token must authenticate as
@@ -17,9 +18,49 @@ use crate::http_client::{ServerEndpoint, get_json, post_json};
 #[derive(Debug, Serialize)]
 struct GrantRequest<'a> {
     workspace: &'a str,
-    project: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<&'a str>,
+    /// Sent only for a workspace grant, so a server that predates it refuses
+    /// the request (no `project`) instead of granting something else.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    all_projects: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     level: Option<&'a str>,
+}
+
+/// What `user grant` / `user revoke` point at, after the flags are checked.
+struct Target<'a> {
+    project: Option<&'a str>,
+    all_projects: bool,
+    /// How the target reads in a message: `workspace/project`, or the
+    /// localized "every project of workspace".
+    label: String,
+}
+
+/// Check `--project` / `--all-projects` and name the target.
+///
+/// clap already requires one of the two; this also refuses an empty
+/// `--project`, which clap accepts.
+fn target<'a>(
+    i18n: &ai_memory_core::i18n::Localizer,
+    workspace: &str,
+    project: Option<&'a str>,
+    all_projects: bool,
+) -> Result<Target<'a>> {
+    super::refuse_empty_explicit(project, "--project")?;
+    let label = match project {
+        Some(project) => format!("{workspace}/{project}"),
+        None => crate::localization::format(
+            i18n,
+            "cli-grant-every-project-of-workspace",
+            &[("value0", terminal_text(workspace))],
+        ),
+    };
+    Ok(Target {
+        project,
+        all_projects,
+        label,
+    })
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -30,20 +71,65 @@ struct GrantRow {
     level: String,
 }
 
+/// A grant on every project of a workspace, as the listing routes return it.
+#[derive(Debug, Deserialize, Serialize)]
+struct WorkspaceGrantRow {
+    username: String,
+    workspace: String,
+    level: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GrantList {
     grants: Vec<GrantRow>,
+    /// Absent from a server that predates workspace grants.
+    #[serde(default)]
+    workspace_grants: Vec<WorkspaceGrantRow>,
+}
+
+/// Table rows for a listing: workspace grants first, shown as `workspace/*`,
+/// then the project grants.
+fn table_rows(list: &GrantList) -> Vec<GrantRow> {
+    list.workspace_grants
+        .iter()
+        .map(|g| GrantRow {
+            username: g.username.clone(),
+            workspace: g.workspace.clone(),
+            project: "*".to_owned(),
+            level: g.level.clone(),
+        })
+        .chain(list.grants.iter().map(|g| GrantRow {
+            username: g.username.clone(),
+            workspace: g.workspace.clone(),
+            project: g.project.clone(),
+            level: g.level.clone(),
+        }))
+        .collect()
 }
 
 fn print_grants(
     i18n: &ai_memory_core::i18n::Localizer,
-    grants: &[GrantRow],
+    list: &GrantList,
     json: bool,
 ) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(grants)?);
+        // The project grants keep the array shape scripts already parse. With
+        // workspace grants in force the output is an object naming both, so a
+        // script cannot read a partial answer as the whole one.
+        if list.workspace_grants.is_empty() {
+            println!("{}", serde_json::to_string_pretty(&list.grants)?);
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "grants": list.grants,
+                    "workspace_grants": list.workspace_grants,
+                }))?
+            );
+        }
         return Ok(());
     }
+    let grants = &table_rows(list)[..];
     if grants.is_empty() {
         // Say what empty means: nothing is lost on an open project.
         println!("{}", i18n.text("cli-grant-no-grants"));
@@ -129,7 +215,7 @@ pub async fn list_for_user(ep: &ServerEndpoint, args: &UserGrantsArgs) -> Result
             .await
             .context(i18n.text("cli-grant-listing-grants"))?,
     };
-    print_grants(i18n, &resp.grants, args.json)
+    print_grants(i18n, &resp, args.json)
 }
 
 /// `ai-memory project grants --workspace W --project P`.
@@ -148,7 +234,7 @@ pub async fn list_for_project(ep: &ServerEndpoint, args: &ProjectGrantsArgs) -> 
     )
     .await
     .with_context(|| format!("listing grants on {}/{}", args.workspace, args.project))?;
-    print_grants(i18n, &resp.grants, args.json)
+    print_grants(i18n, &resp, args.json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,11 +253,17 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
     let i18n = &ep.i18n;
     super::refuse_empty_explicit(Some(args.user.as_str()), "--user")?;
     super::refuse_empty_explicit(Some(args.workspace.as_str()), "--workspace")?;
-    super::refuse_empty_explicit(Some(args.project.as_str()), "--project")?;
+    let target = target(
+        i18n,
+        &args.workspace,
+        args.project.as_deref(),
+        args.all_projects,
+    )?;
     super::refuse_empty_explicit(Some(args.level.as_str()), "--level")?;
     let body = GrantRequest {
         workspace: &args.workspace,
-        project: &args.project,
+        project: target.project,
+        all_projects: target.all_projects,
         level: Some(&args.level),
     };
     let resp: GrantResponse = post_json(
@@ -180,14 +272,9 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
         &body,
     )
     .await
-    .with_context(|| {
-        format!(
-            "granting {} on {}/{}",
-            args.user, args.workspace, args.project
-        )
-    })?;
+    .with_context(|| format!("granting {} on {}", args.user, target.label))?;
     let who = &args.user;
-    let project = format!("{}/{}", args.workspace, args.project);
+    let project = target.label;
     match (resp.changed, resp.previous) {
         (false, _) => println!(
             "{}",
@@ -244,10 +331,16 @@ pub async fn revoke(ep: &ServerEndpoint, args: &UserRevokeArgs) -> Result<()> {
     let i18n = &ep.i18n;
     super::refuse_empty_explicit(Some(args.user.as_str()), "--user")?;
     super::refuse_empty_explicit(Some(args.workspace.as_str()), "--workspace")?;
-    super::refuse_empty_explicit(Some(args.project.as_str()), "--project")?;
+    let target = target(
+        i18n,
+        &args.workspace,
+        args.project.as_deref(),
+        args.all_projects,
+    )?;
     let body = GrantRequest {
         workspace: &args.workspace,
-        project: &args.project,
+        project: target.project,
+        all_projects: target.all_projects,
         level: None,
     };
     let resp: RevokeResponse = post_json(
@@ -256,13 +349,8 @@ pub async fn revoke(ep: &ServerEndpoint, args: &UserRevokeArgs) -> Result<()> {
         &body,
     )
     .await
-    .with_context(|| {
-        format!(
-            "revoking {} on {}/{}",
-            args.user, args.workspace, args.project
-        )
-    })?;
-    let project = format!("{}/{}", args.workspace, args.project);
+    .with_context(|| format!("revoking {} on {}", args.user, target.label))?;
+    let project = target.label;
     if resp.revoked {
         println!(
             "{}",
@@ -399,11 +487,91 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+    /// The request for one project is byte-for-byte what it was before
+    /// workspace grants existed, and a workspace grant says so by name and
+    /// carries no `project`.
+    #[test]
+    fn the_request_names_one_project_or_all_projects_never_both() {
+        let one = GrantRequest {
+            workspace: "acme",
+            project: Some("api"),
+            all_projects: false,
+            level: Some("read"),
+        };
+        assert_eq!(
+            serde_json::to_value(&one).unwrap(),
+            serde_json::json!({"workspace": "acme", "project": "api", "level": "read"})
+        );
+        let all = GrantRequest {
+            workspace: "acme",
+            project: None,
+            all_projects: true,
+            level: Some("read"),
+        };
+        assert_eq!(
+            serde_json::to_value(&all).unwrap(),
+            serde_json::json!({"workspace": "acme", "all_projects": true, "level": "read"})
+        );
+    }
+
+    #[test]
+    fn workspace_grants_lead_the_table_as_workspace_star() {
+        let list: GrantList = serde_json::from_value(serde_json::json!({
+            "grants": [
+                {"username": "bob", "workspace": "acme", "project": "api", "level": "read"},
+            ],
+            "workspace_grants": [
+                {"username": "ana", "workspace": "acme", "level": "write"},
+            ],
+        }))
+        .unwrap();
+        let mut buf = Vec::new();
+        write_grants(
+            &ai_memory_core::i18n::Localizer::default(),
+            &table_rows(&list),
+            &mut buf,
+        )
+        .unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[1].starts_with("acme/* "), "{table}");
+        assert!(lines[1].ends_with("write"), "{table}");
+        assert!(lines[2].starts_with("acme/api"), "{table}");
+
+        // A server that predates workspace grants sends no such key.
+        let old: GrantList = serde_json::from_value(serde_json::json!({"grants": []})).unwrap();
+        assert!(table_rows(&old).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_all_projects_grant_still_refuses_an_empty_workspace_and_level() {
+        let all = || UserGrantArgs {
+            project: None,
+            all_projects: true,
+            ..grant_args()
+        };
+        let mut a = all();
+        a.workspace = " ".into();
+        let error = super::grant(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+        let mut a = all();
+        a.level = "".into();
+        let error = super::grant(&dead_ep(), &a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--level was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
     fn grant_args() -> UserGrantArgs {
         UserGrantArgs {
             user: "ana".into(),
             workspace: "default".into(),
-            project: "app".into(),
+            project: Some("app".into()),
+            all_projects: false,
             level: "write".into(),
         }
     }
@@ -412,7 +580,8 @@ mod tests {
         UserRevokeArgs {
             user: "ana".into(),
             workspace: "default".into(),
-            project: "app".into(),
+            project: Some("app".into()),
+            all_projects: false,
         }
     }
 
@@ -441,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_project_flag_is_refused_before_granting() {
         let mut a = grant_args();
-        a.project = "  ".into();
+        a.project = Some("  ".into());
         let error = super::grant(&dead_ep(), &a).await.unwrap_err();
         assert!(
             error.to_string().contains("--project was passed empty"),
@@ -485,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_project_flag_is_refused_before_revoking() {
         let mut a = revoke_args();
-        a.project = "  ".into();
+        a.project = Some("  ".into());
         let error = super::revoke(&dead_ep(), &a).await.unwrap_err();
         assert!(
             error.to_string().contains("--project was passed empty"),

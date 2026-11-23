@@ -490,6 +490,7 @@ async fn pure_authorize_project_reference() {
         is_root: false,
         is_creator: false,
         grant: None,
+        workspace_grant: None,
         reserved_global: false,
     };
     assert!(authorize_project(&deny, ProjectAccess::Read).is_err());
