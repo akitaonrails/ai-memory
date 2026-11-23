@@ -173,6 +173,47 @@ explicitly, then grants users. Single-user/loopback is unaffected (no DB users â
    to the messaging feature and is why it must be designed, not bolted on.
 4. **Handoff `OwnerFilter`**: unchanged; grants and owner-batons are orthogonal.
 
+## Workspace grants (#2444)
+
+A team that works on every project of a workspace needed one grant per project
+and a new grant for each project created later. V115 adds `workspace_grants`,
+one row per `(workspace, user)` with the same `read`/`write` levels:
+
+```sql
+CREATE TABLE workspace_grants (
+    workspace_id BLOB NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id      BLOB NOT NULL REFERENCES users(id)      ON DELETE CASCADE,
+    level        TEXT NOT NULL CHECK (level IN ('read','write')),
+    granted_by   BLOB REFERENCES users(id) ON DELETE SET NULL,
+    granted_at   INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, user_id)
+) WITHOUT ROWID;
+```
+
+The existing choke point takes it as a second input. `resolve` reads it for a
+`restricted` project and `ProjectAuthz::authorize` takes the higher of the
+project grant and the workspace grant; `readable_repository_sql` admits the
+projects of a granted workspace so search agrees. Four decisions:
+
+- **Joined on the project's own workspace.** `read_workspace_grant` joins
+  `projects.workspace_id` and also requires the caller's workspace id to match,
+  so a granted workspace id paired with a foreign project id admits nothing. A
+  project moved to another workspace comes under that workspace's grants.
+- **Never reaches private `_profile.<user_id>` scopes.** Every operator's
+  private cross-project profile lives in `default` as `_profile.<user_id>`.
+  `read_workspace_grant`, `readable_repository_sql`, and `authors_without_grant`
+  all exclude `_profile.%`, and `GET /admin/projects/grants` reports no
+  workspace grants on private profile scopes.
+- **No write to the reserved shared scopes.** A workspace `_profile` is unioned
+  into every project's reads in the workspace. Writing it keeps needing root or
+  a `write` grant on that project; a workspace grant only reads it.
+- **Asked for by name.** `--all-projects` on the CLI and `"all_projects": true`
+  over REST. A request that names neither a project nor all projects is
+  refused, so a dropped field cannot widen a grant.
+
+The two kinds of grant are independent rows. Granting a workspace does not
+touch project grants, and revoking it gives back exactly what was held before.
+
 ## Non-goals (v1)
 Per-project *admin* delegation, row-level ACLs, time-boxed grants, group/role
 abstractions. Those can layer on the `project_grants` table later.

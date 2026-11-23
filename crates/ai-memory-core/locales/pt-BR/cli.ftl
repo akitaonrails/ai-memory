@@ -377,6 +377,7 @@ cli-grant-who-previous-on-project = { $value0 }: { $value1 } -> { $value2 } em {
 cli-grant-who-now-holds-on-project = { $value0 } agora tem { $value1 } em { $value2 }.
 cli-grant-no-longer-holds-anything-on-project = { $value0 } não tem mais permissões em { $value1 }.
 cli-grant-held-nothing-on-project-nothing-changed = { $value0 } não tinha permissões em { $value1 }; nada alterado.
+cli-grant-every-project-of-workspace = todos os projetos de { $value0 }
 cli-install-instructions-would-write-into = # Gravaria em: { $value0 }{ "\u000A" }
 cli-install-instructions-getting-cwd-for-install-instructions-target = obtendo CWD para o destino de install-instructions
 cli-install-instructions-note-neither-claude-md-nor-agents-md-exists-in-creating-claude-md-if-you-use = nota: nem CLAUDE.md nem AGENTS.md existem em { $value0 }; criando CLAUDE.md. Se você usa Codex / OpenCode / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Kiro CLI, execute novamente com `--target AGENTS.md`.

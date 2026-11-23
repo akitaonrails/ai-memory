@@ -189,6 +189,11 @@ pub struct ProjectAuthz {
     pub is_creator: bool,
     /// The caller's grant on the project, if any.
     pub grant: Option<GrantLevel>,
+    /// The caller's grant on the project's whole workspace, if any
+    /// (`workspace_grants`, V115). It counts as a grant at that level on every
+    /// project of the workspace except private `_profile.<user_id>` scopes and
+    /// writes to a reserved shared scope.
+    pub workspace_grant: Option<GrantLevel>,
     /// The project is a shared reserved scope: the global preferences scope
     /// (`default/_global`) or a workspace profile (`<workspace>/_profile`).
     pub reserved_global: bool,
@@ -198,11 +203,14 @@ impl ProjectAuthz {
     /// Decide whether the caller may perform `need` in this project.
     ///
     /// - A deployment that does not distinguish operators skips the gate.
-    /// - A write to the reserved global scope needs root or a `write` grant,
-    ///   in either mode; its creator gets nothing extra.
+    /// - A write to the reserved global scope needs root or a `write` grant
+    ///   on that project, in either mode; its creator gets nothing extra, and
+    ///   neither does a workspace grant: a workspace profile reaches every
+    ///   user of the workspace, so writing it stays a per-project decision.
     /// - An `open` project admits everyone (today's behaviour).
     /// - A `restricted` project admits root and the creator unconditionally;
-    ///   otherwise a read needs any grant and a write needs a `write` grant.
+    ///   otherwise a read needs any grant and a write needs a `write` grant,
+    ///   held on the project or on its workspace.
     ///   Anyone else — including an anonymous caller — is [`AuthzError::Forbidden`].
     ///
     /// # Errors
@@ -224,10 +232,15 @@ impl ProjectAuthz {
                 if self.is_root || self.is_creator {
                     return Ok(());
                 }
+                // A project grant and a workspace grant both count; the
+                // higher level decides.
                 let admitted = match need {
                     // A read or write grant both admit a read.
-                    ProjectAccess::Read => self.grant.is_some(),
-                    ProjectAccess::Write => self.grant == Some(GrantLevel::Write),
+                    ProjectAccess::Read => self.grant.is_some() || self.workspace_grant.is_some(),
+                    ProjectAccess::Write => {
+                        self.grant == Some(GrantLevel::Write)
+                            || self.workspace_grant == Some(GrantLevel::Write)
+                    }
                 };
                 if admitted {
                     Ok(())
@@ -356,6 +369,37 @@ fn read_grant(
     Ok(level.as_deref().and_then(GrantLevel::from_db))
 }
 
+/// Look up a caller's grant on the whole workspace a project lives in
+/// (`workspace_grants`, V115).
+///
+/// The join is on the project's own `workspace_id`, and the caller's
+/// `workspace_id` must equal it: a grant on one workspace never admits a
+/// project of another, whatever pair of ids a request carries. Private
+/// per-operator profile scopes (`_profile.<user_id>`) are excluded: a
+/// workspace grant never reaches another operator's private profile.
+fn read_workspace_grant(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    user_id: UserId,
+) -> rusqlite::Result<Option<GrantLevel>> {
+    let level: Option<String> = conn
+        .query_row(
+            "SELECT wg.level FROM workspace_grants wg \
+               JOIN projects p ON p.workspace_id = wg.workspace_id \
+              WHERE p.id = ?2 AND wg.workspace_id = ?1 AND wg.user_id = ?3 \
+                AND p.name NOT LIKE '\\_profile.%' ESCAPE '\\'",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                user_id.as_bytes()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(level.as_deref().and_then(GrantLevel::from_db))
+}
+
 /// Resolve the full [`ProjectAuthz`] for a project from a live connection.
 ///
 /// `open` short-circuits without touching `project_grants`. The caller is the
@@ -471,12 +515,34 @@ fn resolve(
     } else {
         None
     };
+    // Only a restricted project consults grants for entry; the reserved
+    // scopes' write gate deliberately ignores the workspace grant.
+    let workspace_grant = match principal.user_id {
+        Some(user_id) if access_mode == AccessMode::Restricted => {
+            match read_workspace_grant(conn, workspace_id, project_id, user_id) {
+                Ok(grant) => grant,
+                Err(err) if resolution == Resolution::Strict => return Err(err.into()),
+                // Same degraded mode as the project grant above: no grant is
+                // invented for a table that cannot be read.
+                Err(err) if reserved_global => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not read workspace_grants for a shared scope; admitting no workspace grant",
+                    );
+                    None
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        _ => None,
+    };
     Ok(ProjectAuthz {
         distinguishes_operators,
         access_mode,
         is_root: principal.is_root,
         is_creator,
         grant,
+        workspace_grant,
         reserved_global,
     })
 }
@@ -498,6 +564,7 @@ mod tests {
             is_root,
             is_creator,
             grant,
+            workspace_grant: None,
             reserved_global: false,
         }
     }

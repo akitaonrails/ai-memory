@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `ai-memory user grant --all-projects` gave a user `read` or `write` on every
+  project of a workspace, including projects created later, instead of one
+  grant per project; `user revoke --all-projects` takes it away. The grant is
+  stored in a new `workspace_grants` table (V115, additive), combines with a
+  project grant to the higher level, never reaches another workspace or private
+  `_profile.<user_id>` scopes, and does not allow writing the workspace's
+  shared `_profile` scope. `POST
+  /admin/users/{username}/grant|revoke` accept `"all_projects": true` in place
+  of `"project"`, and the grant listings return workspace grants in a separate
+  `workspace_grants` array. See `docs/users.md#per-project-access`. (#2444)
+
 - `pi_direct_tools` (`AI_MEMORY_PI_DIRECT_TOOLS`) lets the generated Pi
   extension keep a chosen list of ai-memory MCP tools `direct` while
   registering the rest with `exposure: "deferred"`, attaching a single

@@ -123,8 +123,8 @@ fn history_visible(table: &str, now_param: &str) -> String {
 /// "May read" is what [`crate::authorize_project`] admits for
 /// [`crate::ProjectAccess::Read`]: a project that is not `restricted` (an
 /// unrecognised mode reads as open there too), one the viewer created, or one
-/// they hold any grant on — every level admits a read, and a test pins the two
-/// together. The global
+/// they hold any grant on, directly or through its workspace — every level
+/// admits a read, and a test pins the two together. The global
 /// preferences scope is always readable: it is shared by construction (see
 /// `lookup_global_scope`).
 ///
@@ -213,6 +213,11 @@ fn readable_repository_sql(
                                        OR op.created_by = {user}) \
                OR {project_column} IN (SELECT pg.project_id FROM project_grants pg \
                                     WHERE pg.user_id = {user}) \
+               OR {project_column} IN (SELECT wp.id FROM projects wp \
+                                       JOIN workspace_grants wg \
+                                         ON wg.workspace_id = wp.workspace_id \
+                                       WHERE wg.user_id = {user} \
+                                         AND wp.name NOT LIKE '\\_profile.%' ESCAPE '\\') \
                OR {project_column} IN (SELECT gp.id FROM projects gp \
                                        JOIN workspaces gw ON gw.id = gp.workspace_id \
                                        WHERE gw.name = {workspace} AND gp.name = {project}))"
@@ -3263,6 +3268,18 @@ impl ReaderPool {
         filter: crate::grants::GrantFilter,
     ) -> StoreResult<Vec<crate::grants::GrantListing>> {
         self.with_conn(move |conn| crate::grants::list_grants(conn, filter))
+            .await
+    }
+
+    /// Workspace grants matching `filter`, resolved to names for display.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_workspace_grants(
+        &self,
+        filter: crate::grants::WorkspaceGrantFilter,
+    ) -> StoreResult<Vec<crate::grants::WorkspaceGrantListing>> {
+        self.with_conn(move |conn| crate::grants::list_workspace_grants(conn, filter))
             .await
     }
 

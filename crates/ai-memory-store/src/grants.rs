@@ -1,7 +1,8 @@
 //! Per-project grants and access modes: storage (#708).
 //!
 //! The decision lives in [`crate::project_authz`]; this module keeps what it
-//! reads — `project_grants` rows and `projects.access_mode` — and the
+//! reads — `project_grants` rows, `workspace_grants` rows and
+//! `projects.access_mode` — and the
 //! root-only management that changes them, each change recorded in
 //! `audit_log`.
 
@@ -82,7 +83,7 @@ pub fn set_access_mode(
 
 /// Users who have written to `repository_id` and would not be admitted if it
 /// were restricted: enabled, not root, not its creator, and holding no grant
-/// on it.
+/// on it or on its workspace.
 ///
 /// What an operator needs to see when restricting a project — the people who
 /// were working in it and are about to be refused — so they can grant the ones
@@ -104,6 +105,10 @@ pub fn authors_without_grant(
                              WHERE pr.id = ?1 AND pr.created_by = u.id) \
             AND NOT EXISTS (SELECT 1 FROM project_grants pg \
                              WHERE pg.user_id = u.id AND pg.project_id = ?1) \
+            AND NOT EXISTS (SELECT 1 FROM workspace_grants wg \
+                             JOIN projects wp ON wp.workspace_id = wg.workspace_id \
+                            WHERE wg.user_id = u.id AND wp.id = ?1 \
+                              AND wp.name NOT LIKE '\\_profile.%' ESCAPE '\\') \
           ORDER BY u.username",
     )?;
     let names = stmt
@@ -197,7 +202,7 @@ fn audit_grant(
     conn: &Connection,
     op: &str,
     workspace_id: WorkspaceId,
-    project_id: ProjectId,
+    project_id: Option<ProjectId>,
     by: Option<UserId>,
     detail: &serde_json::Value,
     now: i64,
@@ -209,7 +214,7 @@ fn audit_grant(
             now,
             op,
             workspace_id.as_bytes(),
-            project_id.as_bytes(),
+            project_id.map(|project| project.as_bytes().to_vec()),
             by.map(|by| by.as_bytes().to_vec()),
             detail.to_string(),
         ],
@@ -270,7 +275,7 @@ pub fn grant(
         conn,
         "grant_access",
         workspace_id,
-        project_id,
+        Some(project_id),
         granted_by,
         &serde_json::json!({
             "user_id": user_id.to_string(),
@@ -310,7 +315,7 @@ pub fn revoke(
         conn,
         "revoke_access",
         held.workspace_id,
-        project_id,
+        Some(project_id),
         revoked_by,
         &serde_json::json!({
             "user_id": user_id.to_string(),
@@ -399,6 +404,232 @@ pub fn list_grants(conn: &Connection, filter: GrantFilter) -> StoreResult<Vec<Gr
             username,
             workspace,
             project,
+            level,
+        });
+    }
+    Ok(out)
+}
+
+/// The level `user_id` holds on the whole of `workspace_id`, if any — a row of
+/// `workspace_grants` (V115).
+///
+/// A stored level this build cannot read is **skipped and logged**, as
+/// [`grants_for`] does: dropping it can only ever deny.
+///
+/// # Errors
+/// Propagates any SQL error.
+pub fn workspace_grant_for(
+    conn: &Connection,
+    user_id: UserId,
+    workspace_id: WorkspaceId,
+) -> StoreResult<Option<GrantLevel>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT level FROM workspace_grants WHERE user_id = ?1 AND workspace_id = ?2",
+            params![user_id.as_bytes(), workspace_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let level = GrantLevel::from_db(&stored);
+    if level.is_none() {
+        tracing::error!(
+            level = %stored,
+            "skipping a malformed workspace_grants row; access will be denied \
+             as though it were absent",
+        );
+    }
+    Ok(level)
+}
+
+/// Grant `user_id` `level` on every project of `workspace_id`, present and
+/// future, or change the level they hold on it.
+///
+/// Project grants the user already holds in the workspace are left alone: the
+/// choke point takes the higher of the two, and revoking the workspace grant
+/// later must give back exactly what was held before it.
+///
+/// `granted_by` is `None` for the root bearer token. Every change is recorded
+/// in `audit_log` (`grant_workspace_access`, with the previous level when
+/// there was one, and no project).
+///
+/// # Errors
+/// [`crate::StoreError::NotFound`] when the workspace does not exist;
+/// otherwise propagates any SQL error.
+pub fn grant_workspace(
+    conn: &Connection,
+    user_id: UserId,
+    workspace_id: WorkspaceId,
+    level: GrantLevel,
+    granted_by: Option<UserId>,
+    now: i64,
+) -> StoreResult<GrantOutcome> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?1)",
+        params![workspace_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(crate::StoreError::NotFound(format!(
+            "workspace {workspace_id}"
+        )));
+    }
+    let held = workspace_grant_for(conn, user_id, workspace_id)?;
+    let outcome = match held {
+        Some(held) if held == level => return Ok(GrantOutcome::Unchanged),
+        Some(held) => GrantOutcome::LevelChanged { from: held },
+        None => GrantOutcome::Granted,
+    };
+    conn.execute(
+        "INSERT INTO workspace_grants (workspace_id, user_id, level, granted_by, granted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET \
+           level = excluded.level, granted_by = excluded.granted_by, \
+           granted_at = excluded.granted_at",
+        params![
+            workspace_id.as_bytes(),
+            user_id.as_bytes(),
+            level.as_str(),
+            granted_by.map(|by| by.as_bytes().to_vec()),
+            now,
+        ],
+    )?;
+    audit_grant(
+        conn,
+        "grant_workspace_access",
+        workspace_id,
+        None,
+        granted_by,
+        &serde_json::json!({
+            "user_id": user_id.to_string(),
+            "level": level.as_str(),
+            "previous": held.map(GrantLevel::as_str),
+        }),
+        now,
+    )?;
+    Ok(outcome)
+}
+
+/// Take away the workspace grant `user_id` holds on `workspace_id`.
+///
+/// Project grants the user holds inside the workspace stay in force: they
+/// were given one by one and are revoked one by one. Returns whether anything
+/// was revoked; the revocation is recorded in `audit_log`
+/// (`revoke_workspace_access`).
+///
+/// # Errors
+/// Propagates any SQL error.
+pub fn revoke_workspace(
+    conn: &Connection,
+    user_id: UserId,
+    workspace_id: WorkspaceId,
+    revoked_by: Option<UserId>,
+    now: i64,
+) -> StoreResult<bool> {
+    // Read the raw row, not the parsed level: a malformed row must still be
+    // revocable.
+    let held: Option<String> = conn
+        .query_row(
+            "SELECT level FROM workspace_grants WHERE user_id = ?1 AND workspace_id = ?2",
+            params![user_id.as_bytes(), workspace_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(held) = held else {
+        return Ok(false);
+    };
+    conn.execute(
+        "DELETE FROM workspace_grants WHERE user_id = ?1 AND workspace_id = ?2",
+        params![user_id.as_bytes(), workspace_id.as_bytes()],
+    )?;
+    audit_grant(
+        conn,
+        "revoke_workspace_access",
+        workspace_id,
+        None,
+        revoked_by,
+        &serde_json::json!({
+            "user_id": user_id.to_string(),
+            "level": held,
+        }),
+        now,
+    )?;
+    Ok(true)
+}
+
+/// One row of the operator's workspace-grant listing, resolved to names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceGrantListing {
+    /// Who holds it.
+    pub username: String,
+    /// The workspace whose every project it covers.
+    pub workspace: String,
+    /// What they hold.
+    pub level: GrantLevel,
+}
+
+/// Which workspace grants a listing covers.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkspaceGrantFilter {
+    /// Every workspace grant on the server.
+    All,
+    /// The workspaces one user holds.
+    User(UserId),
+    /// Who holds one workspace.
+    Workspace(WorkspaceId),
+}
+
+/// Workspace grants matching `filter`, ordered for human reading.
+///
+/// # Errors
+/// Propagates any SQL error.
+pub fn list_workspace_grants(
+    conn: &Connection,
+    filter: WorkspaceGrantFilter,
+) -> StoreResult<Vec<WorkspaceGrantListing>> {
+    let (predicate, bound): (&str, Option<Vec<u8>>) = match filter {
+        WorkspaceGrantFilter::All => ("1 = 1", None),
+        WorkspaceGrantFilter::User(user) => (
+            "workspace_grants.user_id = ?1",
+            Some(user.as_bytes().to_vec()),
+        ),
+        WorkspaceGrantFilter::Workspace(workspace) => (
+            "workspace_grants.workspace_id = ?1",
+            Some(workspace.as_bytes().to_vec()),
+        ),
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT users.username, workspaces.name, workspace_grants.level \
+           FROM workspace_grants \
+           JOIN users      ON users.id = workspace_grants.user_id \
+           JOIN workspaces ON workspaces.id = workspace_grants.workspace_id \
+          WHERE {predicate} \
+          ORDER BY workspaces.name, users.username"
+    ))?;
+    let map = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    };
+    let rows = match bound {
+        Some(id) => stmt
+            .query_map(params![id], map)?
+            .collect::<Result<Vec<_>, _>>()?,
+        None => stmt.query_map([], map)?.collect::<Result<Vec<_>, _>>()?,
+    };
+    let mut out = Vec::new();
+    for (username, workspace, level) in rows {
+        let Some(level) = GrantLevel::from_db(&level) else {
+            tracing::error!(%username, %workspace, "skipping a malformed workspace_grants row in listing");
+            continue;
+        };
+        out.push(WorkspaceGrantListing {
+            username,
+            workspace,
             level,
         });
     }
@@ -652,6 +883,7 @@ mod tests {
                 is_root: false,
                 is_creator: false,
                 grant: Some(level),
+                workspace_grant: None,
                 reserved_global: false,
             };
             assert!(
@@ -1018,6 +1250,14 @@ mod tests {
             .await
             .unwrap();
         w.revoke_memory(f.bob, f.personal, None).await.unwrap();
+        // carol holds a workspace other than the fixture's: both forms must
+        // admit its project and neither of the fixture's.
+        let carol = human(&f.store, "carol", UserRole::User).await;
+        let team = w.get_or_create_workspace("team-b").await.unwrap();
+        let api = w.get_or_create_project(team, "api", None).await.unwrap();
+        w.grant_workspace(carol, team, GrantLevel::Read, None)
+            .await
+            .unwrap();
 
         let conn = Connection::open(f.store.db_path()).unwrap();
         let ids = |sql: String, binds: Vec<rusqlite::types::Value>| -> Vec<ProjectId> {
@@ -1040,6 +1280,7 @@ mod tests {
             (f.alice, sorted(vec![f.client, global.project_id])),
             // bob's only grant was revoked: the shared scope is all that is left.
             (f.bob, vec![global.project_id]),
+            (carol, sorted(vec![api, global.project_id])),
         ] {
             let (bound, binds) =
                 crate::reader::readable_repository_filter("projects.id", Some(viewer), 1);
@@ -1175,5 +1416,477 @@ mod tests {
         assert_eq!(dups, 1, "no viewer still sees the pair");
         let detail = r.health_detail_for_workspace(f.ws, 10, None).await.unwrap();
         assert_eq!(detail.duplicates.len(), 2);
+    }
+
+    // ---- workspace grants (V115) ----
+
+    /// Whether `user` is admitted to `(workspace, project)` at `need`, through
+    /// the reader choke point on a server that distinguishes operators.
+    async fn admitted(
+        store: &Store,
+        workspace: WorkspaceId,
+        project: ProjectId,
+        user: UserId,
+        need: crate::ProjectAccess,
+    ) -> bool {
+        store
+            .reader
+            .authorize_project(
+                workspace,
+                project,
+                crate::ProjectPrincipal::user(user),
+                true,
+                need,
+            )
+            .await
+            .unwrap()
+            .is_ok()
+    }
+
+    async fn page_in(store: &Store, workspace: WorkspaceId, project: ProjectId, path: &str) {
+        store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: workspace,
+                project_id: project,
+                path: ai_memory_core::PagePath::new(path).unwrap(),
+                title: path.to_owned(),
+                body: "quarterly day rate".to_owned(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+                trust_class: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The boundary a workspace grant draws: every project of that workspace,
+    /// one created later included, and no project of any other workspace —
+    /// at the choke point and in search alike. Remove the `workspace_grants`
+    /// read from `resolve` or from `readable_repository_sql` and the admitted
+    /// rows flip; remove the workspace join and the foreign rows flip.
+    #[tokio::test]
+    async fn a_workspace_grant_reaches_every_project_of_its_workspace_and_no_other() {
+        use crate::ProjectAccess::{Read, Write};
+        let f = fixture().await;
+        let (w, r) = (&f.store.writer, &f.store.reader);
+        let other = w.get_or_create_workspace("other-team").await.unwrap();
+        let foreign = w.get_or_create_project(other, "api", None).await.unwrap();
+        page_in(&f.store, f.ws, f.client, "client/rates.md").await;
+        page_in(&f.store, f.ws, f.personal, "personal/rates.md").await;
+        page_in(&f.store, other, foreign, "foreign/rates.md").await;
+        let found = |viewer| async move {
+            paths(
+                &r.search_pages("rate".into(), 10, Some(viewer))
+                    .await
+                    .unwrap(),
+                |h| h.path.as_str(),
+            )
+        };
+
+        // Before the grant: nothing, anywhere.
+        assert!(!admitted(&f.store, f.ws, f.client, f.alice, Read).await);
+        assert!(found(f.alice).await.is_empty());
+
+        assert_eq!(
+            w.grant_workspace(f.alice, f.ws, GrantLevel::Read, None)
+                .await
+                .unwrap(),
+            GrantOutcome::Granted
+        );
+
+        // Every project of the workspace, at the level granted and no higher.
+        for project in [f.client, f.personal] {
+            assert!(admitted(&f.store, f.ws, project, f.alice, Read).await);
+            assert!(
+                !admitted(&f.store, f.ws, project, f.alice, Write).await,
+                "a read grant on the workspace must not admit a write"
+            );
+        }
+        // A project created after the grant is covered without another grant.
+        let later = w.get_or_create_project(f.ws, "later", None).await.unwrap();
+        assert!(admitted(&f.store, f.ws, later, f.alice, Read).await);
+
+        // The violation: a project of another workspace stays closed, under
+        // its own workspace id and under the granted workspace's id.
+        assert!(!admitted(&f.store, other, foreign, f.alice, Read).await);
+        assert!(
+            !admitted(&f.store, f.ws, foreign, f.alice, Read).await,
+            "a granted workspace id paired with a foreign project id must not admit"
+        );
+        // Search agrees with the choke point.
+        assert_eq!(
+            found(f.alice).await,
+            vec!["client/rates.md".to_owned(), "personal/rates.md".to_owned()]
+        );
+        // Control: a user without the grant is still refused and finds nothing.
+        assert!(!admitted(&f.store, f.ws, f.client, f.bob, Read).await);
+        assert!(found(f.bob).await.is_empty());
+
+        // Raising the level admits writes; the foreign workspace stays closed.
+        assert_eq!(
+            w.grant_workspace(f.alice, f.ws, GrantLevel::Write, None)
+                .await
+                .unwrap(),
+            GrantOutcome::LevelChanged {
+                from: GrantLevel::Read
+            }
+        );
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Write).await);
+        assert!(!admitted(&f.store, other, foreign, f.alice, Write).await);
+
+        // Revoking closes all of it again.
+        assert!(w.revoke_workspace(f.alice, f.ws, None).await.unwrap());
+        assert!(!admitted(&f.store, f.ws, f.client, f.alice, Read).await);
+        assert!(!admitted(&f.store, f.ws, later, f.alice, Read).await);
+        assert!(found(f.alice).await.is_empty());
+        assert!(
+            !w.revoke_workspace(f.alice, f.ws, None).await.unwrap(),
+            "revoking twice reports that nothing was held"
+        );
+    }
+
+    /// The two kinds of grant are independent rows and the higher level
+    /// decides. Revoking one leaves the other exactly as it was.
+    #[tokio::test]
+    async fn a_project_grant_and_a_workspace_grant_combine_to_the_higher_level() {
+        use crate::ProjectAccess::{Read, Write};
+        let f = fixture().await;
+        let w = &f.store.writer;
+        w.grant_memory(f.alice, f.client, GrantLevel::Write, None)
+            .await
+            .unwrap();
+        w.grant_workspace(f.alice, f.ws, GrantLevel::Read, None)
+            .await
+            .unwrap();
+
+        assert!(
+            admitted(&f.store, f.ws, f.client, f.alice, Write).await,
+            "a lower workspace grant must not lower a project grant"
+        );
+        assert!(admitted(&f.store, f.ws, f.personal, f.alice, Read).await);
+        assert!(!admitted(&f.store, f.ws, f.personal, f.alice, Write).await);
+
+        // The workspace grant goes; the project grant given before it stays.
+        w.revoke_workspace(f.alice, f.ws, None).await.unwrap();
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Write).await);
+        assert!(!admitted(&f.store, f.ws, f.personal, f.alice, Read).await);
+        assert_eq!(all_rows(&f.store, f.alice, f.client).len(), 1);
+
+        // And the other way round: revoking the project grant leaves the
+        // workspace grant in force.
+        w.grant_workspace(f.alice, f.ws, GrantLevel::Read, None)
+            .await
+            .unwrap();
+        w.revoke_memory(f.alice, f.client, None).await.unwrap();
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Read).await);
+        assert!(!admitted(&f.store, f.ws, f.client, f.alice, Write).await);
+    }
+
+    /// A workspace profile is read by every user of the workspace, so a write
+    /// there needs root or a write grant on the profile itself. A write grant
+    /// on the workspace opens every ordinary project and still not this one.
+    #[tokio::test]
+    async fn a_workspace_write_grant_does_not_write_the_shared_profile() {
+        use crate::ProjectAccess::{Read, Write};
+        let f = fixture().await;
+        let w = &f.store.writer;
+        let profile = w
+            .get_or_create_project(
+                f.ws,
+                ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT,
+                None,
+            )
+            .await
+            .unwrap();
+        w.grant_workspace(f.alice, f.ws, GrantLevel::Write, None)
+            .await
+            .unwrap();
+
+        // In both modes. A profile starts open, where no grant is read at
+        // all; restricted is where the workspace grant is resolved and the
+        // write gate has to refuse it by itself.
+        for mode in [AccessMode::Open, AccessMode::Restricted] {
+            let conn = Connection::open(f.store.db_path()).unwrap();
+            set_access_mode(&conn, profile, mode).unwrap();
+            assert!(
+                !admitted(&f.store, f.ws, profile, f.alice, Write).await,
+                "a workspace grant must not write the shared profile ({mode:?})"
+            );
+            // The workspace grant still reads it.
+            assert!(admitted(&f.store, f.ws, profile, f.alice, Read).await);
+            // bob holds nothing: a restricted profile refuses his read.
+            assert_eq!(
+                admitted(&f.store, f.ws, profile, f.bob, Read).await,
+                mode == AccessMode::Open
+            );
+        }
+        // Controls: the same grant writes an ordinary project, root writes the
+        // profile, and so does a write grant on the profile itself.
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Write).await);
+        assert!(
+            f.store
+                .reader
+                .authorize_project(f.ws, profile, crate::ProjectPrincipal::root(), true, Write)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        w.grant_memory(f.alice, profile, GrantLevel::Write, None)
+            .await
+            .unwrap();
+        assert!(admitted(&f.store, f.ws, profile, f.alice, Write).await);
+    }
+
+    /// Every operator's private cross-project profile lives in `default` as
+    /// `_profile.<user_id>`. A workspace grant on `default` must never read or
+    /// write another operator's private profile, either at `authorize_project`
+    /// or in unscoped search.
+    #[tokio::test]
+    async fn a_workspace_grant_never_reaches_another_operators_private_profile() {
+        use crate::ProjectAccess::{Read, Write};
+        let f = fixture().await;
+        let (w, r) = (&f.store.writer, &f.store.reader);
+        let bob_profile_name = ai_memory_core::profile::user_profile_project(f.bob);
+        let (bob_profile, _) = w
+            .get_or_create_project_as(f.ws, &bob_profile_name, None, Some(f.bob))
+            .await
+            .unwrap();
+        {
+            let conn = Connection::open(f.store.db_path()).unwrap();
+            set_access_mode(&conn, bob_profile, AccessMode::Restricted).unwrap();
+        }
+        page_in(&f.store, f.ws, bob_profile, "profile/secret.md").await;
+        page_in(&f.store, f.ws, f.client, "client/rates.md").await;
+
+        w.grant_workspace(f.alice, f.ws, GrantLevel::Write, None)
+            .await
+            .unwrap();
+
+        // Violation: alice's workspace write grant on `default` must not reach
+        // bob's private profile at the choke point or in search.
+        assert!(
+            !admitted(&f.store, f.ws, bob_profile, f.alice, Read).await,
+            "a workspace grant must not read another operator's private profile"
+        );
+        assert!(
+            !admitted(&f.store, f.ws, bob_profile, f.alice, Write).await,
+            "a workspace grant must not write another operator's private profile"
+        );
+        let alice_hits = paths(
+            &r.search_pages("rate".into(), 10, Some(f.alice))
+                .await
+                .unwrap(),
+            |h| h.path.as_str(),
+        );
+        assert_eq!(
+            alice_hits,
+            vec!["client/rates.md".to_owned()],
+            "alice's search must hide bob's private profile page"
+        );
+
+        // Control 1: an ordinary restricted project in `default` is reachable
+        // via the workspace grant.
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Read).await);
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Write).await);
+
+        // Control 2: the profile owner can still read and write their own
+        // private profile and find its pages in search.
+        assert!(admitted(&f.store, f.ws, bob_profile, f.bob, Read).await);
+        assert!(admitted(&f.store, f.ws, bob_profile, f.bob, Write).await);
+        let bob_hits = paths(
+            &r.search_pages("rate".into(), 10, Some(f.bob))
+                .await
+                .unwrap(),
+            |h| h.path.as_str(),
+        );
+        assert_eq!(bob_hits, vec!["profile/secret.md".to_owned()]);
+
+        // Control 3: root can still read and write the private profile.
+        for need in [Read, Write] {
+            assert!(
+                r.authorize_project(
+                    f.ws,
+                    bob_profile,
+                    crate::ProjectPrincipal::root(),
+                    true,
+                    need,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+            );
+        }
+    }
+
+    /// A project follows the grants of the workspace it is in now: moved out,
+    /// it leaves the old workspace's grant behind and comes under the new
+    /// one's.
+    #[tokio::test]
+    async fn a_moved_project_follows_the_grants_of_its_new_workspace() {
+        use crate::ProjectAccess::Read;
+        let f = fixture().await;
+        let w = &f.store.writer;
+        let elsewhere = w.get_or_create_workspace("elsewhere").await.unwrap();
+        w.grant_workspace(f.alice, f.ws, GrantLevel::Write, None)
+            .await
+            .unwrap();
+        w.grant_workspace(f.bob, elsewhere, GrantLevel::Read, None)
+            .await
+            .unwrap();
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Read).await);
+
+        w.move_project_workspace(f.client, f.ws, elsewhere)
+            .await
+            .unwrap();
+
+        assert!(
+            !admitted(&f.store, elsewhere, f.client, f.alice, Read).await,
+            "the old workspace's grant must not follow the project"
+        );
+        assert!(!admitted(&f.store, f.ws, f.client, f.alice, Read).await);
+        assert!(admitted(&f.store, elsewhere, f.client, f.bob, Read).await);
+        // Control: what stayed behind is still alice's.
+        assert!(admitted(&f.store, f.ws, f.personal, f.alice, Read).await);
+    }
+
+    /// One row per user and workspace; every change — not a repeat — is
+    /// audited with who made it and no project; the listing shows names.
+    #[tokio::test]
+    async fn workspace_grants_are_audited_listed_and_deleted_with_their_workspace() {
+        let f = fixture().await;
+        let (w, r) = (&f.store.writer, &f.store.reader);
+        let team = w.get_or_create_workspace("team-b").await.unwrap();
+
+        assert_eq!(
+            w.grant_workspace(f.alice, team, GrantLevel::Read, Some(f.bob))
+                .await
+                .unwrap(),
+            GrantOutcome::Granted
+        );
+        assert_eq!(
+            w.grant_workspace(f.alice, team, GrantLevel::Read, Some(f.bob))
+                .await
+                .unwrap(),
+            GrantOutcome::Unchanged
+        );
+        w.grant_workspace(f.alice, team, GrantLevel::Write, Some(f.bob))
+            .await
+            .unwrap();
+        w.grant_workspace(f.bob, f.ws, GrantLevel::Read, None)
+            .await
+            .unwrap();
+
+        let granted = audit_rows(&f.store, "grant_workspace_access");
+        assert_eq!(granted.len(), 3, "the repeat is not a change");
+        assert_eq!(granted[0].0, Some(f.bob.as_bytes().to_vec()));
+        assert_eq!(granted[1].1["previous"], "read");
+        assert_eq!(granted[1].1["level"], "write");
+        assert_eq!(granted[1].1["user_id"], f.alice.to_string());
+        let conn = Connection::open(f.store.db_path()).unwrap();
+        let with_project: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log \
+                  WHERE op = 'grant_workspace_access' AND project_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(with_project, 0, "a workspace grant names no project");
+
+        let listing = |filter| async move {
+            r.list_workspace_grants(filter)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|g| (g.username, g.workspace, g.level))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listing(WorkspaceGrantFilter::All).await,
+            vec![
+                ("bob".to_owned(), "default".to_owned(), GrantLevel::Read),
+                ("alice".to_owned(), "team-b".to_owned(), GrantLevel::Write),
+            ]
+        );
+        assert_eq!(
+            listing(WorkspaceGrantFilter::User(f.alice)).await,
+            vec![("alice".to_owned(), "team-b".to_owned(), GrantLevel::Write)]
+        );
+        assert_eq!(
+            listing(WorkspaceGrantFilter::Workspace(f.ws)).await,
+            vec![("bob".to_owned(), "default".to_owned(), GrantLevel::Read)]
+        );
+
+        // An unknown workspace is refused, never created by a grant.
+        let ghost = WorkspaceId::new();
+        assert!(matches!(
+            w.grant_workspace(f.alice, ghost, GrantLevel::Read, None)
+                .await,
+            Err(crate::StoreError::NotFound(_))
+        ));
+
+        // Deleting the workspace takes its grants; the revoke is still audited
+        // for the one that was revoked by hand.
+        assert!(
+            w.revoke_workspace(f.bob, f.ws, Some(f.alice))
+                .await
+                .unwrap()
+        );
+        assert_eq!(audit_rows(&f.store, "revoke_workspace_access").len(), 1);
+        w.delete_workspace(
+            team,
+            true,
+            crate::Compaction::Skip,
+            crate::PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+        assert!(listing(WorkspaceGrantFilter::All).await.is_empty());
+    }
+
+    /// Restricting a project warns about the authors it will refuse. An author
+    /// who holds the workspace is not one of them.
+    #[tokio::test]
+    async fn an_author_with_a_workspace_grant_is_not_listed_as_losing_access() {
+        let f = fixture().await;
+        let (w, r) = (&f.store.writer, &f.store.reader);
+        for (author, path) in [(f.alice, "notes/a.md"), (f.bob, "notes/b.md")] {
+            w.upsert_page(ai_memory_core::NewPage {
+                workspace_id: f.ws,
+                project_id: f.client,
+                path: ai_memory_core::PagePath::new(path).unwrap(),
+                title: path.to_owned(),
+                body: "body".to_owned(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: Some(author),
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+                trust_class: None,
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            r.authors_without_grant(f.client).await.unwrap(),
+            vec!["alice".to_owned(), "bob".to_owned()]
+        );
+        w.grant_workspace(f.alice, f.ws, GrantLevel::Read, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.authors_without_grant(f.client).await.unwrap(),
+            vec!["bob".to_owned()]
+        );
     }
 }
