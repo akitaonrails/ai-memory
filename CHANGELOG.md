@@ -121,6 +121,8 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory install-hooks --agent <agent> --apply` to send the opt-in (see
   `docs/install.md#hook-files-after-an-update`). (#1621, #1865)
 
+## [3.5.2] - 2026-11-23
+
 ### Fixed
 
 - Reported Pi MCP tool discovery failures with a server check and `/reload`
@@ -6303,7 +6305,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.2...HEAD
+[3.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.2
 [3.5.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.1
 [3.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.0
 [3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
