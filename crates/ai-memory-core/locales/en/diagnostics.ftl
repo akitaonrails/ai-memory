@@ -1044,3 +1044,6 @@ diag-true-yolo-is-now-yolo = ai-memory: --true-yolo is now the same as --yolo; u
 diag-claude-true-yolo-deprecated = ai-memory: claude_true_yolo is deprecated and ignored: --yolo on Claude always forces bypassPermissions now; remove it from config.toml
 diag-serializing-redacted-config = serializing redacted config for { $value0 }
 diag-verifying-redacted-config = verifying redacted config for { $value0 }
+diag-pi-direct-tools-codemode-conflict = pi_direct_tools and pi_tool_exposure = "codemode" are mutually exclusive; remove pi_direct_tools or set pi_tool_exposure = "direct"
+diag-pi-direct-tools-too-many = pi_direct_tools may list at most { $max } tools (got { $count })
+diag-pi-direct-tools-invalid-entry = pi_direct_tools entry `{ $tool }` is invalid; tool names must be non-empty, at most { $max } characters, and use only ASCII letters, digits, `_`, or `-`

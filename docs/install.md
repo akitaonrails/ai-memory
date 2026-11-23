@@ -2661,6 +2661,30 @@ same. Preview output and every later `--apply` (including the refresh that
 `ai-memory upgrade` runs) read the same setting, so regenerating keeps your
 choice. Set it back to `direct`, or remove it, to return to the default.
 
+#### Pi selective direct/deferred tools (`pi_direct_tools`)
+
+To keep a small set of ai-memory tools directly declared to the model while
+deferring the remaining schemas behind Pi's `tool_search`, set
+`pi_direct_tools` in `config.toml` (or `AI_MEMORY_PI_DIRECT_TOOLS` as a JSON
+array) and regenerate the extension:
+
+```toml
+pi_direct_tools = ["memory_query", "memory_briefing"]
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Listed tools register with `exposure: "direct"`, all other ai-memory tools
+register with `exposure: "deferred"`, a concise `promptGuidelines` hint is
+attached once so the model knows to use `tool_search` for deferred memory
+tools, and `session_start` activates `tool_search` when Pi exposes
+`getActiveTools`/`setActiveTools`. Set `pi_direct_tools = []` to defer every
+ai-memory tool while still activating `tool_search`. `pi_direct_tools` is
+mutually exclusive with `pi_tool_exposure = "codemode"`. Remove the key to
+return to the default extension output.
+
 ### Bind mounts vs docker cp
 
 The `setup-agent` subcommand does the extract + render in one shot

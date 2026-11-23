@@ -576,6 +576,16 @@ pub struct Config {
     /// `--apply` alike, so regenerating the extension keeps the choice. Set
     /// with `AI_MEMORY_PI_TOOL_EXPOSURE` or `pi_tool_exposure` in config.toml.
     pub pi_tool_exposure: PiToolExposure,
+    /// Optional allowlist of ai-memory MCP tool names kept directly exposed in
+    /// the generated Pi extension while all other ai-memory tools are
+    /// registered as `exposure: "deferred"` and Pi's `tool_search` is
+    /// activated on `session_start` (#2428). Unset (`None`, the default) keeps
+    /// the generated extension byte-identical to `pi_tool_exposure` alone.
+    /// An empty list (`Some([])`) defers every ai-memory tool and activates
+    /// `tool_search`. Mutually exclusive with `pi_tool_exposure = "codemode"`.
+    /// Set with `AI_MEMORY_PI_DIRECT_TOOLS` or `pi_direct_tools` in
+    /// `config.toml`.
+    pub pi_direct_tools: Option<Vec<String>>,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -1619,6 +1629,7 @@ impl Default for Config {
             run: RunSettings::default(),
             claude_true_yolo: false,
             pi_tool_exposure: PiToolExposure::default(),
+            pi_direct_tools: None,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -3112,6 +3123,7 @@ impl Config {
             .llm_extra_headers()
             .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?;
         validate_auth_settings(&config.auth)?;
+        validate_pi_direct_tools(config.pi_tool_exposure, config.pi_direct_tools.as_deref())?;
 
         // Validated and resolved eagerly, unlike the primary provider (which
         // stays lazily checked at `serve` startup): a fallback can otherwise
@@ -4096,6 +4108,50 @@ fn env_secret(name: &str) -> Option<SecretString> {
 
 fn non_empty_secret(secret: Option<&SecretString>) -> Option<&str> {
     non_empty(secret.map(ExposeSecret::expose_secret))
+}
+
+/// Maximum number of tool names allowed in `pi_direct_tools`.
+const MAX_PI_DIRECT_TOOLS: usize = 64;
+
+/// Maximum length in bytes of a single tool name in `pi_direct_tools`.
+const MAX_PI_DIRECT_TOOL_NAME_LEN: usize = 128;
+
+/// Validate `pi_direct_tools` against `pi_tool_exposure` and safe ASCII tool
+/// name constraints (#2428).
+fn validate_pi_direct_tools(
+    exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
+) -> Result<()> {
+    let Some(tools) = direct_tools else {
+        return Ok(());
+    };
+    if exposure == PiToolExposure::Codemode {
+        anyhow::bail!(
+            "pi_direct_tools and pi_tool_exposure = \"codemode\" are mutually exclusive; \
+             remove pi_direct_tools or set pi_tool_exposure = \"direct\""
+        );
+    }
+    if tools.len() > MAX_PI_DIRECT_TOOLS {
+        anyhow::bail!(
+            "pi_direct_tools may list at most {MAX_PI_DIRECT_TOOLS} tools (got {})",
+            tools.len()
+        );
+    }
+    for tool in tools {
+        if tool.is_empty()
+            || tool.len() > MAX_PI_DIRECT_TOOL_NAME_LEN
+            || !tool
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            anyhow::bail!(
+                "pi_direct_tools entry `{tool}` is invalid; tool names must be non-empty, \
+                 at most {MAX_PI_DIRECT_TOOL_NAME_LEN} characters, and use only ASCII letters, \
+                 digits, `_`, or `-`"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reject equal configured secrets without logging their values.
@@ -6745,6 +6801,76 @@ input_token_safety_margin = {margin}
                 got.map(|c| c.pi_tool_exposure)
             ),
         }
+    }
+
+    /// #2428: `pi_direct_tools` defaults to `None`, accepts a valid list or an
+    /// empty list (defer all), rejects empty/whitespace/invalid entries and
+    /// excessive lengths/counts, and is mutually exclusive with
+    /// `pi_tool_exposure = "codemode"`.
+    #[test]
+    fn load_validates_pi_direct_tools() {
+        let absent = load_with_toml("").unwrap();
+        assert_eq!(absent.pi_direct_tools, None);
+
+        let valid =
+            load_with_toml("pi_direct_tools = [\"memory_query\", \"memory_briefing\"]\n").unwrap();
+        assert_eq!(
+            valid.pi_direct_tools,
+            Some(vec![
+                "memory_query".to_string(),
+                "memory_briefing".to_string(),
+            ])
+        );
+
+        let empty = load_with_toml("pi_direct_tools = []\n").unwrap();
+        assert_eq!(empty.pi_direct_tools, Some(Vec::new()));
+
+        for bad in [
+            "pi_direct_tools = [\"\"]\n",
+            "pi_direct_tools = [\"   \"]\n",
+            "pi_direct_tools = [\"memory query\"]\n",
+            "pi_direct_tools = [\"memory_query;alert(1)\"]\n",
+            "pi_direct_tools = [\"memory.query\"]\n",
+        ] {
+            let err = load_with_toml(bad).expect_err(bad);
+            assert!(
+                err.to_string().contains("pi_direct_tools entry"),
+                "{bad}: {err}"
+            );
+        }
+
+        let too_long = format!("pi_direct_tools = [\"{}\"]\n", "a".repeat(129));
+        let err = load_with_toml(&too_long).unwrap_err();
+        assert!(err.to_string().contains("pi_direct_tools entry"), "{err}");
+
+        let too_many = format!(
+            "pi_direct_tools = [{}]\n",
+            (0..65)
+                .map(|i| format!("\"tool_{i}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let err = load_with_toml(&too_many).unwrap_err();
+        assert!(
+            err.to_string().contains("pi_direct_tools may list at most"),
+            "{err}"
+        );
+
+        let conflict = load_with_toml(
+            "pi_tool_exposure = \"codemode\"\npi_direct_tools = [\"memory_query\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            conflict.to_string().contains("mutually exclusive"),
+            "{conflict}"
+        );
+
+        let conflict_empty =
+            load_with_toml("pi_tool_exposure = \"codemode\"\npi_direct_tools = []\n").unwrap_err();
+        assert!(
+            conflict_empty.to_string().contains("mutually exclusive"),
+            "{conflict_empty}"
+        );
     }
 
     #[test]

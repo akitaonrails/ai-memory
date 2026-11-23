@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `pi_direct_tools` (`AI_MEMORY_PI_DIRECT_TOOLS`) lets the generated Pi
+  extension keep a chosen list of ai-memory MCP tools `direct` while
+  registering the rest with `exposure: "deferred"`, attaching a single
+  `promptGuidelines` discovery hint and activating Pi's `tool_search` in
+  `session_start` (`[]` defers all tools; unset leaves the generated
+  extension byte-identical; mutually exclusive with
+  `pi_tool_exposure = "codemode"`). (#2428)
+
 - Arabic FTS5 search normalization and hook heuristics: the auxiliary
   CJK/Arabic FTS index strips tashkeel/tatweel/BiDi marks, folds Arabic letter
   variants (Alef, Alef Maksura, Teh Marbuta, Hamza carriers), and normalizes

@@ -1115,6 +1115,7 @@ fn run_with_hook_connection(
                 &args,
                 &capture_mode,
                 config.pi_tool_exposure,
+                config.pi_direct_tools.as_deref(),
             ),
             AgentChoice::Omp => {
                 apply_to_omp_extension(&config.i18n, &server_url, auth, &args, &capture_mode)
@@ -1395,6 +1396,7 @@ fn run_with_hook_connection(
             &preview_capture_mode,
             args.capture_assistant,
             config.pi_tool_exposure,
+            config.pi_direct_tools.as_deref(),
         ),
         AgentChoice::Omp => render_omp_extension(
             &server_url,
@@ -6450,6 +6452,7 @@ fn apply_to_pi_extension(
     args: &InstallHooksArgs,
     capture_mode: &str,
     exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
 ) -> Result<()> {
     let path = resolve_pi_extension_path(args)?;
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -6460,6 +6463,7 @@ fn apply_to_pi_extension(
         capture_mode,
         args.capture_assistant,
         exposure,
+        direct_tools,
     );
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -6500,6 +6504,7 @@ fn render_pi_extension(
     capture_mode: &str,
     capture_assistant: bool,
     exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
 ) -> Result<()> {
     println!(
         "// Pi extension — write to {}",
@@ -6516,7 +6521,8 @@ fn render_pi_extension(
             project_strategy,
             capture_mode,
             capture_assistant,
-            exposure
+            exposure,
+            direct_tools,
         )
     );
     Ok(())
@@ -6598,6 +6604,7 @@ fn build_pi_extension(
     capture_mode: &str,
     capture_assistant: bool,
     exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
 ) -> String {
     // When capture is off the output is byte-identical to the pre-#2240 Pi
     // extension: no `CAPTURE_ASSISTANT`/`NATIVE_HOOK` consts, no `spawn` import,
@@ -6633,7 +6640,7 @@ fn build_pi_extension(
     let export_injection = format!(
         "{}\n{}{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
         pi_session_usage_source(),
-        pi_mcp_bridge_source(exposure),
+        pi_mcp_bridge_source(exposure, direct_tools),
         capture_source,
     );
     let mut lifecycle = build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
@@ -6660,6 +6667,15 @@ fn build_pi_extension(
             &export_injection,
         )
         .replace("api.on(\"", "pi.on(\"");
+    if direct_tools.is_some() && exposure == PiToolExposure::Direct {
+        const SESSION_START_BODY: &str = "  pi.on(\"session_start\", (_event: any, ctx: any) => {\n    noteSubagent(ctx);\n    startSession(ctx);\n  });";
+        debug_assert_eq!(lifecycle.matches(SESSION_START_BODY).count(), 1);
+        lifecycle = lifecycle.replacen(
+            SESSION_START_BODY,
+            "  pi.on(\"session_start\", (_event: any, ctx: any) => {\n    noteSubagent(ctx);\n    startSession(ctx);\n    try { if (typeof pi.getActiveTools === \"function\" && typeof pi.setActiveTools === \"function\") { pi.setActiveTools([...new Set([...pi.getActiveTools(), \"tool_search\"])]); } } catch (_e) {}\n  });",
+            1,
+        );
+    }
     if capture_assistant {
         lifecycle = lifecycle.replace(
             "import { execFileSync } from \"node:child_process\";",
@@ -6710,20 +6726,56 @@ function piSessionPayload(ctx: any): Record<string, unknown> {
 /// The registration line [`pi_mcp_bridge_source`] adds `exposure` after.
 const PI_TOOL_LABEL_LINE: &str = "          label: tool.name,\n";
 
-/// The MCP bridge half of the Pi extension. `direct` is Pi's default
-/// `exposure`, so it is left out and the file stays as earlier releases wrote
-/// it; `codemode` is spelled out on every registration (#1988). Values per
+/// The MCP bridge half of the Pi extension. `direct` with `direct_tools: None`
+/// leaves `exposure` out so the file stays byte-identical to earlier releases;
+/// `codemode` spells out `exposure: "codemode"` on every registration (#1988);
+/// `direct_tools: Some(list)` keeps listed tools `direct`, marks all others
+/// `deferred`, and attaches a single `promptGuidelines` discovery hint (#2428).
+/// Values per
 /// <https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure>.
-fn pi_mcp_bridge_source(exposure: PiToolExposure) -> String {
+fn pi_mcp_bridge_source(exposure: PiToolExposure, direct_tools: Option<&[String]>) -> String {
     let source = PI_MCP_BRIDGE_SOURCE;
     debug_assert_eq!(source.matches(PI_TOOL_LABEL_LINE).count(), 1);
-    match exposure {
-        PiToolExposure::Direct => source.to_string(),
-        PiToolExposure::Codemode => source.replacen(
+    match (exposure, direct_tools) {
+        (PiToolExposure::Direct, None) => source.to_string(),
+        (PiToolExposure::Codemode, _) => source.replacen(
             PI_TOOL_LABEL_LINE,
             &format!("{PI_TOOL_LABEL_LINE}          exposure: \"codemode\",\n"),
             1,
         ),
+        (PiToolExposure::Direct, Some(tools)) => {
+            const TIMEOUT_LINE: &str = "const MCP_REQUEST_TIMEOUT_MS = 10000;\n";
+            const LOOP_LINE: &str = "    for (const tool of listed?.tools ?? []) {\n";
+            debug_assert_eq!(source.matches(TIMEOUT_LINE).count(), 1);
+            debug_assert_eq!(source.matches(LOOP_LINE).count(), 1);
+            let serialized = serde_json::to_string(tools)
+                .expect("serializing pi_direct_tools to JSON cannot fail");
+            source
+                .replacen(
+                    TIMEOUT_LINE,
+                    &format!("{TIMEOUT_LINE}const DIRECT_TOOLS = new Set({serialized});\n"),
+                    1,
+                )
+                .replacen(
+                    LOOP_LINE,
+                    "    const listedTools = listed?.tools ?? [];\n    \
+                     const guidelineTarget = (DIRECT_TOOLS.has(\"memory_query\") && listedTools.some((t: any) => t?.name === \"memory_query\"))\n      \
+                     ? \"memory_query\"\n      \
+                     : listedTools.find((t: any) => DIRECT_TOOLS.has(t?.name))?.name ?? listedTools[0]?.name;\n    \
+                     for (const tool of listedTools) {\n",
+                    1,
+                )
+                .replacen(
+                    PI_TOOL_LABEL_LINE,
+                    &format!(
+                        "{PI_TOOL_LABEL_LINE}\
+                         {indent}exposure: DIRECT_TOOLS.has(tool.name) ? \"direct\" : \"deferred\",\n\
+                         {indent}...(guidelineTarget && tool.name === guidelineTarget ? {{ promptGuidelines: [\"Additional ai-memory tools are deferred; use tool_search to discover and load them when needed.\"] }} : {{}}),\n",
+                        indent = "          "
+                    ),
+                    1,
+                )
+        }
     }
 }
 
@@ -14331,6 +14383,7 @@ model = "gpt-5"
                     "denylist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
             (
@@ -14742,6 +14795,7 @@ model = "gpt-5"
                 "denylist",
                 false,
                 PiToolExposure::Direct,
+                None,
             ),
         ] {
             assert!(!extension.contains("/recap"));
@@ -14763,6 +14817,7 @@ model = "gpt-5"
                 "denylist",
                 false,
                 PiToolExposure::Direct,
+                None,
             ),
         ] {
             for expected in [
@@ -16163,6 +16218,7 @@ model = "gpt-5"
             "allowlist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(
             extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
@@ -16202,6 +16258,7 @@ model = "gpt-5"
                     "denylist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
         ];
@@ -16269,6 +16326,7 @@ model = "gpt-5"
                     "denylist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
         ];
@@ -16316,6 +16374,7 @@ model = "gpt-5"
                     "allowlist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
         ];
@@ -17053,6 +17112,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(
             extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
@@ -17070,6 +17130,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
 
         assert!(extension.contains("export default function AiMemoryExtension(pi: any): void"));
@@ -17165,6 +17226,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             true,
             PiToolExposure::Direct,
+            None,
         );
         assert!(on.contains("const CAPTURE_ASSISTANT = true;"), "{on}");
         assert!(
@@ -17230,6 +17292,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(!off.contains("CAPTURE_ASSISTANT"), "{off}");
         assert!(!off.contains("NATIVE_HOOK"), "{off}");
@@ -17255,6 +17318,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             true,
             PiToolExposure::Direct,
+            None,
         );
         let strategy_decl = "const NATIVE_PROJECT_STRATEGY: string | undefined = \"repo-root\";";
         let push_line = concat!(
@@ -17271,6 +17335,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             true,
             PiToolExposure::Direct,
+            None,
         );
         let unset_decl = "const NATIVE_PROJECT_STRATEGY: string | undefined = undefined;";
         assert!(no_strategy.contains(unset_decl), "{no_strategy}");
@@ -17284,6 +17349,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(
             !capture_off.contains("NATIVE_PROJECT_STRATEGY"),
@@ -17308,6 +17374,7 @@ process.stdout.write(JSON.stringify({
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
 
         let notify_start = extension
@@ -17357,6 +17424,7 @@ process.stdout.write(JSON.stringify({
                 "denylist",
                 false,
                 exposure,
+                None,
             )
         };
         let direct = render(PiToolExposure::Direct);
@@ -17455,6 +17523,7 @@ process.stdout.write(JSON.stringify({
                     "denylist",
                     false,
                     exposure,
+                    None,
                 ),
             )
             .unwrap();
@@ -17492,6 +17561,220 @@ process.stdout.write(JSON.stringify({
                     "mcp": "pi-codemode-session",
                 }),
                 "{exposure:?}"
+            );
+        }
+    }
+
+    /// #2428: `pi_direct_tools` emits `DIRECT_TOOLS`, conditional `exposure`,
+    /// a single `promptGuidelines` hint, and `session_start` `tool_search`
+    /// activation; `None` stays byte-identical to the default extension.
+    #[test]
+    fn pi_direct_tools_is_baked_into_registration_and_session_start() {
+        let render = |direct_tools: Option<&[String]>| {
+            build_pi_extension(
+                "http://127.0.0.1:49374",
+                Some("tok"),
+                None,
+                "denylist",
+                false,
+                PiToolExposure::Direct,
+                direct_tools,
+            )
+        };
+        let baseline = render(None);
+        assert!(!baseline.contains("DIRECT_TOOLS"), "{baseline}");
+        assert!(!baseline.contains("exposure"), "{baseline}");
+        assert!(!baseline.contains("promptGuidelines"), "{baseline}");
+        assert!(!baseline.contains("setActiveTools"), "{baseline}");
+
+        let list = vec!["memory_query".to_string(), "memory_briefing".to_string()];
+        let selective = render(Some(&list));
+        assert!(
+            selective
+                .contains("const DIRECT_TOOLS = new Set([\"memory_query\",\"memory_briefing\"]);"),
+            "{selective}"
+        );
+        assert!(
+            selective
+                .contains("exposure: DIRECT_TOOLS.has(tool.name) ? \"direct\" : \"deferred\","),
+            "{selective}"
+        );
+        assert!(selective.contains("promptGuidelines:"), "{selective}");
+        let session_start = selective.find("pi.on(\"session_start\"").unwrap();
+        let next_handler = session_start
+            + selective[session_start..]
+                .find("pi.on(\"before_agent_start\"")
+                .unwrap();
+        let activate = selective.find("pi.setActiveTools").unwrap();
+        assert!(session_start < activate && activate < next_handler);
+
+        let defer_all = render(Some(&[]));
+        assert!(
+            defer_all.contains("const DIRECT_TOOLS = new Set([]);"),
+            "{defer_all}"
+        );
+        assert!(defer_all.contains("pi.setActiveTools"), "{defer_all}");
+    }
+
+    /// #2428: `install-hooks --agent pi --apply` respects `pi_direct_tools`,
+    /// is idempotent on re-run, and restores the byte-identical baseline when
+    /// `pi_direct_tools` is unset.
+    #[test]
+    fn pi_apply_follows_pi_direct_tools_idempotently() {
+        let home = TempDir::new().unwrap();
+        let extension = home.path().join("ai-memory-pi.ts");
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let args = || InstallHooksArgs {
+            agent: AgentChoice::Pi,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(extension.clone()),
+            ..default_hook_args()
+        };
+
+        run(&config, args()).unwrap();
+        let baseline = fs::read_to_string(&extension).unwrap();
+        assert!(!baseline.contains("DIRECT_TOOLS"), "{baseline}");
+
+        config.pi_direct_tools = Some(vec!["memory_query".to_string()]);
+        run(&config, args()).unwrap();
+        let selective = fs::read_to_string(&extension).unwrap();
+        assert!(
+            selective.contains("const DIRECT_TOOLS = new Set([\"memory_query\"]);"),
+            "{selective}"
+        );
+        run(&config, args()).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), selective);
+
+        config.pi_direct_tools = None;
+        run(&config, args()).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), baseline);
+    }
+
+    /// #2428 in Node: verifies direct vs deferred registration, single
+    /// `promptGuidelines` placement (preferring `memory_query`, then first
+    /// direct tool, then first tool fallback), and `session_start` activating
+    /// `tool_search` via `getActiveTools`/`setActiveTools`.
+    #[test]
+    fn pi_direct_tools_registers_direct_and_deferred_tools_in_node() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        const HARNESS: &str = r#"
+import { pathToFileURL } from "node:url";
+globalThis.fetch = async (url: any, options: any) => {
+  const target = new URL(url);
+  if (target.pathname !== "/mcp") return new Response(null, { status: 202 });
+  const body = JSON.parse(options.body);
+  if (body.id === undefined) return new Response(null, { status: 202 });
+  const result = body.method === "tools/list"
+    ? {
+        tools: [
+          { name: "memory_write_page", description: "w", inputSchema: { type: "object" } },
+          { name: "memory_briefing", description: "b", inputSchema: { type: "object" } },
+          { name: "memory_query", description: "q", inputSchema: { type: "object" } },
+        ],
+      }
+    : {};
+  return Response.json({ jsonrpc: "2.0", id: body.id, result });
+};
+const tools: any[] = [];
+const handlers: Record<string, any> = {};
+let activeTools = ["bash", "read"];
+const { default: extension } = await import(pathToFileURL(process.argv[2]).href);
+extension({
+  on: (event: string, fn: any) => { handlers[event] = fn; },
+  registerTool: (tool: any) => tools.push(tool),
+  getActiveTools: () => activeTools,
+  setActiveTools: (next: string[]) => { activeTools = next; },
+});
+for (let i = 0; i < 200 && tools.length < 3; i++) await new Promise((r) => setTimeout(r, 10));
+handlers["session_start"]?.({}, { cwd: process.cwd(), sessionManager: { getSessionId: () => "pi-s1" } });
+process.stdout.write(JSON.stringify({
+  tools: tools.map((t) => ({
+    name: t.name,
+    exposure: t.exposure ?? null,
+    guidelines: t.promptGuidelines?.length ?? 0,
+  })),
+  activeTools,
+}) + "\n", (error) => process.exit(error ? 1 : 0));
+"#;
+        let cases: &[(&[&str], serde_json::Value)] = &[
+            (
+                &["memory_query", "memory_briefing"],
+                serde_json::json!([
+                    {"name": "memory_write_page", "exposure": "deferred", "guidelines": 0},
+                    {"name": "memory_briefing", "exposure": "direct", "guidelines": 0},
+                    {"name": "memory_query", "exposure": "direct", "guidelines": 1},
+                ]),
+            ),
+            (
+                &["memory_briefing"],
+                serde_json::json!([
+                    {"name": "memory_write_page", "exposure": "deferred", "guidelines": 0},
+                    {"name": "memory_briefing", "exposure": "direct", "guidelines": 1},
+                    {"name": "memory_query", "exposure": "deferred", "guidelines": 0},
+                ]),
+            ),
+            (
+                &[],
+                serde_json::json!([
+                    {"name": "memory_write_page", "exposure": "deferred", "guidelines": 1},
+                    {"name": "memory_briefing", "exposure": "deferred", "guidelines": 0},
+                    {"name": "memory_query", "exposure": "deferred", "guidelines": 0},
+                ]),
+            ),
+        ];
+
+        for (direct, expected_tools) in cases {
+            let direct_vec: Vec<String> = direct.iter().map(|s| (*s).to_string()).collect();
+            let tmp = TempDir::new().unwrap();
+            let extension = tmp.path().join("ai-memory-pi.ts");
+            fs::write(
+                &extension,
+                build_pi_extension(
+                    "http://127.0.0.1:49600",
+                    None,
+                    None,
+                    "denylist",
+                    false,
+                    PiToolExposure::Direct,
+                    Some(&direct_vec),
+                ),
+            )
+            .unwrap();
+            fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
+            let mut command = Command::new("node");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AI_MEMORY_") {
+                    command.env_remove(&key);
+                }
+            }
+            let output = command
+                .args(["--experimental-strip-types", "--no-warnings", "harness.ts"])
+                .arg(&extension)
+                .current_dir(tmp.path())
+                .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
+                .env("AI_MEMORY_DATA_DIR", tmp.path().join("data"))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{direct:?}: harness failed\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let seen: serde_json::Value =
+                serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+            assert_eq!(
+                seen,
+                serde_json::json!({
+                    "tools": expected_tools,
+                    "activeTools": ["bash", "read", "tool_search"],
+                }),
+                "{direct:?}"
             );
         }
     }
