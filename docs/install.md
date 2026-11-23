@@ -2595,6 +2595,13 @@ The Pi and OMP extensions use distinct filenames (`ai-memory-pi.ts` and
 `ai-memory-omp.ts`) so installing one never overwrites the other. They are
 not interchangeable: only Pi's bridges MCP tools.
 
+If ai-memory tools are missing, check the extension's startup warning. Discovery
+runs when the extension loads; a failed `initialize` or `tools/list` request does
+not stop lifecycle capture, but leaves the tools unavailable. Start or restore
+the server, check its URL and credentials, then run `/reload` in Pi to load the
+extension and discover the tools again. Starting a new session alone does not
+retry discovery.
+
 #### OMP profiles
 
 `omp --profile <name>` relocates OMP's agent home to

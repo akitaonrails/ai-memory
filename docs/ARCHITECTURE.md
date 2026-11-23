@@ -292,9 +292,10 @@ from hook paths.
    received agent messages (including claimed/cancelled history), or
    auto-improvement data; managed continuity history therefore keeps its
    project scope alive even when no lifecycle-hook session has been captured.
-   The same scheduled sweep tick also runs one store-wide
-   `close_abandoned_sessions` batched `UPDATE`. A session with no activity
-   for 48 hours and no `SessionEnd` gets `ended_at` set from its own last
+   When `[sessions] idle_end_after_hours` is `0`, the scheduled sweep tick
+   also runs one store-wide `close_abandoned_sessions` batched `UPDATE`.
+   A session with no activity for 48 hours and no `SessionEnd` gets
+   `ended_at` set from its own last
    activity, with no summary page and no usage. This keeps
    `open_session_count` from growing on sessions nobody continues, and it is
    narrower than a real end (see the session-usage row below).
@@ -1198,9 +1199,11 @@ that touch the relevant area.
    (`SessionAgents`) with no database round trip (#2023).
    (agentmemory #221 / #143.) The router's filesystem probes of an event's
    cwd (git discovery, canonicalization) never run on an async worker: they
-   go through `CwdProbes`, a blocking-pool path with four permits and a
-   2-second deadline, so a stuck `open()` (macOS privacy controls, a dead
-   network mount) fails that event instead of stalling the server (#1514).
+   go through `CwdProbes`, a blocking-pool path with four permits, one probe
+   per cwd at a time and a 2-second deadline, so a stuck `open()` (macOS
+   privacy controls, a dead network mount) fails that event instead of
+   stalling the server (#1514), and a directory that stays stuck pins one
+   permit however many events come from it (#2434).
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>`
    has no other constructor than `sanitize()`. (design-decisions §14.)
    The opt-in assistant/Stop excerpt (#196) enters through this same

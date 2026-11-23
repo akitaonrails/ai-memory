@@ -290,8 +290,9 @@ a partir dos caminhos de hooks.
    enviadas ou recebidas (incluindo histórico reivindicado/cancelado) ou dados de
    autoaperfeiçoamento; o histórico de continuidade gerenciada, portanto, mantém o escopo de seu projeto
    ativo mesmo quando nenhuma sessão de hook de ciclo de vida tiver sido capturada.
-   O mesmo ciclo agendado de varredura também executa um `UPDATE` em lote
-   de `close_abandoned_sessions` em todo o armazenamento. Uma sessão sem atividade
+   Quando `[sessions] idle_end_after_hours` é `0`, o ciclo agendado de varredura
+   também executa um `UPDATE` em lote de `close_abandoned_sessions` em todo
+   o armazenamento. Uma sessão sem atividade
    por 48 horas e sem `SessionEnd` tem seu `ended_at` definido a partir de sua própria última
    atividade, sem página de resumo e sem uso. Isso evita que
    `open_session_count` cresça em sessões que ninguém continua, sendo mais
@@ -1168,9 +1169,11 @@ que toquem na área relevante.
    em memória (`SessionAgents`) sem ida ao banco de dados (#2023).
    (agentmemory #221 / #143.) As sondagens do sistema de arquivos do roteador do diretório de trabalho de um evento
    (descoberta git, canonização) nunca rodam em um worker assíncrono: elas
-   passam por `CwdProbes`, um caminho de pool bloqueante com quatro permissões e um
-   prazo de 2 segundos, para que um `open()` travado (controles de privacidade do macOS, uma montagem de
-   rede inativa) falhe aquele evento em vez de paralisar o servidor (#1514).
+   passam por `CwdProbes`, um caminho de pool bloqueante com quatro permissões, uma
+   sondagem por diretório de cada vez e um prazo de 2 segundos, para que um `open()`
+   travado (controles de privacidade do macOS, uma montagem de rede inativa) falhe
+   aquele evento em vez de paralisar o servidor (#1514), e um diretório que continua
+   travado prende uma só permissão, não importa quantos eventos venham dele (#2434).
 6. **A remoção de privacidade é uma fronteira tipada.** `Sanitized<NewObservation>`
    não tem outro construtor além de `sanitize()`. (design-decisions §14.)
    O trecho opcional de assistente/Stop (#196) entra através dessa mesma

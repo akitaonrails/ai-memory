@@ -123,6 +123,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Reported Pi MCP tool discovery failures with a server check and `/reload`
+  recovery instruction, while keeping lifecycle capture enabled. (#2429)
+
+- Let the configured idle session timeout govern scheduled session closure
+  even when it exceeds the forget sweep's 48-hour cutoff. (#2431)
+
+- Added Antigravity CLI 1.5.x file-tool support (`read_file` step-output
+  enrichment, `write_file`/`edit_file` argument code extraction, and `args.Path`
+  capture-policy path extraction in Rust and mirrored TypeScript), and
+  deprioritized opaque metadata-only `tool_family: unknown` stubs below
+  substantive observations in unfinished-session recovery snapshots. (#2436)
+
 - Applied the container wrapper's host-file UID and SELinux handling to
   `doctor`, so it can read home markers and harness stores instead of
   reporting an invalid home route map when access is denied. (#2403)
@@ -130,8 +142,14 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed incremental page listing when a long nested wiki path fits in the
   cursor but falls on a page boundary. (#2408)
 
+- Kept keyboard focus on token-usage selectors when using arrow keys in
+  the session timeline. (#2432)
+
 - Fixed installation-guide links whose GitHub fragments contain repeated
   hyphens so they jump to the matching heading in the bundled web docs. (#2419)
+
+- Fixed PPTX imports failing on section metadata in PowerPoint decks. The
+  importer now uses PresentationML slide IDs to read the slides in order. (#2430)
 
 - Kept the ETag from the page version written by `ai-memory-wikisync export --force`,
   so later exports detect a server restored to an earlier version. (#1120)
@@ -182,6 +200,9 @@ version in [`docs/changelog/`](docs/changelog/):
 - Included Codex hook settings in agent backups and used the effective
   `CODEX_HOME` for Codex configuration, skills, and plugins on backup and
   restore. (#2409)
+
+- Included Kimi Code's hook and provider settings from the active
+  `config.toml` in agent backups, with structured credential redaction. (#2433)
 
 - Avoided scanning every pending wiki path for the next debounce deadline on
   each filesystem notification, reducing watcher work during bulk edits. (#2354)
@@ -247,6 +268,13 @@ version in [`docs/changelog/`](docs/changelog/):
 - Backed up Kimi Code's MCP settings and skills from its active home.
   Restores honor `KIMI_CODE_HOME` and keep the recorded destinations for
   older `.kimi/` archives. (#2418)
+
+- Kept a directory whose cwd probe never returns from taking every probe
+  permit on the server. Each hook event from that directory used to pin a
+  permit of its own, so a few of them made every event that needed a probe
+  fail with `inspecting cwd ... did not finish within 2s`, whatever directory
+  it came from. A directory's probes now run one at a time, so it pins one
+  permit and events from other directories keep resolving. (#2434)
 
 ## [3.5.1] - 2026-11-19
 

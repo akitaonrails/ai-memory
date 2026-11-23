@@ -208,6 +208,8 @@ alongside numbered worksheet parts.
 
 XLSX worksheet and PPTX slide relationship IDs accept any prefix bound to the
 Office relationship namespace, including the Transitional and Strict variants.
+PPTX imports follow the presentation's slide order when the deck contains
+PowerPoint sections.
 
 VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
 between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep

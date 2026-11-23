@@ -38,13 +38,14 @@ pub const MAX_ANTIGRAVITY_OUTPUT_BYTES: usize = 2048;
 /// Check if a tool is eligible for output extraction from `output.txt`.
 ///
 /// Whitelist rationale:
-/// - Tools like `run_command`, `view_file`, and search tools produce valuable
-///   execution logs or inspection output in `output.txt`.
-/// - Mutation tools (`write_to_file`, `replace_file_content`) must NEVER be
-///   enriched here because their `output.txt` only contains generic confirmation
-///   strings ("Created file..."), whereas `ai-memory` extracts the real code
-///   from `args.CodeContent` / `args.ReplacementContent`. Overwriting with
-///   `tool_response` would destroy that code capture.
+/// - Tools like `run_command`, `view_file` / `read_file`, and search tools
+///   produce valuable execution logs or inspection output in `output.txt`.
+/// - Mutation tools (`write_to_file`, `replace_file_content`, `write_file`,
+///   `edit_file`) must NEVER be enriched here because their `output.txt` only
+///   contains generic confirmation strings ("Created file..."), whereas
+///   `ai-memory` extracts the real code from `args.CodeContent` /
+///   `args.ReplacementContent` / `args.Content` / `args.Replacement`.
+///   Overwriting with `tool_response` would destroy that code capture.
 /// - Unproven generic tools (`read_url_content`, `read_resource`, `call_mcp_tool`)
 ///   fail closed to `ToolFamily::Unknown`.
 #[must_use]
@@ -53,6 +54,7 @@ pub fn is_output_eligible(tool_name: &str) -> bool {
         tool_name.to_ascii_lowercase().as_str(),
         "run_command"
             | "view_file"
+            | "read_file"
             | "list_dir"
             | "find_by_name"
             | "grep_search"
@@ -741,6 +743,8 @@ mod tests {
         assert!(is_output_eligible("RUN_COMMAND"));
         assert!(is_output_eligible("view_file"));
         assert!(is_output_eligible("View_File"));
+        assert!(is_output_eligible("read_file"));
+        assert!(is_output_eligible("Read_File"));
         assert!(is_output_eligible("list_dir"));
         assert!(is_output_eligible("find_by_name"));
         assert!(is_output_eligible("grep_search"));
@@ -752,6 +756,8 @@ mod tests {
         assert!(!is_output_eligible("write_to_file"));
         assert!(!is_output_eligible("replace_file_content"));
         assert!(!is_output_eligible("multi_replace_file_content"));
+        assert!(!is_output_eligible("write_file"));
+        assert!(!is_output_eligible("edit_file"));
         assert!(!is_output_eligible("generate_image"));
         assert!(!is_output_eligible("ask_question"));
         assert!(!is_output_eligible("schedule"));
@@ -971,6 +977,60 @@ mod tests {
         // Assert
         assert!(!enriched);
         assert!(payload.get("tool_response").is_none());
+    }
+
+    #[test]
+    fn test_enrich_antigravity_step_output_supports_1_5_read_file_and_skips_write_edit() {
+        let dir = tempdir().unwrap();
+        let step_dir = dir.path().join(".system_generated").join("steps").join("7");
+        fs::create_dir_all(&step_dir).unwrap();
+        fs::write(
+            step_dir.join("output.txt"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+
+        let mut read_payload = serde_json::json!({
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": "/workspace/src/lib.rs"}
+            },
+            "stepIdx": 7,
+            "artifactDirectoryPath": dir.path().to_str().unwrap()
+        });
+        assert!(enrich_antigravity_step_output(
+            &mut read_payload,
+            HookEvent::PostToolUse,
+            None
+        ));
+        assert_eq!(
+            read_payload
+                .get("tool_response")
+                .and_then(serde_json::Value::as_str),
+            Some("pub fn answer() -> u32 { 42 }")
+        );
+
+        for (tool, args) in [
+            (
+                "write_file",
+                serde_json::json!({"Path": "/workspace/new.rs", "Content": "fn main() {}"}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"Path": "/workspace/new.rs", "Target": "a", "Replacement": "b"}),
+            ),
+        ] {
+            let mut payload = serde_json::json!({
+                "toolCall": {"name": tool, "args": args},
+                "stepIdx": 7,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            });
+            assert!(
+                !enrich_antigravity_step_output(&mut payload, HookEvent::PostToolUse, None),
+                "{tool} must not be overwritten with output.txt"
+            );
+            assert!(payload.get("tool_response").is_none());
+        }
     }
 
     #[test]

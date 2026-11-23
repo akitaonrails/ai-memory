@@ -1304,14 +1304,24 @@ fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option
     let tool = tool_call.get("name")?.as_str()?;
     if !matches!(
         tool.to_ascii_lowercase().as_str(),
-        "write_to_file" | "replace_file_content" | "multi_replace_file_content"
+        "write_to_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "write_file"
+            | "edit_file"
     ) {
         return None;
     }
     let args = tool_call.get("args")?;
     extract_content(
         args,
-        &["ReplacementContent", "CodeContent", "ReplacementChunks"],
+        &[
+            "ReplacementContent",
+            "CodeContent",
+            "ReplacementChunks",
+            "Replacement",
+            "Content",
+        ],
     )
 }
 
@@ -5443,6 +5453,50 @@ outcome: unknown
         assert!(body.contains("tool_family: file"));
         assert!(body.contains("Line 1: first line edited"));
         assert!(body.contains("Line 4: fourth line edited"));
+
+        // Antigravity CLI 1.5.x renamed write_to_file/replace_file_content to
+        // write_file/edit_file with Path + Content/Replacement args.
+        let write_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {
+                        "Path": "/repo/src/new_file.rs",
+                        "Content": "pub fn created_by_1_5() -> bool { true }\n",
+                        "Overwrite": true
+                    }
+                }
+            }),
+        );
+        let body = write_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("created_by_1_5"));
+
+        let edit_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "edit_file",
+                    "args": {
+                        "Path": "/repo/src/new_file.rs",
+                        "Target": "true",
+                        "Replacement": "EDITED_BY_1_5_SENTINEL"
+                    }
+                }
+            }),
+        );
+        let body = edit_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("EDITED_BY_1_5_SENTINEL"));
     }
 
     #[test]

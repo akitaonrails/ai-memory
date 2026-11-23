@@ -2277,6 +2277,8 @@ async fn start_maintenance_scheduler(
     }
 
     let forget_sweep_interval_secs = settings.forget_sweep_interval_secs;
+    let idle_end_after_hours = sessions.idle_end_after_hours;
+    let idle_end_enabled = idle_end_after_hours > 0;
     let lint_interval_secs = settings.lint_interval_secs;
     let lint_llm = llm_providers.get(LlmWorkload::Lint).cloned();
     let lint_llm_interval_secs = scheduled_llm_lint_interval(
@@ -2342,6 +2344,7 @@ async fn start_maintenance_scheduler(
                             decay.ledger_retention(),
                             decay.compact_cold_episodic,
                             decay.cold_cluster_dedup(dedup_embedding),
+                            !idle_end_enabled,
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -2697,8 +2700,7 @@ async fn start_maintenance_scheduler(
     // interval; the scan is stateless and idempotent (the writer-side
     // `ended_at IS NULL` CAS plus the conditional page write make a double
     // end impossible), so it needs no persisted cadence state.
-    let idle_end_after_hours = sessions.idle_end_after_hours;
-    if maintenance_enabled && idle_end_after_hours > 0 {
+    if maintenance_enabled && idle_end_enabled {
         let writer = writer.clone();
         let reader = reader.clone();
         let wiki = wiki.clone();
@@ -2925,6 +2927,7 @@ async fn run_scheduled_sweep_tick(
     ledgers: ai_memory_consolidate::LedgerRetention,
     compact_cold_episodic: bool,
     dedup: ai_memory_consolidate::ColdClusterDedup,
+    close_abandoned_sessions: bool,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -2974,6 +2977,10 @@ async fn run_scheduled_sweep_tick(
                 );
             }
         }
+    }
+
+    if !close_abandoned_sessions {
+        return Ok(outcome);
     }
 
     let cutoff_us = jiff::Timestamp::now().as_microsecond()
@@ -7325,6 +7332,7 @@ mod tests {
             ai_memory_consolidate::LedgerRetention::default(),
             false,
             ai_memory_consolidate::ColdClusterDedup::default(),
+            true,
         )
         .await
         .unwrap();
@@ -7342,6 +7350,82 @@ mod tests {
                     .unwrap()
                     .is_empty(),
                 "sweep should evict the eligible page in every project"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forget_sweep_leaves_session_closure_to_the_configured_idle_tick() {
+        for (idle_end_after_hours, expected_open) in [(0, false), (72, true)] {
+            let (_tmp, store, wiki, ws, proj, _second) = two_project_wiki().await;
+            let sid = SessionId::new();
+            let now = jiff::Timestamp::now().as_microsecond();
+            let last_activity = now - 49 * 3_600_000_000;
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                    occurred_at: Some(last_activity),
+                    origin: None,
+                })
+                .await
+                .unwrap();
+
+            let tasks = start_maintenance_scheduler(
+                MaintenanceSettings {
+                    enabled: true,
+                    forget_sweep_interval_secs: 1,
+                    lint_interval_secs: 0,
+                    lint_llm_interval_secs: 0,
+                    embedding_backfill_interval_secs: 0,
+                    reconcile_tombstones_deleted_pages: false,
+                },
+                AutoImproveSettings::default(),
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki,
+                None,
+                LlmProviders::default(),
+                crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings {
+                    idle_end_after_hours,
+                },
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
+                None,
+                true,
+            )
+            .await;
+            let swept = tokio::time::timeout(Duration::from_secs(10), async {
+                while store
+                    .reader
+                    .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            for task in tasks {
+                task.abort();
+            }
+            swept.expect("scheduled forget sweep completed");
+            let open = store.reader.idle_open_sessions(now, 1).await.unwrap();
+            assert_eq!(
+                open.iter().any(|session| session.session_id == sid),
+                expected_open,
+                "idle_end_after_hours={idle_end_after_hours}",
             );
         }
     }

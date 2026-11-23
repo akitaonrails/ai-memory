@@ -303,6 +303,9 @@ impl ProjectBriefs {
     }
 }
 
+type CwdProbeGate = tokio::sync::Mutex<()>;
+type CwdProbeGateMap = HashMap<String, Weak<CwdProbeGate>>;
+
 /// Runs the hook resolver's filesystem probes of a caller-supplied cwd (git
 /// discovery, canonicalization) off the async workers (#1514).
 ///
@@ -314,9 +317,16 @@ impl ProjectBriefs {
 /// probe runs on the blocking pool, holding one of a fixed number of permits
 /// until the syscall really returns, so probes that never return pin at most
 /// that many threads, and the caller gives up after a deadline.
+///
+/// One cwd's probes take turns (#2434). Each event from a directory that
+/// blocks used to pin a permit of its own, so a handful of events from one
+/// such directory left no permit for any other cwd and every hook event on
+/// the server failed. Queued behind the stuck probe they hold nothing, and
+/// the directory pins one thread however many events name it.
 #[derive(Clone)]
 pub struct CwdProbes {
     permits: Arc<tokio::sync::Semaphore>,
+    gates: Arc<tokio::sync::Mutex<CwdProbeGateMap>>,
     timeout: std::time::Duration,
 }
 
@@ -330,13 +340,15 @@ impl CwdProbes {
     fn new(max_in_flight: usize, timeout: std::time::Duration) -> Self {
         Self {
             permits: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+            gates: Arc::default(),
             timeout,
         }
     }
 
-    /// Run `probe` on the blocking pool. Fails when no permit frees up or
-    /// the probe does not finish before the deadline; the event then fails
-    /// rather than routing on a guess, and nothing is cached.
+    /// Run `probe` on the blocking pool once no earlier probe of the same
+    /// cwd is still running. Fails when that turn or a permit does not come,
+    /// or the probe does not finish, before the deadline; the event then
+    /// fails rather than routing on a guess, and nothing is cached.
     async fn run<T: Send + 'static>(
         &self,
         cwd: &str,
@@ -344,9 +356,12 @@ impl CwdProbes {
     ) -> anyhow::Result<T> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let finished = async {
+            // The cwd's turn before a permit: an event waiting behind a stuck
+            // probe of its own directory holds no permit while it waits.
+            let turn = self.gate(cwd).await.lock_owned().await;
             let permit = self.permits.clone().acquire_owned().await.ok()?;
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                let _held = (permit, turn);
                 probe()
             })
             .await
@@ -362,6 +377,21 @@ impl CwdProbes {
                 self.timeout
             )),
         }
+    }
+
+    /// The gate `cwd`'s probes queue on, keyed like the project cache so
+    /// every spelling of one directory shares it. Entries are weak, and dead
+    /// ones are dropped when a new cwd arrives, so only gates in use stay.
+    async fn gate(&self, cwd: &str) -> Arc<CwdProbeGate> {
+        let key = normalize_project_path_key(cwd);
+        let mut gates = self.gates.lock().await;
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(CwdProbeGate::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
     }
 }
 
@@ -3170,7 +3200,8 @@ fn render_interrupted_session_markdown(
         }
     }
 
-    let activity: Vec<&ObservationRecord> = records
+    const MAX_ACTIVITY_ITEMS: usize = 8;
+    let (mut activity, stubs): (Vec<&ObservationRecord>, Vec<&ObservationRecord>) = records
         .iter()
         .filter(|record| {
             record.kind != ObservationKind::SessionStart.as_str()
@@ -3178,8 +3209,11 @@ fn render_interrupted_session_markdown(
                 && record.kind != ObservationKind::Stop.as_str()
                 && (!record.title.trim().is_empty() || !record.body.trim().is_empty())
         })
-        .take(8)
-        .collect();
+        .partition(|record| !is_opaque_unknown_tool_stub(record));
+    activity.truncate(MAX_ACTIVITY_ITEMS);
+    if activity.len() < MAX_ACTIVITY_ITEMS {
+        activity.extend(stubs.into_iter().take(MAX_ACTIVITY_ITEMS - activity.len()));
+    }
     if !activity.is_empty() {
         buf.push_str("\n**Most recent recorded activity** (newest first)\n");
         for record in activity {
@@ -3222,6 +3256,23 @@ fn render_interrupted_session_markdown(
     buf.push('\n');
     buf.push_str(INTERRUPTED_SESSION_FOOTER);
     Some(buf)
+}
+
+fn is_opaque_unknown_tool_stub(record: &ObservationRecord) -> bool {
+    if record.kind != ObservationKind::PreToolUse.as_str()
+        && record.kind != ObservationKind::PostToolUse.as_str()
+    {
+        return false;
+    }
+    let body = record.body.trim();
+    if body.is_empty() || body.contains(ai_memory_core::TOOL_BODY_SEPARATOR) {
+        return false;
+    }
+    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
+    if lines.next() != Some("tool_family: unknown") {
+        return false;
+    }
+    lines.all(|line| line.starts_with("tool_call_id: ") || line == "outcome: unknown")
 }
 
 fn cap_recovery_item(value: &str) -> String {
@@ -10441,6 +10492,58 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(healthy, 7);
+    }
+
+    /// A directory whose probe never returns holds one permit however many
+    /// events name it (#2434). A later probe of the same directory, here
+    /// spelled with a trailing slash, waits behind the stuck one and never
+    /// starts, so the second permit still serves another directory. Without
+    /// the per-cwd gate that probe takes the second permit and blocks too,
+    /// and no other directory resolves.
+    #[tokio::test]
+    async fn cwd_probes_give_a_stuck_directory_one_permit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let probes = CwdProbes::new(2, std::time::Duration::from_millis(200));
+        // The stuck probes return when these senders drop, at the end of the
+        // test or on a failed assertion, and after ten seconds at most, so a
+        // regression fails the test instead of hanging it.
+        let (_release_first, first_released) = std::sync::mpsc::channel::<()>();
+        let (_release_second, second_released) = std::sync::mpsc::channel::<()>();
+        let stuck = std::time::Duration::from_secs(10);
+
+        let first = probes
+            .run("/Volumes/stuck", move || {
+                let _ = first_released.recv_timeout(stuck);
+            })
+            .await;
+        assert!(first.is_err(), "the caller gives up at the deadline");
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = probes
+            .run("/Volumes/stuck/", {
+                let ran = ran.clone();
+                move || {
+                    ran.store(true, Ordering::SeqCst);
+                    let _ = second_released.recv_timeout(stuck);
+                }
+            })
+            .await;
+        assert!(second.is_err(), "the directory is still blocked");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a second thread blocked on the stuck directory"
+        );
+
+        let other = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = probes.run("/w/other", || 7).await {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("another directory still gets a permit");
+        assert_eq!(other, 7);
     }
 
     /// The resolver's filesystem rungs go through the bounded probe path: with
@@ -21249,6 +21352,80 @@ pub(crate) mod tests {
         assert_eq!(rendered.matches(UNTRUSTED_HISTORY_START).count(), 1);
         assert_eq!(rendered.matches(UNTRUSTED_HISTORY_END).count(), 1);
         assert!(rendered.ends_with(INTERRUPTED_SESSION_FOOTER));
+    }
+
+    #[test]
+    fn interrupted_session_renderer_prefers_substantive_over_opaque_unknown_stubs() {
+        let candidate = InterruptedSessionCandidate {
+            session_id: SessionId::new(),
+            agent_kind: AgentKind::AntigravityCli,
+            last_activity_at: "2026-11-23T12:00:00Z".into(),
+            cwd: None,
+        };
+        let make_obs = |kind: ObservationKind, title: &str, body: &str| ObservationRecord {
+            id: ai_memory_core::ObservationId::new(),
+            session_id: candidate.session_id,
+            kind: kind.as_str().into(),
+            title: title.into(),
+            body: body.into(),
+            importance: 3,
+            created_at: candidate.last_activity_at.clone(),
+            extension: None,
+            source_event: None,
+        };
+
+        // 10 newest observations are opaque metadata-only unknown stubs (e.g., parallel
+        // `call_mcp_tool` PreToolUse/PostToolUse pairs); real file and command work sits
+        // beneath them.
+        let mut records = Vec::new();
+        for idx in 0..5 {
+            records.push(make_obs(
+                ObservationKind::PostToolUse,
+                "post_tool_use: unknown",
+                &format!("tool_family: unknown\ntool_call_id: call-{idx}\noutcome: unknown"),
+            ));
+            records.push(make_obs(
+                ObservationKind::PreToolUse,
+                "pre_tool_use: unknown",
+                "tool_family: unknown",
+            ));
+        }
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: file",
+            "tool_family: file\noutcome: unknown\n\npub fn edited_code() {}",
+        ));
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: non-file",
+            "tool_family: non-file\noutcome: unknown\n\ncargo test passed",
+        ));
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: unknown",
+            "tool_family: unknown\noutcome: error",
+        ));
+
+        let rendered = render_interrupted_session_markdown(&candidate, &records, 13, 0)
+            .expect("recovery snapshot renders");
+
+        // All 3 substantive observations must appear (not crowded out by the 10 stubs).
+        assert!(rendered.contains("pub fn edited_code() {}"));
+        assert!(rendered.contains("cargo test passed"));
+        assert!(rendered.contains("outcome: error"));
+        // Remaining 5 of 8 slots fall back to the newest opaque stubs.
+        let activity_section = rendered
+            .split("**Most recent recorded activity** (newest first)\n")
+            .nth(1)
+            .expect("activity section present")
+            .split("\n**Bounds**")
+            .next()
+            .unwrap();
+        let item_count = activity_section
+            .lines()
+            .filter(|line| line.starts_with("- `"))
+            .count();
+        assert_eq!(item_count, 8);
     }
 
     /// Backfill-close must be strictly stricter than the
