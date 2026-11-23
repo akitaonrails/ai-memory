@@ -549,12 +549,16 @@ fn declares_cursor_agent(entry: &serde_json::Value) -> bool {
         })
 }
 
-/// `~/.gemini/settings.json`.
+/// `~/.gemini/settings.json` (or `$GEMINI_CLI_HOME/.gemini/settings.json`).
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.gemini/settings.json")?
-        .join(".gemini")
-        .join("settings.json"))
+    gemini_settings_path_in(std::env::var_os("GEMINI_CLI_HOME"))
+}
+
+/// [`gemini_settings_path`] with the `GEMINI_CLI_HOME` value passed in.
+fn gemini_settings_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(install_mcp::gemini_home_in(env_override)?.join("settings.json"))
 }
 
 /// `~/.gemini/config/hooks.json` — Antigravity CLI lifecycle hooks.
@@ -2338,6 +2342,7 @@ pub(crate) fn hook_config_target_with(
         AgentChoice::Grok => grok_hooks_path_in(env("GROK_HOME")),
         AgentChoice::AntigravityCli => antigravity_hooks_path(),
         AgentChoice::CopilotCli => copilot_cli_hooks_path_in(env("COPILOT_HOME")),
+        AgentChoice::GeminiCli => gemini_settings_path_in(env("GEMINI_CLI_HOME")),
         AgentChoice::Cline => cline_hooks_path_in(env("HOME")),
         other => anyhow::bail!(
             "{} is not auto-wired by `ai-memory run`",

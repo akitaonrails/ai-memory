@@ -203,7 +203,7 @@ runs, in order, the commands a native install otherwise needs one by one:
    `CODEX_HOME` and similar relocations). The plan numbers each agent and
    says what it was found by (its session store, its MCP config, or for Muse
    its directory), then lists the other agents `--agent` accepts. Cursor,
-   Gemini CLI, Droid and the other agents with no store to look for are
+   Droid and the other agents with no store to look for are
    wired by naming them. OpenCode 1 and 2 share one session store, so a
    detected or named `opencode` runs `opencode --version` once and wires the
    plugin and MCP entry for the major it reports, as `install-mcp --client

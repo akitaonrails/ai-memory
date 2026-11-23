@@ -21,6 +21,24 @@ version in [`docs/changelog/`](docs/changelog/):
   extension byte-identical; mutually exclusive with
   `pi_tool_exposure = "codemode"`). (#2428)
 
+- `ai-memory run` accepts `gemini` (alias `gemini-cli`) and manages Google
+  Gemini CLI as a workstream harness: a fresh session gets a generated
+  `--session-id`, a returning one is resumed with `--resume <id>`, explicit user
+  selectors (`--resume`, `-r`, `--session-id`, `--session-file`) win, utility
+  subcommands (`mcp`, `extensions`, `skills`, `hooks`, `gemma`) and listing /
+  deletion / help / version flags pass through, `-p`/`--prompt` blocks
+  first-use adoption, and `--yolo` maps to Gemini CLI's `--yolo` without
+  duplicating `-y`, `--yolo`, or `--approval-mode`. Visible messages and
+  completed tool calls/results are imported read-only from
+  `$GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/session-*.jsonl` with
+  exact-checkout `projectHash` isolation and symlink refusal (hidden `thoughts`,
+  system prompts, binary payloads, and provider metadata are excluded), and the
+  existing `SessionStart` hook delivers workstream context. The first managed
+  launch auto-wires Gemini CLI's hooks and MCP (honoring `GEMINI_CLI_HOME`),
+  `ai-jail` maps it to `--harness gemini` with `GEMINI_API_KEY` /
+  `GOOGLE_API_KEY`, and `doctor` scans its local store. Verified against Gemini
+  CLI 0.64.0 / 0.66.0. (#2435)
+
 - Arabic FTS5 search normalization and hook heuristics: the auxiliary
   CJK/Arabic FTS index strips tashkeel/tatweel/BiDi marks, folds Arabic letter
   variants (Alef, Alef Maksura, Teh Marbuta, Hamza carriers), and normalizes

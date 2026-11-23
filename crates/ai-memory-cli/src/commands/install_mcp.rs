@@ -809,7 +809,7 @@ pub(crate) fn mcp_config_path_with(
                 )
             }
         }
-        McpClient::GeminiCli => home()?.join(".gemini").join("settings.json"),
+        McpClient::GeminiCli => gemini_home_in(env("GEMINI_CLI_HOME"))?.join("settings.json"),
         McpClient::QwenCode => home()?.join(".qwen").join("settings.json"),
         McpClient::Qoder => home()?.join(".qoder").join("settings.json"),
         McpClient::Openclaw => home()?.join(".openclaw").join("config.json"),
@@ -1067,6 +1067,20 @@ fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
     Ok(home_dir()
         .context("could not locate $HOME for Kiro configuration")?
         .join(".kiro"))
+}
+
+/// Google Gemini CLI's configuration directory: `$GEMINI_CLI_HOME/.gemini` when
+/// `GEMINI_CLI_HOME` is set and not blank, otherwise `~/.gemini`. Gemini CLI's
+/// `Storage.getGlobalGeminiDir()` replaces `os.homedir()` with
+/// `GEMINI_CLI_HOME` before appending `.gemini`, so both `settings.json` and
+/// `tmp/` live under this directory.
+pub(crate) fn gemini_home_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join(".gemini"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.gemini/settings.json")?
+        .join(".gemini"))
 }
 
 /// GitHub Copilot CLI's configuration directory: `$COPILOT_HOME` when set and

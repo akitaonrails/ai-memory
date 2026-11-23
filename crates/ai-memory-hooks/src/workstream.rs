@@ -378,6 +378,7 @@ async fn prepare_run(
             | AgentKind::Grok
             | AgentKind::AntigravityCli
             | AgentKind::CopilotCli
+            | AgentKind::GeminiCli
     ) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -3977,6 +3978,15 @@ mod tests {
         assert_explicit_only_managed_harness(
             AgentKind::CopilotCli,
             "318db77d-e19b-4750-82df-192a6b931437",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+        assert_explicit_only_managed_harness(
+            AgentKind::GeminiCli,
+            "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d",
         )
         .await;
     }

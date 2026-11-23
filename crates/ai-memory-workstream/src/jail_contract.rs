@@ -98,6 +98,7 @@ pub const fn ai_jail_harness_name(harness: ManagedHarness) -> Option<&'static st
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => Some("kiro-cli"),
         ManagedHarness::Grok => Some("grok"),
         ManagedHarness::Antigravity => Some("antigravity"),
+        ManagedHarness::Gemini => Some("gemini"),
         ManagedHarness::CommandCode | ManagedHarness::Copilot => None,
     }
 }
@@ -124,7 +125,9 @@ const fn harness_keys(harness: ManagedHarness) -> Option<&'static [&'static str]
             "CLAUDE_CODE_OAUTH_TOKEN",
         ]),
         ManagedHarness::Codex => Some(&["OPENAI_API_KEY"]),
-        ManagedHarness::Antigravity => Some(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+        ManagedHarness::Antigravity | ManagedHarness::Gemini => {
+            Some(&["GEMINI_API_KEY", "GOOGLE_API_KEY"])
+        }
         ManagedHarness::Copilot => Some(&["COPILOT_GITHUB_TOKEN"]),
         // Their keys are not in FORWARDED_ENV_NAMES; ai-jail forwards
         // XAI_API_KEY and MOONSHOT_API_KEY itself with the harness state.
@@ -409,7 +412,7 @@ mod tests {
         );
     }
 
-    const ALL_HARNESSES: [ManagedHarness; 14] = [
+    const ALL_HARNESSES: [ManagedHarness; 15] = [
         ManagedHarness::Claude,
         ManagedHarness::Codex,
         ManagedHarness::OpenCode,
@@ -424,6 +427,7 @@ mod tests {
         ManagedHarness::Grok,
         ManagedHarness::Antigravity,
         ManagedHarness::Copilot,
+        ManagedHarness::Gemini,
     ];
 
     #[test]
@@ -438,6 +442,7 @@ mod tests {
             "omp",
             "antigravity",
             "crush",
+            "gemini",
             "grok",
             "kimi",
             "kiro-cli",
@@ -447,6 +452,7 @@ mod tests {
                 assert!(ACCEPTED.contains(&name), "{harness:?} -> {name}");
             }
         }
+        assert_eq!(ai_jail_harness_name(ManagedHarness::Gemini), Some("gemini"));
         assert_eq!(ai_jail_harness_name(ManagedHarness::Copilot), None);
         assert_eq!(ai_jail_harness_name(ManagedHarness::CommandCode), None);
     }

@@ -155,6 +155,8 @@ pub enum ManagedHarness {
     Antigravity,
     /// GitHub Copilot CLI (`copilot`).
     Copilot,
+    /// Google Gemini CLI (`gemini`).
+    Gemini,
 }
 
 impl ManagedHarness {
@@ -175,6 +177,7 @@ impl ManagedHarness {
             "grok" | "grok-build" => Some(Self::Grok),
             "antigravity" | "antigravity-cli" | "agy" => Some(Self::Antigravity),
             "copilot" | "copilot-cli" => Some(Self::Copilot),
+            "gemini" | "gemini-cli" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -214,6 +217,7 @@ impl ManagedHarness {
             Self::Grok => AgentKind::Grok,
             Self::Antigravity => AgentKind::AntigravityCli,
             Self::Copilot => AgentKind::CopilotCli,
+            Self::Gemini => AgentKind::GeminiCli,
         }
     }
 
@@ -240,6 +244,7 @@ impl ManagedHarness {
             Self::Grok => "grok",
             Self::Antigravity => "agy",
             Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -261,6 +266,7 @@ impl ManagedHarness {
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
             Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -441,17 +447,17 @@ pub fn build_launch_plan_with_env_lookup(
     for id in expected.as_deref().into_iter().chain(linked_session_id) {
         ai_memory_core::NativeSessionIdentity::parse(id, &ai_memory_core::Sanitizer::builtin())?;
     }
-    // Command Code and Copilot also resolve a session name or an id prefix;
-    // only an exact UUID identifies the session before launch. Claude's
-    // `--resume` also takes a session name or a transcript path, while its
-    // `--session-id` names the id itself and stays subject to the identity
-    // check in `run`.
+    // Command Code, Copilot, and Gemini also resolve a session name, index, or
+    // keyword (`latest`) on `--resume`; only an exact UUID identifies the
+    // session before launch. Claude's `--resume` also takes a session name or a
+    // transcript path, while its `--session-id` names the id itself and stays
+    // subject to the identity check in `run`.
     let claude_resume =
         harness == ManagedHarness::Claude && flag_value(&args, &["--resume", "-r"]).is_some();
     if claude_resume
         || matches!(
             harness,
-            ManagedHarness::CommandCode | ManagedHarness::Copilot
+            ManagedHarness::CommandCode | ManagedHarness::Copilot | ManagedHarness::Gemini
         )
     {
         expected = expected.filter(|value| Uuid::parse_str(value).is_ok());
@@ -595,6 +601,21 @@ pub fn build_launch_plan_with_env_lookup(
                     expected = Some(id);
                 }
             }
+            ManagedHarness::Gemini => {
+                // Gemini CLI accepts a caller-chosen UUID on `--session-id` for
+                // a fresh session and resumes an existing session with
+                // `--resume <id>`.
+                let id = linked_session_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let selector = if linked_session_id.is_some() {
+                    "--resume"
+                } else {
+                    "--session-id"
+                };
+                args.extend([OsString::from(selector), OsString::from(&id)]);
+                expected = Some(id);
+            }
         }
     }
 
@@ -625,6 +646,7 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::Grok => Some("--yolo"),
         ManagedHarness::Antigravity => Some("--dangerously-skip-permissions"),
         ManagedHarness::Copilot => Some("--yolo"),
+        ManagedHarness::Gemini => Some("--yolo"),
     };
     if let Some(flag) = flag {
         // Kimi's `--yolo` has hidden aliases (`--yes`, `--auto-approve`) and
@@ -638,6 +660,9 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
             ManagedHarness::Grok => &["--yolo", "--always-approve"],
             // Copilot documents `--allow-all` as the same permission set.
             ManagedHarness::Copilot => &["--yolo", "--allow-all"],
+            // Gemini documents `-y` as the short alias of `--yolo` and
+            // `--approval-mode` as the explicit approval-mode selector.
+            ManagedHarness::Gemini => &["--yolo", "-y", "--approval-mode"],
             _ => &[flag],
         };
         if !has_flag(args, present) {
@@ -776,6 +801,8 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
         ManagedHarness::Antigravity => has_flag(args, &["--print", "-p", "--prompt"]),
         // `-i`/`--interactive` seeds a prompt and keeps the session open.
         ManagedHarness::Copilot => has_flag(args, &["--prompt", "-p"]),
+        // `-i`/`--prompt-interactive` seeds a prompt and keeps the session open.
+        ManagedHarness::Gemini => has_flag(args, &["--prompt", "-p"]),
     }
 }
 
@@ -798,6 +825,19 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
         return LaunchMode::Passthrough;
     }
     if harness == ManagedHarness::CommandCode && has_flag(args, &["--list-models", "--ide-setup"]) {
+        return LaunchMode::Passthrough;
+    }
+    if harness == ManagedHarness::Gemini
+        && has_flag(
+            args,
+            &[
+                "--list-sessions",
+                "--delete-session",
+                "--list-extensions",
+                "-l",
+            ],
+        )
+    {
         return LaunchMode::Passthrough;
     }
     if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
@@ -1064,6 +1104,19 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "workflow",
         ]
         .as_slice(),
+        // Every root command in Gemini CLI 0.64.0 (`gemini --help`), including
+        // singular aliases (`extension`, `skill`, `hook`).
+        ManagedHarness::Gemini => [
+            "mcp",
+            "extensions",
+            "extension",
+            "skills",
+            "skill",
+            "hooks",
+            "hook",
+            "gemma",
+        ]
+        .as_slice(),
     };
     let first = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
         kiro_root_subcommand(args)
@@ -1164,6 +1217,11 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
             args,
             &["--resume", "-r", "--continue", "--session-id", "--connect"],
         ),
+        // `--resume`/`-r`, `--session-id`, and `--session-file` are mutually
+        // exclusive explicit session selectors in Gemini CLI.
+        ManagedHarness::Gemini => {
+            has_flag(args, &["--resume", "-r", "--session-id", "--session-file"])
+        }
     }
 }
 
@@ -1196,6 +1254,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // after the fact, from the conversation store.
         ManagedHarness::Antigravity => flag_value(args, &["--conversation"]),
         ManagedHarness::Copilot => flag_value(args, &["--resume", "-r", "--session-id"]),
+        ManagedHarness::Gemini => flag_value(args, &["--resume", "-r", "--session-id"]),
     }
 }
 
@@ -1370,6 +1429,7 @@ pub fn store_override_vars(harness: ManagedHarness) -> &'static [&'static str] {
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => &["KIRO_HOME"],
         ManagedHarness::Grok => &["GROK_HOME"],
         ManagedHarness::Copilot => &["COPILOT_HOME"],
+        ManagedHarness::Gemini => &["GEMINI_CLI_HOME"],
         ManagedHarness::Crush | ManagedHarness::CommandCode | ManagedHarness::Antigravity => &[],
     }
 }
@@ -1855,6 +1915,9 @@ fn environment_session_dir_with(
         ManagedHarness::Antigravity => None,
         // Sessions live under `<COPILOT_HOME>/session-state/<id>/`.
         ManagedHarness::Copilot => value("COPILOT_HOME").map(|dir| dir.join("session-state")),
+        // `GEMINI_CLI_HOME` overrides `os.homedir()`, so sessions live under
+        // `<GEMINI_CLI_HOME>/.gemini/tmp/<project>/chats/`.
+        ManagedHarness::Gemini => value("GEMINI_CLI_HOME").map(|dir| dir.join(".gemini/tmp")),
     }
 }
 
@@ -4149,6 +4212,8 @@ mod tests {
             ManagedHarness::Omp,
             ManagedHarness::Kimi,
             ManagedHarness::Grok,
+            ManagedHarness::Copilot,
+            ManagedHarness::Gemini,
         ]
         .into_iter()
         .chain(hookless)
@@ -4213,5 +4278,192 @@ mod tests {
         .unwrap();
         assert_eq!(plan.expected_session_id.as_deref(), Some("vendor-界-01"));
         assert!(plan.args.iter().any(|arg| arg == "vendor-界-01"));
+    }
+
+    #[test]
+    fn gemini_fresh_and_linked_resume_inject_native_selectors() {
+        let fresh = build_launch_plan(
+            ManagedHarness::Gemini,
+            None,
+            vec![OsString::from("--model"), OsString::from("gemini-2.5-pro")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(fresh.mode, LaunchMode::Session);
+        let generated = fresh.expected_session_id.as_deref().unwrap();
+        assert!(Uuid::parse_str(generated).is_ok());
+        assert_eq!(
+            strings(&fresh.args),
+            ["--model", "gemini-2.5-pro", "--session-id", generated]
+        );
+
+        let linked = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        let resumed = build_launch_plan(
+            ManagedHarness::Gemini,
+            None,
+            vec![OsString::from("--model"), OsString::from("gemini-2.5-pro")],
+            Some(linked),
+        )
+        .unwrap();
+        assert_eq!(resumed.mode, LaunchMode::Session);
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(linked));
+        assert_eq!(
+            strings(&resumed.args),
+            ["--model", "gemini-2.5-pro", "--resume", linked]
+        );
+    }
+
+    #[test]
+    fn gemini_explicit_selectors_always_win_over_linked_session() {
+        let exact = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        for (native, expected) in [
+            (
+                vec![OsString::from("--resume"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (
+                vec![OsString::from("-r"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (
+                vec![OsString::from("--session-id"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (
+                vec![OsString::from(format!("--session-id={exact}"))],
+                Some(exact),
+            ),
+            // Index and "latest" resolve natively; they identify no UUID before launch.
+            (
+                vec![OsString::from("--resume"), OsString::from("latest")],
+                None,
+            ),
+            (vec![OsString::from("--resume"), OsString::from("5")], None),
+            (
+                vec![
+                    OsString::from("--session-file"),
+                    OsString::from("/tmp/session.json"),
+                ],
+                None,
+            ),
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Gemini,
+                None,
+                native.clone(),
+                Some("linked-id"),
+            )
+            .unwrap();
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert_eq!(plan.expected_session_id.as_deref(), expected, "{native:?}");
+            assert!(!allows_native_session_adoption(
+                ManagedHarness::Gemini,
+                &native
+            ));
+        }
+    }
+
+    #[test]
+    fn gemini_utility_subcommands_and_flags_are_passed_through() {
+        for utility in [
+            "mcp",
+            "extensions",
+            "extension",
+            "skills",
+            "skill",
+            "hooks",
+            "hook",
+            "gemma",
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Gemini,
+                None,
+                vec![OsString::from(utility)],
+                Some("linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{utility}");
+            assert_eq!(strings(&plan.args), [utility]);
+        }
+        for flag in [
+            "--help",
+            "-h",
+            "--version",
+            "-v",
+            "--list-sessions",
+            "--delete-session",
+            "--list-extensions",
+            "-l",
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Gemini,
+                None,
+                vec![OsString::from(flag)],
+                None,
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{flag}");
+            assert_eq!(strings(&plan.args), [flag]);
+        }
+    }
+
+    #[test]
+    fn gemini_prompt_blocks_adoption_but_interactive_seed_does_not() {
+        for args in [
+            vec![OsString::from("-p"), OsString::from("summarize")],
+            vec![OsString::from("--prompt=summarize")],
+        ] {
+            assert!(!allows_native_session_adoption(
+                ManagedHarness::Gemini,
+                &args
+            ));
+            let plan = build_launch_plan(ManagedHarness::Gemini, None, args, None).unwrap();
+            assert_eq!(plan.mode, LaunchMode::Session);
+        }
+        assert!(allows_native_session_adoption(
+            ManagedHarness::Gemini,
+            &[OsString::from("-i"), OsString::from("summarize")]
+        ));
+    }
+
+    #[test]
+    fn gemini_yolo_avoids_duplicating_short_flag_or_approval_mode() {
+        let mut plain = vec![OsString::from("--model"), OsString::from("gemini-2.5-pro")];
+        apply_yolo(ManagedHarness::Gemini, &mut plain);
+        assert_eq!(strings(&plain), ["--model", "gemini-2.5-pro", "--yolo"]);
+
+        for already in [
+            vec!["--yolo"],
+            vec!["-y"],
+            vec!["--approval-mode", "auto_edit"],
+            vec!["--approval-mode=yolo"],
+        ] {
+            let mut args: Vec<OsString> = already.iter().map(OsString::from).collect();
+            apply_yolo(ManagedHarness::Gemini, &mut args);
+            assert_eq!(strings(&args), already, "{already:?} must not duplicate");
+        }
+    }
+
+    #[test]
+    fn gemini_names_and_home_override_are_wired() {
+        for name in ["gemini", "gemini-cli"] {
+            assert_eq!(
+                ManagedHarness::from_name(name),
+                Some(ManagedHarness::Gemini)
+            );
+        }
+        assert_eq!(ManagedHarness::Gemini.agent_kind(), AgentKind::GeminiCli);
+        assert_eq!(ManagedHarness::Gemini.executable(), "gemini");
+        assert_eq!(ManagedHarness::Gemini.as_str(), "gemini");
+        assert!(!ManagedHarness::Gemini.lacks_session_end_hook());
+        assert_eq!(
+            store_override_vars(ManagedHarness::Gemini),
+            ["GEMINI_CLI_HOME"]
+        );
+        let get = |name: &str| (name == "GEMINI_CLI_HOME").then(|| OsString::from("/stores/g"));
+        assert_eq!(
+            environment_session_dir_with(ManagedHarness::Gemini, None, None, get).as_deref(),
+            Some(std::path::Path::new("/stores/g/.gemini/tmp"))
+        );
     }
 }
