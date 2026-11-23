@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Added Antigravity CLI 1.5.x file-tool support (`read_file` step-output
+  enrichment, `write_file`/`edit_file` argument code extraction, and `args.Path`
+  capture-policy path extraction in Rust and mirrored TypeScript), and
+  deprioritized opaque metadata-only `tool_family: unknown` stubs below
+  substantive observations in unfinished-session recovery snapshots. (#2436)
+
 - Applied the container wrapper's host-file UID and SELinux handling to
   `doctor`, so it can read home markers and harness stores instead of
   reporting an invalid home route map when access is denied. (#2403)

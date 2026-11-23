@@ -2753,10 +2753,11 @@ fn command_base(workdir: Option<&str>, cwd: &str) -> String {
 }
 
 /// The single-path fields of the file and search/list tool schemas.
-const DIRECT_PATH_KEYS: [&str; 7] = [
+const DIRECT_PATH_KEYS: [&str; 8] = [
     "file_path",
     "filePath",
     "path",
+    "Path",
     "absolute_path",
     "AbsolutePath",
     "notebook_path",
@@ -7133,6 +7134,58 @@ mod tests {
             json!({"toolCall": {"name": "view_file", "args": {"TargetFile": "src/main.rs"}}});
         let decision = policy.inspect(AgentKind::AntigravityCli, &kept, "/repo");
         assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+
+        // Antigravity CLI 1.5.x file tools pass the file path in `args.Path`.
+        for tool in ["read_file", "write_file", "edit_file"] {
+            let ignored = json!({
+                "toolCall": {
+                    "name": tool,
+                    "args": {"Path": "secret/keys.txt"}
+                }
+            });
+            let decision = policy.inspect(AgentKind::AntigravityCli, &ignored, "/repo");
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+            assert_eq!(
+                decision.protocol().extraction_state(),
+                ExtractionState::Extracted
+            );
+            assert_eq!(decision.protocol().path_count(), 1);
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "tool: {tool}"
+            );
+
+            let kept = json!({
+                "toolCall": {
+                    "name": tool,
+                    "args": {"Path": "src/main.rs"}
+                }
+            });
+            let decision = policy.inspect(AgentKind::AntigravityCli, &kept, "/repo");
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+            assert_eq!(
+                decision.protocol().extraction_state(),
+                ExtractionState::Extracted
+            );
+            assert_eq!(decision.protocol().path_count(), 1);
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Keep,
+                "tool: {tool}"
+            );
+        }
+
+        // Security invariant: call_mcp_tool must still fail closed to Unknown.
+        let mcp = json!({
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {"ServerName": "ai-memory", "ToolName": "memory_query"}
+            }
+        });
+        let decision = policy.inspect(AgentKind::AntigravityCli, &mcp, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
         assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
     }
     #[test]

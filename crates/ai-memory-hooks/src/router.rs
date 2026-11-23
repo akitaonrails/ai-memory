@@ -3139,7 +3139,8 @@ fn render_interrupted_session_markdown(
         }
     }
 
-    let activity: Vec<&ObservationRecord> = records
+    const MAX_ACTIVITY_ITEMS: usize = 8;
+    let (mut activity, stubs): (Vec<&ObservationRecord>, Vec<&ObservationRecord>) = records
         .iter()
         .filter(|record| {
             record.kind != ObservationKind::SessionStart.as_str()
@@ -3147,8 +3148,11 @@ fn render_interrupted_session_markdown(
                 && record.kind != ObservationKind::Stop.as_str()
                 && (!record.title.trim().is_empty() || !record.body.trim().is_empty())
         })
-        .take(8)
-        .collect();
+        .partition(|record| !is_opaque_unknown_tool_stub(record));
+    activity.truncate(MAX_ACTIVITY_ITEMS);
+    if activity.len() < MAX_ACTIVITY_ITEMS {
+        activity.extend(stubs.into_iter().take(MAX_ACTIVITY_ITEMS - activity.len()));
+    }
     if !activity.is_empty() {
         buf.push_str("\n**Most recent recorded activity** (newest first)\n");
         for record in activity {
@@ -3191,6 +3195,23 @@ fn render_interrupted_session_markdown(
     buf.push('\n');
     buf.push_str(INTERRUPTED_SESSION_FOOTER);
     Some(buf)
+}
+
+fn is_opaque_unknown_tool_stub(record: &ObservationRecord) -> bool {
+    if record.kind != ObservationKind::PreToolUse.as_str()
+        && record.kind != ObservationKind::PostToolUse.as_str()
+    {
+        return false;
+    }
+    let body = record.body.trim();
+    if body.is_empty() || body.contains(ai_memory_core::TOOL_BODY_SEPARATOR) {
+        return false;
+    }
+    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
+    if lines.next() != Some("tool_family: unknown") {
+        return false;
+    }
+    lines.all(|line| line.starts_with("tool_call_id: ") || line == "outcome: unknown")
 }
 
 fn cap_recovery_item(value: &str) -> String {
@@ -21106,6 +21127,80 @@ pub(crate) mod tests {
         assert_eq!(rendered.matches(UNTRUSTED_HISTORY_START).count(), 1);
         assert_eq!(rendered.matches(UNTRUSTED_HISTORY_END).count(), 1);
         assert!(rendered.ends_with(INTERRUPTED_SESSION_FOOTER));
+    }
+
+    #[test]
+    fn interrupted_session_renderer_prefers_substantive_over_opaque_unknown_stubs() {
+        let candidate = InterruptedSessionCandidate {
+            session_id: SessionId::new(),
+            agent_kind: AgentKind::AntigravityCli,
+            last_activity_at: "2026-11-23T12:00:00Z".into(),
+            cwd: None,
+        };
+        let make_obs = |kind: ObservationKind, title: &str, body: &str| ObservationRecord {
+            id: ai_memory_core::ObservationId::new(),
+            session_id: candidate.session_id,
+            kind: kind.as_str().into(),
+            title: title.into(),
+            body: body.into(),
+            importance: 3,
+            created_at: candidate.last_activity_at.clone(),
+            extension: None,
+            source_event: None,
+        };
+
+        // 10 newest observations are opaque metadata-only unknown stubs (e.g., parallel
+        // `call_mcp_tool` PreToolUse/PostToolUse pairs); real file and command work sits
+        // beneath them.
+        let mut records = Vec::new();
+        for idx in 0..5 {
+            records.push(make_obs(
+                ObservationKind::PostToolUse,
+                "post_tool_use: unknown",
+                &format!("tool_family: unknown\ntool_call_id: call-{idx}\noutcome: unknown"),
+            ));
+            records.push(make_obs(
+                ObservationKind::PreToolUse,
+                "pre_tool_use: unknown",
+                "tool_family: unknown",
+            ));
+        }
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: file",
+            "tool_family: file\noutcome: unknown\n\npub fn edited_code() {}",
+        ));
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: non-file",
+            "tool_family: non-file\noutcome: unknown\n\ncargo test passed",
+        ));
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: unknown",
+            "tool_family: unknown\noutcome: error",
+        ));
+
+        let rendered = render_interrupted_session_markdown(&candidate, &records, 13, 0)
+            .expect("recovery snapshot renders");
+
+        // All 3 substantive observations must appear (not crowded out by the 10 stubs).
+        assert!(rendered.contains("pub fn edited_code() {}"));
+        assert!(rendered.contains("cargo test passed"));
+        assert!(rendered.contains("outcome: error"));
+        // Remaining 5 of 8 slots fall back to the newest opaque stubs.
+        let activity_section = rendered
+            .split("**Most recent recorded activity** (newest first)\n")
+            .nth(1)
+            .expect("activity section present")
+            .split("\n**Bounds**")
+            .next()
+            .unwrap();
+        let item_count = activity_section
+            .lines()
+            .filter(|line| line.starts_with("- `"))
+            .count();
+        assert_eq!(item_count, 8);
     }
 
     /// Backfill-close must be strictly stricter than the
