@@ -257,6 +257,16 @@ log_level = "info"
 # it. Env equivalent: `AI_MEMORY_PI_TOOL_EXPOSURE`.
 # pi_tool_exposure = "direct"
 
+# Optional list of ai-memory MCP tool names to keep directly exposed in the
+# generated Pi extension while deferring all other ai-memory tools behind Pi's
+# `tool_search` (`exposure: "deferred"`). Unset by default (every tool follows
+# `pi_tool_exposure`). Set to `[]` to defer all ai-memory tools and activate
+# `tool_search`. Mutually exclusive with `pi_tool_exposure = "codemode"`.
+# Re-run `ai-memory install-hooks --agent pi --apply` and restart Pi after
+# changing it. Env equivalent: `AI_MEMORY_PI_DIRECT_TOOLS` (JSON array, e.g.
+# `["memory_query","memory_briefing"]`).
+# pi_direct_tools = ["memory_query", "memory_briefing"]
+
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above
 # the min and below the max are flagged; at or above the max they count as
