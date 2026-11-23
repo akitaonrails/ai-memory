@@ -23,6 +23,9 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed installation-guide links whose GitHub fragments contain repeated
   hyphens so they jump to the matching heading in the bundled web docs. (#2419)
 
+- Fixed PPTX imports failing on section metadata in PowerPoint decks. The
+  importer now uses PresentationML slide IDs to read the slides in order. (#2430)
+
 - Kept the ETag from the page version written by `ai-memory-wikisync export --force`,
   so later exports detect a server restored to an earlier version. (#1120)
 

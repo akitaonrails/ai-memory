@@ -648,6 +648,23 @@ fn pptx_slide_order(presentation: &str, relationships: &str) -> Result<Vec<Strin
             .context("parse PPTX presentation metadata")?
         {
             Event::Start(tag) | Event::Empty(tag) if tag.local_name().as_ref() == "sldId" => {
+                // PowerPoint section entries refer to slides by numeric ID.
+                // PresentationML slide IDs carry the package relationship.
+                // https://learn.microsoft.com/en-us/openspecs/office_standards/ms-pptx/5bd8a237-8753-4d05-b757-c5e84e5d1ba6
+                let (ResolveResult::Bound(namespace), _) =
+                    reader.resolver().resolve_element(tag.name())
+                else {
+                    continue;
+                };
+                let uri = quick_xml::escape::unescape(namespace.as_ref())
+                    .context("decode PresentationML namespace")?;
+                if !matches!(
+                    uri.as_ref(),
+                    "http://schemas.openxmlformats.org/presentationml/2006/main"
+                        | "http://purl.oclc.org/ooxml/presentationml/main"
+                ) {
+                    continue;
+                }
                 let id = required_office_relationship_id(&reader, &tag, "PPTX slide id")?;
                 let target = targets
                     .get(&id)
@@ -1948,7 +1965,27 @@ mod tests {
             &[
                 (
                     "ppt/presentation.xml",
-                    r#"<p:presentation xmlns:p="p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="10" r:id="rId10"/><p:sldId id="2" r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+                    r#"<p:presentation
+                        xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                        xmlns:sections="http://schemas.microsoft.com/office/powerpoint/2010/main">
+                      <p:sldIdLst>
+                        <p:sldId id="256" r:id="rId10"/>
+                        <p:sldId id="257" r:id="rId2"/>
+                      </p:sldIdLst>
+                      <p:extLst>
+                        <p:ext uri="{521415D9-36F7-43E2-AB2F-B90AF26B5E84}">
+                          <sections:sectionLst>
+                            <sections:section name="Overview" id="{11111111-2222-3333-4444-555555555555}">
+                              <sections:sldIdLst>
+                                <sections:sldId id="256"/>
+                                <sections:sldId id="257"/>
+                              </sections:sldIdLst>
+                            </sections:section>
+                          </sections:sectionLst>
+                        </p:ext>
+                      </p:extLst>
+                    </p:presentation>"#,
                 ),
                 (
                     "ppt/_rels/presentation.xml.rels",
@@ -1983,6 +2020,29 @@ mod tests {
     }
 
     #[test]
+    fn pptx_strict_slide_ids_keep_requiring_relationship_ids() {
+        let presentation = r#"<presentation
+          xmlns="http://purl.oclc.org/ooxml/presentationml/main"
+          xmlns:link="http://purl.oclc.org/ooxml/officeDocument/relationships">
+          <sldIdLst><sldId id="256" link:id="rId1"/></sldIdLst>
+        </presentation>"#;
+        let relationships = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/slide" Target="slides/slide1.xml"/>
+        </Relationships>"#;
+        assert_eq!(
+            pptx_slide_order(presentation, relationships).unwrap(),
+            ["ppt/slides/slide1.xml"]
+        );
+        let missing = presentation.replace(r#" link:id="rId1""#, "");
+        assert_eq!(
+            pptx_slide_order(&missing, relationships)
+                .unwrap_err()
+                .to_string(),
+            "missing PPTX slide id"
+        );
+    }
+
+    #[test]
     fn pptx_run_separators_are_preserved_and_sanitized() {
         let temp = TempDir::new().unwrap();
         let file = temp.path().join("separators.pptx");
@@ -2009,7 +2069,7 @@ mod tests {
                 &[
                     (
                         "ppt/presentation.xml",
-                        r#"<p:presentation xmlns:p="p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="1" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+                        r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
                     ),
                     (
                         "ppt/_rels/presentation.xml.rels",
