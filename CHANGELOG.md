@@ -18,7 +18,9 @@ version in [`docs/changelog/`](docs/changelog/):
   variants (Alef, Alef Maksura, Teh Marbuta, Hamza carriers), and normalizes
   Eastern/Extended Arabic-Indic digits (`٠-٩`, `۰-۹`) to ASCII across
   punctuation-separated words, while hook handoff heuristics recognize the
-  Arabic question mark (`؟`) and common Arabic acknowledgments. (#2426)
+  Arabic question mark (`؟`) and common Arabic acknowledgments. Pages and
+  observations stored before the upgrade get the Arabic terms on the first
+  start, through migration V114. (#2426, #2439)
 
 - Local in-process embeddings (`embedding_provider = "local"`) now offer a
   checksum-pinned multilingual model for non-English wikis:
