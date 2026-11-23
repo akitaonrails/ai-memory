@@ -30,7 +30,7 @@ Before these commands were added:
 | **OpenCode (v1 / v2)** | `opencode.json`<br>`opencode.jsonc`<br>`~/.config/opencode/opencode.json` | `~/.config/opencode/skills/` | `~/.config/opencode/plugins/` | `AGENTS.md` |
 | **Devin CLI** | `~/.config/devin/config.json`<br>`~/.config/devin/mcp_config.json` | `~/.config/devin/skills/`<br>`.devin/skills/` | — | Devin instructions |
 | **Grok Build CLI** | `~/.grok/config.toml` | `~/.grok/skills/` | — | Grok instructions |
-| **Kimi Code** | `~/.kimi-code/mcp.json` | `~/.kimi-code/skills/` | — | — |
+| **Kimi Code** | `~/.kimi-code/mcp.json`<br>`~/.kimi-code/config.toml` | `~/.kimi-code/skills/` | — | — |
 | **Kiro CLI (AWS)** | `~/.kiro/settings/mcp.json` | `~/.kiro/agents/*.json` | — | — |
 | **OpenClaw** | `~/.openclaw/config.json` | — | `~/.openclaw/extensions/` | — |
 | **GitHub Copilot CLI** | — (MCP and hooks are not archived) | `$COPILOT_HOME/skills/` (default `~/.copilot/skills/`)<br>`.github/skills/` | — | — |
@@ -57,6 +57,9 @@ Kimi Code backups honor `KIMI_CODE_HOME` as described in the
 On restore, entries recorded under `.kimi-code/` follow the destination machine's
 `KIMI_CODE_HOME` or default to `~/.kimi-code/`. Legacy `.kimi/` entries
 keep their recorded destination under the user's home.
+The active `config.toml` includes hook definitions and provider settings.
+The default redaction scrubs recognized credentials while preserving valid
+TOML. The separate Kimi Code `credentials/` directory stays outside the archive.
 
 ---
 

@@ -79,6 +79,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `CODEX_HOME` for Codex configuration, skills, and plugins on backup and
   restore. (#2409)
 
+- Included Kimi Code's hook and provider settings from the active
+  `config.toml` in agent backups, with structured credential redaction. (#2433)
+
 - Avoided scanning every pending wiki path for the next debounce deadline on
   each filesystem notification, reducing watcher work during bulk edits. (#2354)
 

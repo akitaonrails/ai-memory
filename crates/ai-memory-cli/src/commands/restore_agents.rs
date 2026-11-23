@@ -766,8 +766,10 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".qoder/",
                 ".copilot/skills/",
             ];
-            let allowed = matches!(rel_path, ".claude.json" | ".kimi-code/mcp.json")
-                || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
+            let allowed = matches!(
+                rel_path,
+                ".claude.json" | ".kimi-code/mcp.json" | ".kimi-code/config.toml"
+            ) || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
             if !allowed {
                 bail!(
                     "refusing to restore global asset to unauthorized path: {:?}",
