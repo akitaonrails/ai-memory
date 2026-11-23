@@ -794,34 +794,29 @@ fn github_actions_are_pinned_to_full_commits() {
 }
 
 #[test]
-fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
-    for (path, expected_fixed_jobs) in [
-        (".github/workflows/ci.yml", 2),
-        (".github/workflows/release.yml", 3),
-    ] {
+fn workflows_take_the_rust_toolchain_from_the_toolchain_file() {
+    // rust-toolchain.toml is the one place that names the toolchain. A step
+    // that names its own can drift from it: when the toolchain action moved to
+    // its generic `stable` commit, the fixed jobs kept asking for 1.95 only
+    // because each one was given the version by hand (#339).
+    for path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
         let workflow = read_repo(path);
-        let lines = workflow.lines().collect::<Vec<_>>();
-        let mut fixed_jobs = 0;
-        for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
-            line.contains("uses: dtolnay/rust-toolchain@") && line.ends_with("# 1.95")
-        }) {
-            fixed_jobs += 1;
-            assert_eq!(
-                lines.get(index + 1).map(|line| line.trim()),
-                Some("with:"),
-                "{path} must configure the fixed toolchain after: {line}"
+        let mut installs = 0;
+        for line in workflow.lines().map(str::trim) {
+            assert!(
+                !line.contains("rust-toolchain@"),
+                "{path} must not pick a toolchain through an action: {line}"
             );
-            assert_eq!(
-                lines.get(index + 2).map(|line| line.trim()),
-                Some("toolchain: \"1.95\""),
-                "{path} must keep its # 1.95 job on Rust 1.95"
-            );
+            if line.contains("rustup toolchain install") {
+                installs += 1;
+                assert!(
+                    line.ends_with("rustup toolchain install --no-self-update"),
+                    "{path} must install what rust-toolchain.toml names: {line}"
+                );
+            }
         }
 
-        assert_eq!(
-            fixed_jobs, expected_fixed_jobs,
-            "{path} has an unexpected number of fixed Rust jobs"
-        );
+        assert!(installs > 0, "{path} no longer installs the toolchain");
     }
 }
 

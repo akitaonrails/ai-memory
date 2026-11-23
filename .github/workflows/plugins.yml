@@ -98,7 +98,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # Installs what rust-toolchain.toml names, with the rustup the runner ships.
+      - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
