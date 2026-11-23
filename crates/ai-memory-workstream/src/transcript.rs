@@ -148,6 +148,7 @@ const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
             | ManagedHarness::Copilot
+            | ManagedHarness::Gemini
     )
 }
 
@@ -1571,6 +1572,13 @@ fn export_jsonl_range(
                 &mut losses,
             ),
             ManagedHarness::Copilot => parse_copilot(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
+            ManagedHarness::Gemini => parse_gemini(
                 &value,
                 native_session_id,
                 &record_id,
@@ -3263,6 +3271,233 @@ fn parse_copilot(
     }
 }
 
+/// Gemini CLI JSONL session records (verified on 0.64.0 / 0.66.0).
+/// Line 0 is the `{sessionId, projectHash, startTime, lastUpdated, kind}`
+/// header; subsequent lines are message records (`type: "user" | "gemini" | ...`),
+/// metadata updates (`$set`), in-place patches (`$patch`), or rewinds
+/// (`$rewindTo`). Only visible user/assistant text and completed tool
+/// calls/results are imported; hidden `thoughts`, system prompts, binary
+/// parts, and provider metadata (`tokens`, `model`) are excluded.
+fn parse_gemini(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    if value.get("$set").is_some() {
+        return;
+    }
+    if value.get("$rewindTo").is_some() {
+        losses.push("Gemini CLI session rewind records are not replayed".into());
+        return;
+    }
+    if value.get("$patch").is_some() {
+        losses.push("Gemini CLI in-place message patch records are not replayed".into());
+        return;
+    }
+    // Line 0 metadata header carries sessionId + projectHash and no `type`.
+    let Some(record_type) = value.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let occurred_at = timestamp(value);
+    match record_type {
+        "system" => {
+            losses.push("Gemini CLI system prompt records were intentionally excluded".into());
+        }
+        "user" => {
+            let text = gemini_content_text(value.get("content"), losses);
+            if !text.trim().is_empty() {
+                push_event(
+                    events,
+                    AgentKind::GeminiCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    &text,
+                    occurred_at,
+                    json!({}),
+                );
+            }
+        }
+        "gemini" => {
+            if value
+                .get("thoughts")
+                .and_then(Value::as_array)
+                .is_some_and(|thoughts| !thoughts.is_empty())
+            {
+                losses.push("Gemini CLI hidden reasoning was intentionally excluded".into());
+            }
+            let text = gemini_content_text(value.get("content"), losses);
+            let mut block_index = 0_usize;
+            if !text.trim().is_empty() {
+                push_event(
+                    events,
+                    AgentKind::GeminiCli,
+                    session,
+                    record_id,
+                    block_index,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    &text,
+                    occurred_at.clone(),
+                    json!({}),
+                );
+                block_index += 1;
+            }
+            let tool_calls = value
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for call in tool_calls {
+                let Some(status) = call.get("status").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !matches!(status, "success" | "error" | "cancelled") {
+                    continue;
+                }
+                let name = first_string(call, &["name"]).unwrap_or("tool");
+                let call_id = first_string(call, &["id"]);
+                let call_ts = timestamp(call).or_else(|| occurred_at.clone());
+                let args = call.get("args").map(compact_json).unwrap_or_default();
+                push_event(
+                    events,
+                    AgentKind::GeminiCli,
+                    session,
+                    record_id,
+                    block_index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {args}"),
+                    call_ts.clone(),
+                    with_tool_use_id(json!({"tool": name}), call_id),
+                );
+                block_index += 1;
+
+                let result_text = gemini_tool_result_text(call, status, losses);
+                if !result_text.trim().is_empty() {
+                    push_event(
+                        events,
+                        AgentKind::GeminiCli,
+                        session,
+                        record_id,
+                        block_index,
+                        WorkstreamEventKind::ToolResult,
+                        Some("tool"),
+                        &result_text,
+                        call_ts,
+                        with_tool_use_id(json!({"status": status}), call_id),
+                    );
+                    block_index += 1;
+                }
+            }
+        }
+        "info" | "warning" | "error" => {}
+        _ => {}
+    }
+}
+
+fn gemini_content_text(content: Option<&Value>, losses: &mut Vec<String>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => {
+            let mut texts = Vec::new();
+            let mut saw_binary = false;
+            for part in parts {
+                match part {
+                    Value::String(text) if !text.is_empty() => texts.push(text.clone()),
+                    Value::Object(map) => {
+                        if map.contains_key("inlineData") || map.contains_key("fileData") {
+                            saw_binary = true;
+                            continue;
+                        }
+                        if let Some(text) = map.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            texts.push(text.to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if saw_binary {
+                losses.push("Gemini CLI binary payloads were intentionally excluded".into());
+            }
+            texts.join("\n")
+        }
+        Value::Object(map) => {
+            if map.contains_key("inlineData") || map.contains_key("fileData") {
+                losses.push("Gemini CLI binary payloads were intentionally excluded".into());
+                return String::new();
+            }
+            map.get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+fn gemini_tool_result_text(call: &Value, status: &str, losses: &mut Vec<String>) -> String {
+    if let Some(result) = call.get("result") {
+        let extracted = gemini_tool_result_parts(result, losses);
+        if !extracted.trim().is_empty() {
+            return extracted;
+        }
+    }
+    if let Some(display) = call.get("resultDisplay").and_then(Value::as_str)
+        && !display.trim().is_empty()
+    {
+        return display.to_owned();
+    }
+    match status {
+        "error" => "error".to_owned(),
+        "cancelled" => "cancelled".to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn gemini_tool_result_parts(value: &Value, losses: &mut Vec<String>) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| gemini_tool_result_parts(item, losses))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            if map.contains_key("inlineData") || map.contains_key("fileData") {
+                losses.push("Gemini CLI binary payloads were intentionally excluded".into());
+                return String::new();
+            }
+            if let Some(response) = map
+                .get("functionResponse")
+                .and_then(|fr| fr.get("response"))
+            {
+                if let Some(error) = response.get("error").and_then(Value::as_str) {
+                    return format!("error: {error}");
+                }
+                if let Some(output) = response.get("output").and_then(Value::as_str) {
+                    return output.to_owned();
+                }
+                return value_text(response);
+            }
+            map.get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_content_blocks(
     agent: AgentKind,
@@ -4145,6 +4380,9 @@ fn locate_session_file(
         let exact = root.join(id).join("events.jsonl");
         return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
     }
+    if harness == ManagedHarness::Gemini && Uuid::parse_str(id).is_err() {
+        return Ok(None);
+    }
     if harness == ManagedHarness::Claude {
         // The project folder is the cwd with every character outside
         // `[A-Za-z0-9]` turned into `-` (#1167). A name that does not derive
@@ -4394,6 +4632,19 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|dir| dir.file_name())
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| Uuid::parse_str(name).is_ok());
+    }
+    if harness == ManagedHarness::Gemini {
+        // `<tmp>/<project>/chats/session-*.jsonl` only; logs and other temp
+        // files under `<tmp>/<project>/` are not transcripts.
+        return path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("session-") && name.ends_with(".jsonl"))
+            && path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                == Some("chats");
     }
     if compressed_codex_rollout(harness, path) {
         return !cursor_path(harness, path).exists();
@@ -4772,7 +5023,8 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
             | ManagedHarness::Antigravity
-            | ManagedHarness::Copilot => (None, None),
+            | ManagedHarness::Copilot
+            | ManagedHarness::Gemini => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -4865,9 +5117,74 @@ fn session_header_for_cwd(
 ) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::KiroV3 {
         kiro_v3_session_header(path, cwd)
+    } else if harness == ManagedHarness::Gemini {
+        gemini_session_header_for_cwd(path, cwd)
     } else {
         session_header(harness, path)
     }
+}
+
+/// Gemini CLI opens every `chats/session-*.jsonl` with a metadata line
+/// containing `sessionId` (UUID) and `projectHash` (hex SHA-256 of the
+/// checkout path). Open with [`open_regular_transcript`] so symlinks and
+/// non-regular files are refused, and fail closed unless `projectHash` matches
+/// the exact current checkout.
+fn gemini_session_header_for_cwd(path: &Path, cwd: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Ok(file) = open_regular_transcript(path) else {
+        return Ok(None);
+    };
+    let mut reader = BufReader::new(file);
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
+        return Ok(None);
+    };
+    let Ok(header) = serde_json::from_str::<Value>(&line) else {
+        return Ok(None);
+    };
+    let (Some(id), Some(project_hash)) = (
+        header.get("sessionId").and_then(Value::as_str),
+        header.get("projectHash").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    if Uuid::parse_str(id).is_err()
+        || project_hash.len() != 64
+        || !project_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(None);
+    }
+    let matches_cwd = gemini_checkout_hashes(cwd)
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(project_hash));
+    if !matches_cwd {
+        return Ok(None);
+    }
+    Ok(Some((id.to_string(), cwd.to_path_buf())))
+}
+
+/// SHA-256 hex digests Gemini CLI's `getProjectHash` can produce for `cwd`
+/// (both the raw path and its canonicalized path).
+fn gemini_checkout_hashes(cwd: &Path) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut push_path = |path: &Path| {
+        let raw = path.to_string_lossy();
+        let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        if !candidates.contains(&digest) {
+            candidates.push(digest);
+        }
+        #[cfg(windows)]
+        {
+            let slashed = raw.replace('\\', "/");
+            let slash_digest = format!("{:x}", Sha256::digest(slashed.as_bytes()));
+            if !candidates.contains(&slash_digest) {
+                candidates.push(slash_digest);
+            }
+        }
+    };
+    push_path(cwd);
+    if let Ok(canonical) = cwd.canonicalize() {
+        push_path(&canonical);
+    }
+    candidates
 }
 
 /// Kimi sessions are self-describing in `<session-dir>/state.json` — the wire
@@ -6539,6 +6856,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
         ManagedHarness::Copilot => home.join(".copilot/session-state"),
+        ManagedHarness::Gemini => home.join(".gemini/tmp"),
     }
 }
 
@@ -6938,7 +7256,8 @@ mod tests {
                     | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
                     | ManagedHarness::Antigravity
-                    | ManagedHarness::Copilot => {
+                    | ManagedHarness::Copilot
+                    | ManagedHarness::Gemini => {
                         unreachable!()
                     }
                 },
@@ -11810,6 +12129,296 @@ mod tests {
 
         // Re-reading from scratch yields identical event ids.
         let replay = export_jsonl(ManagedHarness::Copilot, &path, "s", None).unwrap();
+        assert_eq!(replay.events[0].event_id, first.events[0].event_id);
+        assert_eq!(replay.events[1].event_id, second.events[0].event_id);
+    }
+
+    #[tokio::test]
+    async fn gemini_discovery_and_export_enforce_exact_checkout_isolation() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let foreign = temp.path().join("other-repo");
+        let root = temp.path().join("gemini-tmp");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+
+        let matching_id = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        let foreign_id = "9b2eb58f-c245-4fef-b4e2-328b6e6d5f6e";
+        let cwd_hash = format!(
+            "{:x}",
+            Sha256::digest(cwd.canonicalize().unwrap().to_string_lossy().as_bytes())
+        );
+        let foreign_hash = format!(
+            "{:x}",
+            Sha256::digest(foreign.canonicalize().unwrap().to_string_lossy().as_bytes())
+        );
+
+        let matching_chats = root.join("repo").join("chats");
+        let foreign_chats = root.join("other-repo").join("chats");
+        fs::create_dir_all(&matching_chats).unwrap();
+        fs::create_dir_all(&foreign_chats).unwrap();
+
+        let matching_path = matching_chats.join("session-2026-11-23T13-00-4c1ea47e.jsonl");
+        fs::write(
+            &matching_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "sessionId": matching_id,
+                    "projectHash": cwd_hash,
+                    "startTime": "2026-11-23T13:00:00.000Z",
+                    "lastUpdated": "2026-11-23T13:01:00.000Z",
+                    "kind": "main"
+                }),
+                json!({
+                    "id": "m1",
+                    "timestamp": "2026-11-23T13:00:05.000Z",
+                    "type": "user",
+                    "content": [{"text": "hello from repo"}]
+                })
+            ),
+        )
+        .unwrap();
+
+        let foreign_path = foreign_chats.join("session-2026-11-23T13-00-9b2eb58f.jsonl");
+        fs::write(
+            &foreign_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "sessionId": foreign_id,
+                    "projectHash": foreign_hash,
+                    "startTime": "2026-11-23T13:00:00.000Z",
+                    "lastUpdated": "2026-11-23T13:01:00.000Z",
+                    "kind": "main"
+                }),
+                json!({
+                    "id": "f1",
+                    "timestamp": "2026-11-23T13:00:05.000Z",
+                    "type": "user",
+                    "content": [{"text": "secret from foreign checkout"}]
+                })
+            ),
+        )
+        .unwrap();
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Gemini, temp.path(), &cwd, Some(&root), 8)
+                .await
+                .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, matching_id);
+
+        // Legitimate control: matching checkout exports cleanly.
+        let control = export_transcript(
+            ManagedHarness::Gemini,
+            temp.path(),
+            &cwd,
+            Some(&root),
+            matching_id,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(control.events.len(), 1);
+        assert_eq!(control.events[0].content, "hello from repo");
+        assert_eq!(control.events[0].agent, AgentKind::GeminiCli);
+
+        // Foreign checkout session cannot be located or exported from `cwd`.
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Gemini,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                foreign_id,
+            )
+            .unwrap()
+        );
+        assert!(
+            export_transcript(
+                ManagedHarness::Gemini,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                foreign_id,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        assert_eq!(
+            session_root(ManagedHarness::Gemini, temp.path(), None),
+            temp.path().join(".gemini/tmp")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_session_header_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let cwd_hash = format!(
+            "{:x}",
+            Sha256::digest(cwd.canonicalize().unwrap().to_string_lossy().as_bytes())
+        );
+        let id = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        let real = temp.path().join("real.jsonl");
+        fs::write(
+            &real,
+            format!("{}\n", json!({"sessionId": id, "projectHash": cwd_hash})),
+        )
+        .unwrap();
+        let link = temp.path().join("session-link.jsonl");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            gemini_session_header_for_cwd(&link, &cwd).unwrap(),
+            None,
+            "symlinked Gemini session file must be refused"
+        );
+        assert_eq!(
+            gemini_session_header_for_cwd(&real, &cwd)
+                .unwrap()
+                .map(|(found, _)| found),
+            Some(id.to_string())
+        );
+    }
+
+    #[test]
+    fn gemini_export_imports_visible_records_and_excludes_private_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-2026-11-23T13-00-4c1ea47e.jsonl");
+        let records = [
+            json!({
+                "sessionId": "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d",
+                "projectHash": "0".repeat(64),
+                "startTime": "2026-11-23T13:00:00.000Z",
+                "kind": "main"
+            }),
+            json!({"$set": {"lastUpdated": "2026-11-23T13:00:01.000Z"}}),
+            json!({"id": "sys-1", "type": "system", "content": "private system prompt"}),
+            json!({
+                "id": "u1",
+                "timestamp": "2026-11-23T13:00:02.000Z",
+                "type": "user",
+                "content": [
+                    {"text": "read note.txt"},
+                    {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}
+                ]
+            }),
+            json!({
+                "id": "g1",
+                "timestamp": "2026-11-23T13:00:03.000Z",
+                "type": "gemini",
+                "model": "gemini-2.5-pro",
+                "thoughts": [{"subject": "plan", "description": "private chain of thought"}],
+                "content": "Checking note.txt.",
+                "toolCalls": [
+                    {
+                        "id": "tc-1",
+                        "name": "read_file",
+                        "args": {"path": "note.txt"},
+                        "status": "success",
+                        "result": [{"functionResponse": {"id": "tc-1", "name": "read_file", "response": {"output": "hello\n"}}}]
+                    },
+                    {
+                        "id": "tc-2",
+                        "name": "run_shell_command",
+                        "args": {"command": "ls"},
+                        "status": "executing"
+                    },
+                    {
+                        "id": "tc-3",
+                        "name": "read_file",
+                        "args": {"path": "missing.txt"},
+                        "status": "error",
+                        "result": [{"functionResponse": {"id": "tc-3", "name": "read_file", "response": {"error": "not found"}}}]
+                    }
+                ]
+            }),
+            json!({"$rewindTo": "u1"}),
+            json!({"$patch": {"id": "g1", "content": "patched"}}),
+        ];
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Gemini, &path, "gemini-session", None).unwrap();
+        let contents: Vec<_> = export
+            .events
+            .iter()
+            .map(|event| (event.kind, event.content.as_str()))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (WorkstreamEventKind::Message, "read note.txt"),
+                (WorkstreamEventKind::Message, "Checking note.txt."),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "read_file: {\"path\":\"note.txt\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "hello\n"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "read_file: {\"path\":\"missing.txt\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "error: not found"),
+            ]
+        );
+        assert!(export.events.iter().all(|event| {
+            event.agent == AgentKind::GeminiCli
+                && !event.content.contains("private")
+                && !event.content.contains("AAAA")
+        }));
+        for expected in [
+            "system prompt records",
+            "binary payloads",
+            "hidden reasoning",
+            "rewind records",
+            "patch records",
+        ] {
+            assert!(
+                export.losses.iter().any(|loss| loss.contains(expected)),
+                "missing loss annotation for {expected}"
+            );
+        }
+        let cursor: FileCursor = serde_json::from_str(&export.source_cursor.unwrap()).unwrap();
+        assert!(cursor.prefix_sha256.is_some());
+    }
+
+    #[test]
+    fn gemini_export_is_incremental_and_holds_back_an_incomplete_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-2026-11-23T13-00-4c1ea47e.jsonl");
+        let first_line = json!({"id": "u1", "type": "user", "content": "one"});
+        let second_line = json!({"id": "g1", "type": "gemini", "content": "two"});
+        let partial = second_line.to_string();
+        fs::write(&path, format!("{first_line}\n{}", &partial[..10])).unwrap();
+
+        let first = export_jsonl(ManagedHarness::Gemini, &path, "s", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert!(first.losses.is_empty());
+
+        fs::write(&path, format!("{first_line}\n{second_line}\n")).unwrap();
+        let second = export_jsonl(
+            ManagedHarness::Gemini,
+            &path,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "two");
+
+        let replay = export_jsonl(ManagedHarness::Gemini, &path, "s", None).unwrap();
         assert_eq!(replay.events[0].event_id, first.events[0].event_id);
         assert_eq!(replay.events[1].event_id, second.events[0].event_id);
     }

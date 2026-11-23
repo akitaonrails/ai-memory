@@ -616,6 +616,7 @@ const fn run_harness_choice(harness: ManagedHarness) -> RunHarnessChoice {
         ManagedHarness::Grok => RunHarnessChoice::Grok,
         ManagedHarness::Antigravity => RunHarnessChoice::Antigravity,
         ManagedHarness::Copilot => RunHarnessChoice::Copilot,
+        ManagedHarness::Gemini => RunHarnessChoice::Gemini,
     }
 }
 
@@ -5291,6 +5292,7 @@ fn previous_harness_candidates(agent: AgentKind) -> &'static [ManagedHarness] {
         AgentKind::Grok => &[ManagedHarness::Grok],
         AgentKind::AntigravityCli => &[ManagedHarness::Antigravity],
         AgentKind::CopilotCli => &[ManagedHarness::Copilot],
+        AgentKind::GeminiCli => &[ManagedHarness::Gemini],
         _ => &[],
     }
 }
@@ -6338,6 +6340,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
         RunHarnessChoice::Copilot => ManagedHarness::Copilot,
+        RunHarnessChoice::Gemini => ManagedHarness::Gemini,
     }
 }
 
@@ -6363,6 +6366,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
         AgentKind::CopilotCli => Some(ManagedHarness::Copilot),
+        AgentKind::GeminiCli => Some(ManagedHarness::Gemini),
         _ => None,
     }
 }
@@ -6387,6 +6391,7 @@ pub(crate) fn harness_from_journal_name(name: &str) -> Option<ManagedHarness> {
         "grok" => Some(ManagedHarness::Grok),
         "antigravity" => Some(ManagedHarness::Antigravity),
         "copilot" => Some(ManagedHarness::Copilot),
+        "gemini" => Some(ManagedHarness::Gemini),
         _ => None,
     }
 }
@@ -6445,6 +6450,7 @@ mod tests {
         ManagedHarness::Grok,
         ManagedHarness::Antigravity,
         ManagedHarness::Copilot,
+        ManagedHarness::Gemini,
     ];
 
     /// The exact spelling `append_journal_entry` records for each harness,
@@ -6468,6 +6474,7 @@ mod tests {
             ManagedHarness::Grok => "grok",
             ManagedHarness::Antigravity => "antigravity",
             ManagedHarness::Copilot => "copilot",
+            ManagedHarness::Gemini => "gemini",
         }
     }
 
@@ -9646,6 +9653,35 @@ mod tests {
         assert_eq!(
             managed_harness_from_agent(AgentKind::CopilotCli),
             Some(ManagedHarness::Copilot)
+        );
+    }
+
+    #[test]
+    fn gemini_aliases_select_the_managed_adapter() {
+        for name in ["gemini", "gemini-cli"] {
+            let cli = Cli::try_parse_from([
+                OsStr::new("ai-memory"),
+                OsStr::new("run"),
+                OsStr::new(name),
+                OsStr::new("--model"),
+                OsStr::new("gemini-2.5-pro"),
+            ])
+            .unwrap();
+            let CliCommand::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let choice = args.harness.expect("explicit harness");
+            assert_eq!(choice, crate::cli::RunHarnessChoice::Gemini, "{name}");
+            assert_eq!(managed_harness(choice), ManagedHarness::Gemini);
+            assert_eq!(run_harness_choice(ManagedHarness::Gemini), choice);
+            assert_eq!(
+                args.native_args,
+                ["--model", "gemini-2.5-pro"].map(OsString::from).to_vec()
+            );
+        }
+        assert_eq!(
+            managed_harness_from_agent(AgentKind::GeminiCli),
+            Some(ManagedHarness::Gemini)
         );
     }
 

@@ -930,10 +930,12 @@ stdio shim. Requires Node.js installed on the same machine.
 ## Gemini CLI
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
-`ai-memory install-hooks --agent gemini-cli --apply`.
+`ai-memory install-hooks --agent gemini-cli --apply`. ✅ Managed workstreams
+supported via `ai-memory run gemini` (alias `gemini-cli`; see
+[`docs/managed-workstreams.md`](managed-workstreams.md)).
 
 **Config file:**
-- User: `~/.gemini/settings.json`
+- User: `~/.gemini/settings.json` (or `$GEMINI_CLI_HOME/.gemini/settings.json`)
 - Project: `.gemini/settings.json`
 
 Gemini CLI uses `httpUrl` (not `url`) for streamable-HTTP MCP

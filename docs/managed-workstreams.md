@@ -2,7 +2,7 @@
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
 between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
-CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI. Direct agent launches
+CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, GitHub Copilot CLI, and Gemini CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -537,7 +537,7 @@ takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
-flavor remains exact. OMP, Grok, Antigravity, and Copilot remain available explicitly
+flavor remains exact. OMP, Grok, Antigravity, Copilot, and Gemini remain available explicitly
 but are not in the automatic pool. OpenCode's resolved major contributes one
 adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 
@@ -943,6 +943,7 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts from `history.jsonl`, falling back to that conversation's bounded `brain/<id>/.system_generated/logs/transcript{,_full}.jsonl` for print mode (assistant and tool steps come from lifecycle-hook capture) |
 | GitHub Copilot CLI | generated `--session-id` | `--resume=<id>` | `$COPILOT_HOME/session-state/<uuid>/events.jsonl` (`COPILOT_HOME` defaults to `~/.copilot`) |
+| Gemini CLI | generated `--session-id` | `--resume <id>` | `$GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/session-*.jsonl` (`GEMINI_CLI_HOME` defaults to `$HOME`) |
 
 OMP's agent directory is `~/.omp/agent` for the default profile and
 `~/.omp/profiles/<name>/agent` for a named profile. `PI_CONFIG_DIR` changes the
@@ -966,8 +967,9 @@ The default executable is `command-code` on Unix and `cmdc` on native Windows;
 The experimental unsandboxed Mod API is not used.
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
-Codex's `resume`, Antigravity's `--conversation` / `--continue`, or Copilot's
-`--resume` / `--continue` / `--session-id` / `--connect` wins.
+Codex's `resume`, Antigravity's `--conversation` / `--continue`, Copilot's
+`--resume` / `--continue` / `--session-id` / `--connect`, or Gemini's
+`--resume` / `-r` / `--session-id` / `--session-file` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session. Claude's `--resume`
 also takes a session name or the absolute path of a transcript; neither is the
@@ -1102,8 +1104,9 @@ the harness's native dangerous mode. The translation is Claude Code
 Crush `--yolo`, Kimi Code `--yolo`, Command Code `--yolo`, Kiro CLI v2
 `--trust-all-tools`, Grok Build CLI `--yolo` (equivalent to its
 `--always-approve` option), Antigravity CLI
-`--dangerously-skip-permissions`, and GitHub Copilot CLI `--yolo` (equivalent
-to its `--allow-all` option). Kiro takes `--trust-all-tools` on both engines,
+`--dangerously-skip-permissions`, GitHub Copilot CLI `--yolo` (equivalent
+to its `--allow-all` option), and Gemini CLI `--yolo` (avoiding duplicates with
+`-y`, `--yolo`, or `--approval-mode`). Kiro takes `--trust-all-tools` on both engines,
 but only as a `chat` option, so ai-memory places it right after `chat`, or
 starts the launch with `chat --trust-all-tools` when it has no subcommand. An
 `--agent-engine` other than v2 or v3 gets a notice and no unverified flag.
@@ -1294,6 +1297,26 @@ copilot` keeps meaning VS Code Copilot. The native contract was verified
 against GitHub Copilot CLI 1.0.92. Copilot is not part of the no-argument
 auto-detection set; name it explicitly.
 
+Gemini CLI accepts a caller-chosen UUID on `--session-id` for a fresh session
+and resumes an existing session with `--resume <id>`. Explicit user selectors
+(`--resume`, `-r`, `--session-id`, `--session-file`) always win, utility
+subcommands (`mcp`, `extensions`, `skills`, `hooks`, `gemma`) and one-shot
+listing/deletion/help/version flags (`--list-sessions`, `--delete-session`,
+`--list-extensions`, `-l`, `-h`/`--help`, `-v`/`--version`) pass through
+without session flags, and `-p`/`--prompt` blocks first-use adoption. Sessions
+are read read-only from `$GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/session-*.jsonl`
+(default `$HOME/.gemini/tmp/...`): discovery refuses symlinks and non-regular
+files and requires the metadata header's `projectHash` (SHA-256 of the checkout
+path) to match the exact current checkout. Export imports visible user and
+assistant text plus completed tool calls and results; hidden `thoughts`, system
+prompts, binary payloads, and provider metadata (`tokens`, `model`) are
+excluded, and `$rewindTo`/`$patch` records are noted as bounded losses. Context
+is delivered by Gemini CLI's existing `SessionStart` hook. `--yolo` maps to
+Gemini CLI's `--yolo` without duplicating `-y`, `--yolo`, or `--approval-mode`.
+The managed launcher accepts `gemini` and `gemini-cli`. Verified against Gemini
+CLI 0.64.0 / 0.66.0. Gemini CLI is not part of the no-argument auto-detection
+set; name it explicitly.
+
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the global Crush JSON the launch
 would read (`$CRUSH_GLOBAL_CONFIG/crush.json`, else
@@ -1448,7 +1471,7 @@ atomic operation.
 
 
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
-Kimi Code, Command Code, Kiro, OMP, Grok, Antigravity, or Copilot private stores. The
+Kimi Code, Command Code, Kiro, OMP, Grok, Antigravity, Copilot, or Gemini private stores. The
 launched harness retains normal ownership of its own session writes. Adapters read only
 documented or observed local session formats. Provider credentials, encrypted
 content, system/developer prompt records, and hidden reasoning are not copied. The
@@ -1468,7 +1491,8 @@ renamed, absolute-path session locators used by Claude Code, Codex, OpenCode,
 Pi, Kimi Code (`state.json`'s `cwd` or legacy `workDir`), Command Code (v3
 header `cwd`), Kiro v2
 (`<uuid>.json`'s `cwd`), Kiro v3 (`session.json`'s `workspacePaths`), OMP,
-Antigravity, and Copilot (`session.start`'s `context.cwd`) may still reference
+Antigravity, Copilot (`session.start`'s `context.cwd`), and Gemini (`projectHash`
+derived from the checkout path) may still reference
 the old path; Crush's project-local `.crush`
 database moves with the checkout.
 

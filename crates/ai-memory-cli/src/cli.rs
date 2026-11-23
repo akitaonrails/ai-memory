@@ -632,6 +632,9 @@ pub enum RunHarnessChoice {
     /// here the way `install-mcp --client copilot` does.
     #[value(name = "copilot", alias = "copilot-cli")]
     Copilot,
+    /// Google Gemini CLI (`gemini`).
+    #[value(name = "gemini", alias = "gemini-cli")]
+    Gemini,
 }
 
 /// Parses the `run` harness positional, additionally wildcarding every
