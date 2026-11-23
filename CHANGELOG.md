@@ -150,6 +150,13 @@ version in [`docs/changelog/`](docs/changelog/):
   Restores honor `KIMI_CODE_HOME` and keep the recorded destinations for
   older `.kimi/` archives. (#2418)
 
+- Kept a directory whose cwd probe never returns from taking every probe
+  permit on the server. Each hook event from that directory used to pin a
+  permit of its own, so a few of them made every event that needed a probe
+  fail with `inspecting cwd ... did not finish within 2s`, whatever directory
+  it came from. A directory's probes now run one at a time, so it pins one
+  permit and events from other directories keep resolving. (#2434)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

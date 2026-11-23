@@ -1196,9 +1196,11 @@ that touch the relevant area.
    (`SessionAgents`) with no database round trip (#2023).
    (agentmemory #221 / #143.) The router's filesystem probes of an event's
    cwd (git discovery, canonicalization) never run on an async worker: they
-   go through `CwdProbes`, a blocking-pool path with four permits and a
-   2-second deadline, so a stuck `open()` (macOS privacy controls, a dead
-   network mount) fails that event instead of stalling the server (#1514).
+   go through `CwdProbes`, a blocking-pool path with four permits, one probe
+   per cwd at a time and a 2-second deadline, so a stuck `open()` (macOS
+   privacy controls, a dead network mount) fails that event instead of
+   stalling the server (#1514), and a directory that stays stuck pins one
+   permit however many events come from it (#2434).
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>`
    has no other constructor than `sanitize()`. (design-decisions §14.)
    The opt-in assistant/Stop excerpt (#196) enters through this same
