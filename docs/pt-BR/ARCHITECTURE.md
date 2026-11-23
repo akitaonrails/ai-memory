@@ -1168,9 +1168,11 @@ que toquem na área relevante.
    em memória (`SessionAgents`) sem ida ao banco de dados (#2023).
    (agentmemory #221 / #143.) As sondagens do sistema de arquivos do roteador do diretório de trabalho de um evento
    (descoberta git, canonização) nunca rodam em um worker assíncrono: elas
-   passam por `CwdProbes`, um caminho de pool bloqueante com quatro permissões e um
-   prazo de 2 segundos, para que um `open()` travado (controles de privacidade do macOS, uma montagem de
-   rede inativa) falhe aquele evento em vez de paralisar o servidor (#1514).
+   passam por `CwdProbes`, um caminho de pool bloqueante com quatro permissões, uma
+   sondagem por diretório de cada vez e um prazo de 2 segundos, para que um `open()`
+   travado (controles de privacidade do macOS, uma montagem de rede inativa) falhe
+   aquele evento em vez de paralisar o servidor (#1514), e um diretório que continua
+   travado prende uma só permissão, não importa quantos eventos venham dele (#2434).
 6. **A remoção de privacidade é uma fronteira tipada.** `Sanitized<NewObservation>`
    não tem outro construtor além de `sanitize()`. (design-decisions §14.)
    O trecho opcional de assistente/Stop (#196) entra através dessa mesma
