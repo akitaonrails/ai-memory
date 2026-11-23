@@ -303,6 +303,9 @@ impl ProjectBriefs {
     }
 }
 
+type CwdProbeGate = tokio::sync::Mutex<()>;
+type CwdProbeGateMap = HashMap<String, Weak<CwdProbeGate>>;
+
 /// Runs the hook resolver's filesystem probes of a caller-supplied cwd (git
 /// discovery, canonicalization) off the async workers (#1514).
 ///
@@ -314,9 +317,16 @@ impl ProjectBriefs {
 /// probe runs on the blocking pool, holding one of a fixed number of permits
 /// until the syscall really returns, so probes that never return pin at most
 /// that many threads, and the caller gives up after a deadline.
+///
+/// One cwd's probes take turns (#2434). Each event from a directory that
+/// blocks used to pin a permit of its own, so a handful of events from one
+/// such directory left no permit for any other cwd and every hook event on
+/// the server failed. Queued behind the stuck probe they hold nothing, and
+/// the directory pins one thread however many events name it.
 #[derive(Clone)]
 pub struct CwdProbes {
     permits: Arc<tokio::sync::Semaphore>,
+    gates: Arc<tokio::sync::Mutex<CwdProbeGateMap>>,
     timeout: std::time::Duration,
 }
 
@@ -330,13 +340,15 @@ impl CwdProbes {
     fn new(max_in_flight: usize, timeout: std::time::Duration) -> Self {
         Self {
             permits: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+            gates: Arc::default(),
             timeout,
         }
     }
 
-    /// Run `probe` on the blocking pool. Fails when no permit frees up or
-    /// the probe does not finish before the deadline; the event then fails
-    /// rather than routing on a guess, and nothing is cached.
+    /// Run `probe` on the blocking pool once no earlier probe of the same
+    /// cwd is still running. Fails when that turn or a permit does not come,
+    /// or the probe does not finish, before the deadline; the event then
+    /// fails rather than routing on a guess, and nothing is cached.
     async fn run<T: Send + 'static>(
         &self,
         cwd: &str,
@@ -344,9 +356,12 @@ impl CwdProbes {
     ) -> anyhow::Result<T> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let finished = async {
+            // The cwd's turn before a permit: an event waiting behind a stuck
+            // probe of its own directory holds no permit while it waits.
+            let turn = self.gate(cwd).await.lock_owned().await;
             let permit = self.permits.clone().acquire_owned().await.ok()?;
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                let _held = (permit, turn);
                 probe()
             })
             .await
@@ -362,6 +377,21 @@ impl CwdProbes {
                 self.timeout
             )),
         }
+    }
+
+    /// The gate `cwd`'s probes queue on, keyed like the project cache so
+    /// every spelling of one directory shares it. Entries are weak, and dead
+    /// ones are dropped when a new cwd arrives, so only gates in use stay.
+    async fn gate(&self, cwd: &str) -> Arc<CwdProbeGate> {
+        let key = normalize_project_path_key(cwd);
+        let mut gates = self.gates.lock().await;
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(CwdProbeGate::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
     }
 }
 
