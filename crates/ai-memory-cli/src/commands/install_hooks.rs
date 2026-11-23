@@ -6827,6 +6827,8 @@ async function bootstrapMcpBridge(pi: any): Promise<void> {
     }
   } catch (_e) {
     // MCP bridge is best-effort; extension load and lifecycle capture must survive.
+    // Do not print the exception: a server response can contain private details.
+    console.warn("ai-memory: MCP tool discovery failed. Check that the server is running and reachable, then run /reload in Pi to retry. Lifecycle capture remains enabled.");
   }
 }
 "#;
@@ -17337,6 +17339,95 @@ process.stdout.write(JSON.stringify({
             !extension.contains("mcpRpc(\"notifications/initialized\""),
             "bootstrap must not send initialized through mcpRpc"
         );
+    }
+
+    /// #2429: failed discovery must give an actionable recovery path without
+    /// leaking the server's response or preventing lifecycle registration.
+    #[test]
+    fn pi_tool_discovery_failure_reports_reload_in_node() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        const HARNESS: &str = r#"
+import { pathToFileURL } from "node:url";
+const failedMethod = process.argv[3];
+const warnings: string[] = [];
+const tools: any[] = [];
+const handlers: string[] = [];
+console.warn = (...values: unknown[]) => { warnings.push(values.join(" ")); };
+globalThis.fetch = async (_url: any, options: any) => {
+  const body = JSON.parse(options.body);
+  if (body.method === failedMethod) {
+    return new Response("private-server-detail", { status: 503 });
+  }
+  if (body.id === undefined) return new Response(null, { status: 202 });
+  const result = body.method === "tools/list"
+    ? { tools: [{ name: "memory_query", description: "d", inputSchema: { type: "object" } }] }
+    : {};
+  return Response.json({ jsonrpc: "2.0", id: body.id, result });
+};
+const { default: extension } = await import(pathToFileURL(process.argv[2]).href);
+extension({
+  on: (name: string) => handlers.push(name),
+  registerTool: (tool: any) => tools.push(tool),
+});
+for (let i = 0; i < 200 && !warnings.length && !tools.length; i++) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+process.stdout.write(JSON.stringify({
+  warnings,
+  names: tools.map((tool) => tool.name),
+  lifecycle: handlers.length > 0,
+}) + "\n", (error) => process.exit(error ? 1 : 0));
+"#;
+        for failed_method in ["initialize", "tools/list", "healthy"] {
+            let tmp = TempDir::new().unwrap();
+            let extension = tmp.path().join("ai-memory-pi.ts");
+            fs::write(
+                &extension,
+                build_pi_extension(
+                    "http://127.0.0.1:49600",
+                    None,
+                    None,
+                    "denylist",
+                    false,
+                    PiToolExposure::Direct,
+                ),
+            )
+            .unwrap();
+            fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
+            let mut command = Command::new("node");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AI_MEMORY_") {
+                    command.env_remove(&key);
+                }
+            }
+            let output = command
+                .args(["--experimental-strip-types", "--no-warnings", "harness.ts"])
+                .arg(&extension)
+                .arg(failed_method)
+                .current_dir(tmp.path())
+                .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
+                .env("AI_MEMORY_DATA_DIR", tmp.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{failed_method}: {output:?}");
+            let seen: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(seen["lifecycle"], true);
+            if failed_method == "healthy" {
+                assert_eq!(seen["warnings"], serde_json::json!([]));
+                assert_eq!(seen["names"], serde_json::json!(["memory_query"]));
+            } else {
+                assert_eq!(seen["names"], serde_json::json!([]));
+                let warnings = seen["warnings"].as_array().unwrap();
+                assert_eq!(warnings.len(), 1, "{failed_method}: {seen}");
+                let warning = warnings[0].as_str().unwrap();
+                assert!(warning.contains("/reload"), "{warning}");
+                assert!(warning.contains("server"), "{warning}");
+                assert!(!warning.contains("private-server-detail"), "{warning}");
+            }
+        }
     }
 
     /// #1988: `codemode` adds Pi's `exposure: "codemode"` to the one
