@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Let the configured idle session timeout govern scheduled session closure
+  even when it exceeds the forget sweep's 48-hour cutoff. (#2431)
+
 - Applied the container wrapper's host-file UID and SELinux handling to
   `doctor`, so it can read home markers and harness stores instead of
   reporting an invalid home route map when access is denied. (#2403)

@@ -125,7 +125,7 @@ Profile names use 1 to 64 ASCII letters, digits, `.`, `_` or `-`. A config holds
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
-| `idle_end_after_hours` | `0` (off) | `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS` | Hours of silence after which the maintenance tick ends an open session that never got a SessionEnd. 0 or 1 to 8760. |
+| `idle_end_after_hours` | `0` (off) | `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS` | Hours of silence after which the maintenance tick ends an open session that never got a SessionEnd. A nonzero value replaces the forget sweep's 48-hour session closure. 0 or 1 to 8760. |
 
 ## `[decay]`
 

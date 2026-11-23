@@ -290,9 +290,10 @@ from hook paths.
    received agent messages (including claimed/cancelled history), or
    auto-improvement data; managed continuity history therefore keeps its
    project scope alive even when no lifecycle-hook session has been captured.
-   The same scheduled sweep tick also runs one store-wide
-   `close_abandoned_sessions` batched `UPDATE`. A session with no activity
-   for 48 hours and no `SessionEnd` gets `ended_at` set from its own last
+   When `[sessions] idle_end_after_hours` is `0`, the scheduled sweep tick
+   also runs one store-wide `close_abandoned_sessions` batched `UPDATE`.
+   A session with no activity for 48 hours and no `SessionEnd` gets
+   `ended_at` set from its own last
    activity, with no summary page and no usage. This keeps
    `open_session_count` from growing on sessions nobody continues, and it is
    narrower than a real end (see the session-usage row below).
