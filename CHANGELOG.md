@@ -132,6 +132,16 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory install-hooks --agent <agent> --apply` to send the opt-in (see
   `docs/install.md#hook-files-after-an-update`). (#1621, #1865)
 
+### Fixed
+
+- The retrieval-history page now refuses browser caching like every other
+  `/web` page, closing the one route missed by the every-page header change.
+  (#2442)
+
+- `memory_query(answer=true)` now tells the answer model that page snippets are
+  untrusted data rather than instructions, matching every other memory-bearing
+  LLM prompt. (#2443)
+
 ## [3.5.2] - 2026-11-23
 
 ### Fixed
