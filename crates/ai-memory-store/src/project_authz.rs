@@ -191,7 +191,8 @@ pub struct ProjectAuthz {
     pub grant: Option<GrantLevel>,
     /// The caller's grant on the project's whole workspace, if any
     /// (`workspace_grants`, V115). It counts as a grant at that level on every
-    /// project of the workspace, except for a write to a reserved shared scope.
+    /// project of the workspace except private `_profile.<user_id>` scopes and
+    /// writes to a reserved shared scope.
     pub workspace_grant: Option<GrantLevel>,
     /// The project is a shared reserved scope: the global preferences scope
     /// (`default/_global`) or a workspace profile (`<workspace>/_profile`).
@@ -373,7 +374,9 @@ fn read_grant(
 ///
 /// The join is on the project's own `workspace_id`, and the caller's
 /// `workspace_id` must equal it: a grant on one workspace never admits a
-/// project of another, whatever pair of ids a request carries.
+/// project of another, whatever pair of ids a request carries. Private
+/// per-operator profile scopes (`_profile.<user_id>`) are excluded: a
+/// workspace grant never reaches another operator's private profile.
 fn read_workspace_grant(
     conn: &Connection,
     workspace_id: WorkspaceId,
@@ -384,7 +387,8 @@ fn read_workspace_grant(
         .query_row(
             "SELECT wg.level FROM workspace_grants wg \
                JOIN projects p ON p.workspace_id = wg.workspace_id \
-              WHERE p.id = ?2 AND wg.workspace_id = ?1 AND wg.user_id = ?3",
+              WHERE p.id = ?2 AND wg.workspace_id = ?1 AND wg.user_id = ?3 \
+                AND p.name NOT LIKE '\\_profile.%' ESCAPE '\\'",
             params![
                 workspace_id.as_bytes(),
                 project_id.as_bytes(),

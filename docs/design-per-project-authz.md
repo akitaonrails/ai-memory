@@ -193,12 +193,17 @@ CREATE TABLE workspace_grants (
 The existing choke point takes it as a second input. `resolve` reads it for a
 `restricted` project and `ProjectAuthz::authorize` takes the higher of the
 project grant and the workspace grant; `readable_repository_sql` admits the
-projects of a granted workspace so search agrees. Three decisions:
+projects of a granted workspace so search agrees. Four decisions:
 
 - **Joined on the project's own workspace.** `read_workspace_grant` joins
   `projects.workspace_id` and also requires the caller's workspace id to match,
   so a granted workspace id paired with a foreign project id admits nothing. A
   project moved to another workspace comes under that workspace's grants.
+- **Never reaches private `_profile.<user_id>` scopes.** Every operator's
+  private cross-project profile lives in `default` as `_profile.<user_id>`.
+  `read_workspace_grant`, `readable_repository_sql`, and `authors_without_grant`
+  all exclude `_profile.%`, and `GET /admin/projects/grants` reports no
+  workspace grants on private profile scopes.
 - **No write to the reserved shared scopes.** A workspace `_profile` is unioned
   into every project's reads in the workspace. Writing it keeps needing root or
   a `write` grant on that project; a workspace grant only reads it.

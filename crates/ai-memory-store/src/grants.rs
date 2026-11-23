@@ -107,7 +107,8 @@ pub fn authors_without_grant(
                              WHERE pg.user_id = u.id AND pg.project_id = ?1) \
             AND NOT EXISTS (SELECT 1 FROM workspace_grants wg \
                              JOIN projects wp ON wp.workspace_id = wg.workspace_id \
-                            WHERE wg.user_id = u.id AND wp.id = ?1) \
+                            WHERE wg.user_id = u.id AND wp.id = ?1 \
+                              AND wp.name NOT LIKE '\\_profile.%' ESCAPE '\\') \
           ORDER BY u.username",
     )?;
     let names = stmt
@@ -1641,6 +1642,87 @@ mod tests {
             .await
             .unwrap();
         assert!(admitted(&f.store, f.ws, profile, f.alice, Write).await);
+    }
+
+    /// Every operator's private cross-project profile lives in `default` as
+    /// `_profile.<user_id>`. A workspace grant on `default` must never read or
+    /// write another operator's private profile, either at `authorize_project`
+    /// or in unscoped search.
+    #[tokio::test]
+    async fn a_workspace_grant_never_reaches_another_operators_private_profile() {
+        use crate::ProjectAccess::{Read, Write};
+        let f = fixture().await;
+        let (w, r) = (&f.store.writer, &f.store.reader);
+        let bob_profile_name = ai_memory_core::profile::user_profile_project(f.bob);
+        let (bob_profile, _) = w
+            .get_or_create_project_as(f.ws, &bob_profile_name, None, Some(f.bob))
+            .await
+            .unwrap();
+        {
+            let conn = Connection::open(f.store.db_path()).unwrap();
+            set_access_mode(&conn, bob_profile, AccessMode::Restricted).unwrap();
+        }
+        page_in(&f.store, f.ws, bob_profile, "profile/secret.md").await;
+        page_in(&f.store, f.ws, f.client, "client/rates.md").await;
+
+        w.grant_workspace(f.alice, f.ws, GrantLevel::Write, None)
+            .await
+            .unwrap();
+
+        // Violation: alice's workspace write grant on `default` must not reach
+        // bob's private profile at the choke point or in search.
+        assert!(
+            !admitted(&f.store, f.ws, bob_profile, f.alice, Read).await,
+            "a workspace grant must not read another operator's private profile"
+        );
+        assert!(
+            !admitted(&f.store, f.ws, bob_profile, f.alice, Write).await,
+            "a workspace grant must not write another operator's private profile"
+        );
+        let alice_hits = paths(
+            &r.search_pages("rate".into(), 10, Some(f.alice))
+                .await
+                .unwrap(),
+            |h| h.path.as_str(),
+        );
+        assert_eq!(
+            alice_hits,
+            vec!["client/rates.md".to_owned()],
+            "alice's search must hide bob's private profile page"
+        );
+
+        // Control 1: an ordinary restricted project in `default` is reachable
+        // via the workspace grant.
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Read).await);
+        assert!(admitted(&f.store, f.ws, f.client, f.alice, Write).await);
+
+        // Control 2: the profile owner can still read and write their own
+        // private profile and find its pages in search.
+        assert!(admitted(&f.store, f.ws, bob_profile, f.bob, Read).await);
+        assert!(admitted(&f.store, f.ws, bob_profile, f.bob, Write).await);
+        let bob_hits = paths(
+            &r.search_pages("rate".into(), 10, Some(f.bob))
+                .await
+                .unwrap(),
+            |h| h.path.as_str(),
+        );
+        assert_eq!(bob_hits, vec!["profile/secret.md".to_owned()]);
+
+        // Control 3: root can still read and write the private profile.
+        for need in [Read, Write] {
+            assert!(
+                r.authorize_project(
+                    f.ws,
+                    bob_profile,
+                    crate::ProjectPrincipal::root(),
+                    true,
+                    need,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+            );
+        }
     }
 
     /// A project follows the grants of the workspace it is in now: moved out,

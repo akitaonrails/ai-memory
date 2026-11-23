@@ -216,7 +216,8 @@ fn readable_repository_sql(
                OR {project_column} IN (SELECT wp.id FROM projects wp \
                                        JOIN workspace_grants wg \
                                          ON wg.workspace_id = wp.workspace_id \
-                                       WHERE wg.user_id = {user}) \
+                                       WHERE wg.user_id = {user} \
+                                         AND wp.name NOT LIKE '\\_profile.%' ESCAPE '\\') \
                OR {project_column} IN (SELECT gp.id FROM projects gp \
                                        JOIN workspaces gw ON gw.id = gp.workspace_id \
                                        WHERE gw.name = {workspace} AND gp.name = {project}))"

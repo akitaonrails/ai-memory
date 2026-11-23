@@ -9700,7 +9700,9 @@ struct ProjectGrantsQuery {
 
 /// `GET /admin/projects/grants[?workspace=&project=]` — who holds a grant on
 /// one project, or every grant on the server. For one project,
-/// `workspace_grants` lists the grants on its workspace, which reach it too.
+/// `workspace_grants` lists the grants on its workspace, which reach it too —
+/// except for a private `_profile.<user_id>` scope, which workspace grants
+/// never reach.
 async fn handle_list_project_grants(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -9710,15 +9712,16 @@ async fn handle_list_project_grants(
     let (filter, workspace_filter) = match (query.workspace.as_deref(), query.project.as_deref()) {
         (None, None) => (
             ai_memory_store::GrantFilter::All,
-            ai_memory_store::WorkspaceGrantFilter::All,
+            Some(ai_memory_store::WorkspaceGrantFilter::All),
         ),
         (Some(workspace), Some(project)) => {
-            let (workspace, project) =
-                lookup_ws_proj_no_create(&state, workspace.trim(), project.trim()).await?;
-            (
-                ai_memory_store::GrantFilter::Project(project),
-                ai_memory_store::WorkspaceGrantFilter::Workspace(workspace),
-            )
+            let trimmed_project = project.trim();
+            let (workspace, project_id) =
+                lookup_ws_proj_no_create(&state, workspace.trim(), trimmed_project).await?;
+            let ws_filter = (!trimmed_project
+                .starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX))
+            .then_some(ai_memory_store::WorkspaceGrantFilter::Workspace(workspace));
+            (ai_memory_store::GrantFilter::Project(project_id), ws_filter)
         }
         _ => {
             return Err(validation_error(
@@ -9731,11 +9734,14 @@ async fn handle_list_project_grants(
         .list_grants(filter)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    let workspace_grants = state
-        .reader
-        .list_workspace_grants(workspace_filter)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
+    let workspace_grants = match workspace_filter {
+        Some(workspace_filter) => state
+            .reader
+            .list_workspace_grants(workspace_filter)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?,
+        None => Vec::new(),
+    };
     Ok((StatusCode::OK, grants_json(grants, workspace_grants)))
 }
 

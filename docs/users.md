@@ -814,12 +814,13 @@ ones who should keep access; nothing is granted automatically.
   `user grants` and `project grants` list workspace grants as `workspace/*`
   rows; the REST listings return them in a separate `workspace_grants` array.
 
-  A workspace grant has three limits. It never reaches a project of another
-  workspace. It does not allow writing the workspace's shared `_profile`
-  scope, which still needs root or a `write` grant on that project. And it
-  follows the workspace, not the project: a project moved to another workspace
-  comes under that workspace's grants. Changes are recorded in the audit log
-  as `grant_workspace_access` / `revoke_workspace_access`.
+  A workspace grant has four limits. It never reaches a project of another
+  workspace. It never reaches private per-operator `_profile.<user_id>` scopes.
+  It does not allow writing the workspace's shared `_profile` scope, which
+  still needs root or a `write` grant on that project. And it follows the
+  workspace, not the project: a project moved to another workspace comes under
+  that workspace's grants. Changes are recorded in the audit log as
+  `grant_workspace_access` / `revoke_workspace_access`.
 - **Cross-project messages** respect access too: delivering into a restricted
   project's inbox needs `write` on it (otherwise the mailbox would be a way
   around its grants), and so do popping its inbox and cancelling its outbox,
