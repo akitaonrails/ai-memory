@@ -10424,6 +10424,58 @@ pub(crate) mod tests {
         assert_eq!(healthy, 7);
     }
 
+    /// A directory whose probe never returns holds one permit however many
+    /// events name it (#2434). A later probe of the same directory, here
+    /// spelled with a trailing slash, waits behind the stuck one and never
+    /// starts, so the second permit still serves another directory. Without
+    /// the per-cwd gate that probe takes the second permit and blocks too,
+    /// and no other directory resolves.
+    #[tokio::test]
+    async fn cwd_probes_give_a_stuck_directory_one_permit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let probes = CwdProbes::new(2, std::time::Duration::from_millis(200));
+        // The stuck probes return when these senders drop, at the end of the
+        // test or on a failed assertion, and after ten seconds at most, so a
+        // regression fails the test instead of hanging it.
+        let (_release_first, first_released) = std::sync::mpsc::channel::<()>();
+        let (_release_second, second_released) = std::sync::mpsc::channel::<()>();
+        let stuck = std::time::Duration::from_secs(10);
+
+        let first = probes
+            .run("/Volumes/stuck", move || {
+                let _ = first_released.recv_timeout(stuck);
+            })
+            .await;
+        assert!(first.is_err(), "the caller gives up at the deadline");
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = probes
+            .run("/Volumes/stuck/", {
+                let ran = ran.clone();
+                move || {
+                    ran.store(true, Ordering::SeqCst);
+                    let _ = second_released.recv_timeout(stuck);
+                }
+            })
+            .await;
+        assert!(second.is_err(), "the directory is still blocked");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a second thread blocked on the stuck directory"
+        );
+
+        let other = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = probes.run("/w/other", || 7).await {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("another directory still gets a permit");
+        assert_eq!(other, 7);
+    }
+
     /// The resolver's filesystem rungs go through the bounded probe path: with
     /// no probe able to run, resolving a cwd fails closed instead of probing
     /// inline or routing on a guess, and caches nothing (#1514).
