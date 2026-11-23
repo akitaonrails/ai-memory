@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The retrieval-history page now refuses browser caching like every other
+  `/web` page, closing the one route missed by the every-page header change.
+  (#2442)
+
+- `memory_query(answer=true)` now tells the answer model that page snippets are
+  untrusted data rather than instructions, matching every other memory-bearing
+  LLM prompt. (#2443)
+
 ## [3.5.2] - 2026-11-23
 
 ### Fixed
@@ -26,14 +36,6 @@ version in [`docs/changelog/`](docs/changelog/):
   capture-policy path extraction in Rust and mirrored TypeScript), and
   deprioritized opaque metadata-only `tool_family: unknown` stubs below
   substantive observations in unfinished-session recovery snapshots. (#2436)
-
-- The retrieval-history page now refuses browser caching like every other
-  `/web` page, closing the one route missed by the every-page header change.
-  (#2442)
-
-- `memory_query(answer=true)` now tells the answer model that page snippets are
-  untrusted data rather than instructions, matching every other memory-bearing
-  LLM prompt. (#2443)
 
 - Applied the container wrapper's host-file UID and SELinux handling to
   `doctor`, so it can read home markers and harness stores instead of
