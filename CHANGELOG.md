@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-11-23
+
 ### Added
 
 - `ai-memory user grant --all-projects` gave a user `read` or `write` on every
@@ -6326,7 +6328,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.0...HEAD
+[3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
 [3.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.2
 [3.5.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.1
 [3.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.0
