@@ -3311,4 +3311,120 @@ mod tests {
             "CHECK constraint must reject invalid trust_class"
         );
     }
+
+    /// V114 rebuilds the auxiliary rows of pages and observations stored
+    /// before #2426 taught `cjk_index_terms` Arabic. Those rows exist with no
+    /// terms, so the startup backfill (an anti-join above its watermark)
+    /// skipped them and a normalized Arabic query never reached them (#2439).
+    /// A row without Arabic text keeps its auxiliary row.
+    #[test]
+    fn v114_reindexes_arabic_rows_stored_before_the_arabic_terms() {
+        use ai_memory_core::{NewPage, PagePath, Tier};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 113).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "إدارة المعرفة".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+        )
+        .unwrap();
+        // The Arabic page comes first, so a watermark left at the top rowid
+        // sits above it.
+        for (path, body) in [
+            ("notes/arabic.md", "إدارة المعرفة"),
+            ("notes/latin.md", "plain latin notes"),
+        ] {
+            crate::ops::upsert_page(
+                &mut conn,
+                &NewPage {
+                    workspace_id,
+                    project_id,
+                    path: PagePath::new(path).unwrap(),
+                    title: "notes".into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                    evidence: Vec::new(),
+                    trust_class: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // What a store written before #2426 holds: an auxiliary row for every
+        // source row, with no terms for Arabic text, and both watermarks at
+        // the top rowid after a finished backfill.
+        conn.execute_batch(
+            "UPDATE pages_cjk_fts SET title = '', body = '', path_search = ''; \
+             UPDATE observations_cjk_fts SET title = '', body = ''; \
+             INSERT INTO backfill_watermarks (name, max_rowid) \
+                 SELECT 'cjk_pages', max(rowid) FROM pages; \
+             INSERT INTO backfill_watermarks (name, max_rowid) \
+                 SELECT 'cjk_observations', max(rowid) FROM observations;",
+        )
+        .unwrap();
+        let arabic_matches = |conn: &Connection, table: &str| -> i64 {
+            // A variant spelling: bare Alef where the stored text has Hamza.
+            let query = crate::fts_query::prepare_cjk_fts5_query("ادارة").unwrap();
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1"),
+                [query],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let stale = crate::ops::backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!((stale.pages, stale.observations), (0, 0));
+        for table in ["pages_cjk_fts", "observations_cjk_fts"] {
+            assert_eq!(arabic_matches(&conn, table), 0, "{table} before V114");
+        }
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        // Only the Arabic rows lost their auxiliary rows, and both watermarks
+        // moved below them, so the next backfill rebuilds exactly those.
+        let rebuilt = crate::ops::backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!((rebuilt.pages, rebuilt.observations), (1, 1));
+        for table in ["pages_cjk_fts", "observations_cjk_fts"] {
+            assert_eq!(arabic_matches(&conn, table), 1, "{table} after V114");
+        }
+    }
 }
