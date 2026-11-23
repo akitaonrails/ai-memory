@@ -116,6 +116,13 @@ async fn dashboard_renders_recorded_retrievals() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-store"),
+        "retrieval history is a per-viewer page and must not be browser-cacheable"
+    );
     let text = body(resp).await;
     assert!(text.contains("Retrieval history"), "page heading");
     assert!(text.contains("alpha dashboard query"), "query text shown");
