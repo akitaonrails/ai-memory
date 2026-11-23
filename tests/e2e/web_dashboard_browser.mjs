@@ -30,6 +30,7 @@ const mutations = {
   'retain-write-token': {test: 'delivery', from: 'if(token)token.value=""', to: 'if(token)token.value=token.value'},
   'disable-live-refresh': {test: 'live-usage', from: 'timer=setTimeout(refresh,10000);', to: 'timer=0;'},
   'disable-session-live-refresh': {test: 'session-live-usage', from: 'timer=setTimeout(refresh,10000);', to: 'timer=0;'},
+  'steal-session-select-key': {test: 'session-scrubber-select', from: 'tag === "TEXTAREA" || tag === "SELECT" || event.metaKey', to: 'tag === "TEXTAREA" || event.metaKey'},
   'drop-usage-query': {test: 'call-history', from: 'new FormData(form).forEach(function(value,key){url.searchParams.set(key,value);});', to: 'void form;'},
   'forget-theme': {test: 'themes', from: 'localStorage.setItem(key,selected)', to: 'void selected'},
   'resolve-fragments-at-mount': {test: 'fragment-navigation', from: 'link.href=currentPage+link.getAttribute("href")', to: 'link.href=document.baseURI+link.getAttribute("href")'},
@@ -420,6 +421,17 @@ async function main() {
       await until(()=>cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)==='+ (before+1)), 'Session usage did not refresh without reload',18000);
       assert(await cdp.evaluate(`document.activeElement.id==='call-filter'&&document.getElementById('call-filter').value==='codex-fixture'`));
       assert(await cdp.evaluate(`Array.from(document.querySelectorAll('[data-call-row]')).some(r=>r.textContent.includes('session-live-response'))`));
+    },
+    async 'session-scrubber-select'() {
+      await cdp.goto(project+'/s/'+id,'#obs-1');
+      await cdp.evaluate(`document.getElementById('call-sort').focus()`);
+      await cdp.key('ArrowRight');
+      assert.equal(await cdp.evaluate('document.activeElement.id'), 'call-sort', 'The timeline must leave arrow keys to the focused select');
+      await cdp.key('ArrowLeft');
+      assert.equal(await cdp.evaluate('document.activeElement.id'), 'call-sort');
+      await cdp.evaluate(`document.getElementById('call-sort').blur()`);
+      await cdp.key('ArrowRight');
+      assert.equal(await cdp.evaluate('document.activeElement.id'), 'obs-1', 'The timeline shortcut still moves to the first observation');
     },
     async 'call-history'() {
       const workspace='history',name='app',sid=crypto.randomUUID(),href=base+'/web/w/history/app';
