@@ -3619,7 +3619,16 @@ impl Config {
             },
         };
         let model = if provider == EmbedderChoice::Local {
-            ai_memory_llm::resolve_local_model(&model)?.id.to_string()
+            match ai_memory_llm::resolve_local_model(&model) {
+                Ok(spec) => spec.id.to_string(),
+                // The unset-provider default is best-effort: a name it cannot
+                // run, typically one left from a hosted provider, keeps the
+                // default model, which is also what every release before the
+                // multilingual model ran with that config. Refusing it would
+                // stop `serve` on upgrade. An explicit `local` still refuses.
+                Err(_) if defaulted => ai_memory_llm::LOCAL_MODEL.to_string(),
+                Err(error) => return Err(error),
+            }
         } else {
             model
         };
