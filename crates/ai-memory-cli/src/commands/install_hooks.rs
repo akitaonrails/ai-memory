@@ -10024,6 +10024,65 @@ mod tests {
         }
     }
 
+    /// The refresh keeps an endpoint only when re-rendering loses nothing, for
+    /// every agent as for Claude Code: a third-party hook in the same file is
+    /// ignored, while a second endpoint, an inline credential or a custom
+    /// prefix on one ai-memory hook leaves the endpoint unrecovered.
+    #[test]
+    fn baked_hook_url_refuses_what_a_refresh_would_lose_for_any_agent() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai-memory");
+        let handler = |prefix: &str, event: &str, url: &str, suffix: &str| {
+            serde_json::json!({
+                "type": "command",
+                "matcher": "",
+                "command": format!(
+                    "{prefix}/usr/local/bin/ai-memory --data-dir /srv/ai-memory hook --event {event} --agent cursor --server-url {}{suffix}",
+                    shell_quote(url)
+                )
+            })
+        };
+        let document = |stop: serde_json::Value| {
+            serde_json::json!({"version": 1, "hooks": {
+                "sessionStart": [handler("", "session-start", remote, "")],
+                "afterShellExecution": [{
+                    "type": "command",
+                    "command": "/opt/audit/bin/notify --server-url https://audit.example.invalid"
+                }],
+                "stop": [stop]
+            }})
+        };
+
+        let installed = document(handler("", "stop", remote, ""));
+        assert_eq!(
+            baked_hook_url(&installed, data_dir, "cursor").as_deref(),
+            Some(remote)
+        );
+        for (case, stop) in [
+            (
+                "a second endpoint",
+                handler("", "stop", "https://other.example.invalid", ""),
+            ),
+            (
+                "an inline credential",
+                handler("", "stop", remote, " --auth-token synthetic-inline"),
+            ),
+            (
+                "a custom prefix",
+                handler("AI_MEMORY_AUTO_HANDOFF=off ", "stop", remote, ""),
+            ),
+            (
+                "userinfo in the endpoint",
+                handler("", "stop", "https://user:pw@memory.example.invalid", ""),
+            ),
+        ] {
+            assert!(
+                baked_hook_url(&document(stop), data_dir, "cursor").is_none(),
+                "{case}"
+            );
+        }
+    }
+
     /// A home-relative install (#2035 renders the binary and data dir as
     /// `"$HOME/..."`) must still be recognized by the upgrade refresh, so its
     /// Claude endpoint and credentials are preserved. Before this, recognition
