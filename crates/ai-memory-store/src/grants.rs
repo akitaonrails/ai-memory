@@ -62,7 +62,8 @@ pub fn access_mode_of(
 }
 
 /// Set a repository's access mode, returning the mode it had. `None` when the
-/// repository does not exist.
+/// repository does not exist. Actual changes and their audit records commit
+/// together; repeats write nothing.
 ///
 /// # Errors
 /// Propagates SQL errors.
@@ -70,14 +71,36 @@ pub fn set_access_mode(
     conn: &Connection,
     repository_id: ProjectId,
     mode: AccessMode,
+    changed_by: Option<UserId>,
+    now: i64,
 ) -> StoreResult<Option<AccessMode>> {
-    let Some(previous) = access_mode_of(conn, repository_id)? else {
+    let tx = conn.unchecked_transaction()?;
+    let Some(previous) = access_mode_of(&tx, repository_id)? else {
         return Ok(None);
     };
-    conn.execute(
+    if previous == mode {
+        return Ok(Some(previous));
+    }
+    let workspace: Vec<u8> = tx.query_row(
+        "SELECT workspace_id FROM projects WHERE id = ?1",
+        params![repository_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    let workspace_id = WorkspaceId::from_slice(&workspace)?;
+    tx.execute(
         "UPDATE projects SET access_mode = ?1 WHERE id = ?2",
         params![mode.as_str(), repository_id.as_bytes()],
     )?;
+    audit_grant(
+        &tx,
+        "set_project_access",
+        workspace_id,
+        Some(repository_id),
+        changed_by,
+        &serde_json::json!({"previous": previous.as_str(), "mode": mode.as_str()}),
+        now,
+    )?;
+    tx.commit()?;
     Ok(Some(previous))
 }
 
@@ -1614,7 +1637,14 @@ mod tests {
         // write gate has to refuse it by itself.
         for mode in [AccessMode::Open, AccessMode::Restricted] {
             let conn = Connection::open(f.store.db_path()).unwrap();
-            set_access_mode(&conn, profile, mode).unwrap();
+            set_access_mode(
+                &conn,
+                profile,
+                mode,
+                None,
+                Timestamp::now().as_microsecond(),
+            )
+            .unwrap();
             assert!(
                 !admitted(&f.store, f.ws, profile, f.alice, Write).await,
                 "a workspace grant must not write the shared profile ({mode:?})"
@@ -1660,7 +1690,14 @@ mod tests {
             .unwrap();
         {
             let conn = Connection::open(f.store.db_path()).unwrap();
-            set_access_mode(&conn, bob_profile, AccessMode::Restricted).unwrap();
+            set_access_mode(
+                &conn,
+                bob_profile,
+                AccessMode::Restricted,
+                None,
+                Timestamp::now().as_microsecond(),
+            )
+            .unwrap();
         }
         page_in(&f.store, f.ws, bob_profile, "profile/secret.md").await;
         page_in(&f.store, f.ws, f.client, "client/rates.md").await;

@@ -80,6 +80,7 @@ pub(crate) enum WriteCmd {
     SetAccessMode {
         project_id: ProjectId,
         mode: crate::AccessMode,
+        changed_by: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
     },
     SetProjectProfileFlags {
@@ -1144,10 +1145,27 @@ impl WriterHandle {
         project_id: ProjectId,
         mode: crate::AccessMode,
     ) -> StoreResult<Option<crate::AccessMode>> {
+        self.set_access_mode_as(project_id, mode, None).await
+    }
+
+    /// Set a project's access mode and audit the change with its operator.
+    /// `None` identifies the root bearer, which has no users row. Repeats are
+    /// not audited. Returns the previous mode, or `None` for a missing project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates SQL errors without committing an unaudited change.
+    pub async fn set_access_mode_as(
+        &self,
+        project_id: ProjectId,
+        mode: crate::AccessMode,
+        changed_by: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<Option<crate::AccessMode>> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::SetAccessMode {
             project_id,
             mode,
+            changed_by,
             reply: tx,
         })
         .await?;
@@ -4362,9 +4380,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::SetAccessMode {
                 project_id,
                 mode,
+                changed_by,
                 reply,
             } => {
-                let result = crate::grants::set_access_mode(&conn, project_id, mode);
+                let result = crate::grants::set_access_mode(
+                    &conn,
+                    project_id,
+                    mode,
+                    changed_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
                 send_or_warn(reply, result, "set_access_mode");
             }
             WriteCmd::SetProjectProfileFlags {
