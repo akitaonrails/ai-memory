@@ -18,14 +18,10 @@ version in [`docs/changelog/`](docs/changelog/):
   together, so an audit failure leaves access unchanged; repeated modes do
   not add audit rows. (#2446)
 
-### Fixed
-
 - Hook titles skipped leading blank lines, so pasted prompts no longer fell
   back to `user-prompt`. Claude Code `<agent-message>` subagent hand-backs
   stayed in session history but no longer became page titles, listed prompts,
   or harvested user preferences (#2450).
-
-### Fixed
 
 - `ai-memory serve` starts again when `embedding_model` names a model the
   local embedder cannot run, such as `text-embedding-3-small` left behind
@@ -34,8 +30,6 @@ version in [`docs/changelog/`](docs/changelog/):
   embedder now keeps its default model, as releases before 3.6.0 did, and logs
   a warning naming the ignored setting. An explicit `embedding_provider =
   "local"` still refuses an unknown model. (#2454)
-
-### Fixed
 
 - `ai-memory upgrade` no longer moves the hooks of Codex, Copilot CLI,
   Cursor, Gemini CLI, Kimi Code and the other native-hook agents to the local
@@ -48,34 +42,22 @@ version in [`docs/changelog/`](docs/changelog/):
   writes, including the PowerShell form those agents get on Windows. A
   configured `server_url` or `AI_MEMORY_SERVER_URL` still wins. (#2455)
 
-### Fixed
-
 - Fixed `backup-agents` and `restore-agents` to honor `GEMINI_CLI_HOME`
   for Gemini CLI's global settings and skills. (#2459)
-
-### Fixed
 
 - Fixed duplicate-title lint to compare the indexed titles shown in the page
   list, including titles derived from a Markdown heading or filename. (#2447)
 
-### Fixed
-
 - Stabilized duplicate-title ordering in lint reports to avoid redundant
   report revisions and keep the briefing's warning-page list consistent. (#2461)
 
-### Fixed
-
 - Kept Gemini CLI utility commands such as `--debug mcp list` in passthrough
   mode so `ai-memory run gemini` leaves their arguments intact. (#2435)
-
-### Fixed
 
 - XLSX import kept a cell under its header when an earlier blank cell was
   omitted from the worksheet, for a gap of up to 32 columns. A wider jump
   still uses one separator, so a sparse sheet is not expanded into the empty
   rectangle. (#2458)
-
-### Fixed
 
 - A repeated delivery of an ordinary hook whose ingest key had already
   completed is acknowledged before its body is scrubbed again. A
@@ -83,8 +65,6 @@ version in [`docs/changelog/`](docs/changelog/):
   retry. Recovery keys and `SessionEnd` still take the full path: a recovery
   mismatch stays a collision, and an ended session can still repair its wiki
   commit. (#2452)
-
-### Fixed
 
 - Hook spool drain and large `PostToolUse` sanitization: `post_batch` and
   `post_hook` now classify post-connect request/response timeouts
