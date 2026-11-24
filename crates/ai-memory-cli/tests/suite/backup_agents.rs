@@ -37,6 +37,7 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .env_remove("COPILOT_HOME")
+        .env_remove("GEMINI_CLI_HOME")
         .env_remove("KIMI_CODE_HOME")
         .env_remove("KIRO_HOME");
     #[cfg(windows)]
@@ -480,6 +481,52 @@ fn codex_assets_follow_codex_home_on_backup_and_restore() {
     );
     assert!(!restored_home.path().join(".codex").exists());
     assert!(!destination.join("skills/stale").exists());
+}
+
+#[test]
+fn gemini_assets_follow_gemini_cli_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let gemini_home = home.path().join("active Gemini home");
+    let settings = ".gemini/settings.json";
+    let skill = ".gemini/skills/example/SKILL.md";
+    let active_settings = r#"{"ui":{"theme":"Active profile"}}"#;
+    let stale_settings = r#"{"ui":{"theme":"Default profile"}}"#;
+    for (path, body) in [
+        (gemini_home.join(settings), active_settings),
+        (gemini_home.join(skill), "# Example Gemini skill"),
+        (home.path().join(settings), stale_settings),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("gemini-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("GEMINI_CLI_HOME", &gemini_home)
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Gemini home");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("GEMINI_CLI_HOME", &destination)
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(destination.join(settings)).unwrap(),
+        active_settings
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join(skill)).unwrap(),
+        "# Example Gemini skill"
+    );
+    assert!(!restored_home.path().join(".gemini").exists());
 }
 
 /// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default
