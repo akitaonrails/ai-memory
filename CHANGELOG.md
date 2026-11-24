@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Hook titles skipped leading blank lines, so pasted prompts no longer fell
+  back to `user-prompt`. Claude Code `<agent-message>` subagent hand-backs
+  stayed in session history but no longer became page titles, listed prompts,
+  or harvested user preferences (#2450).
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

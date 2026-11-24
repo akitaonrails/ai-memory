@@ -497,7 +497,7 @@ normalises them to exactly one of these `ObservationKind` values:
 | Stored kind | Semantics |
 |---|---|
 | `session-start` | Agent session began; cwd/model/session identity captured. |
-| `user-prompt` | User submitted prompt text to the agent. |
+| `user-prompt` | User submitted prompt text to the agent. Its title uses the first nonblank line; machine turns such as Claude Code `<agent-message>` hand-backs stay in raw history, outside page titles and the prompts list. |
 | `pre-tool-use` | Agent is about to call a tool. |
 | `post-tool-use` | Agent finished a tool call. |
 | `pre-compact` | Agent is about to compact or compress its context. |
