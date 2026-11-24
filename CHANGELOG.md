@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A repeated delivery of an ordinary hook whose ingest key had already
+  completed is acknowledged before its body is scrubbed again. A
+  multi-megabyte tool result no longer has to be reprocessed on every spool
+  retry. Recovery keys still take the full path, so a mismatched replay
+  remains a collision. (#2452)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

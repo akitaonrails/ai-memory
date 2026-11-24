@@ -6651,6 +6651,37 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether an ordinary ingest key in this project is already complete.
+    ///
+    /// A replay can acknowledge that delivery without scrubbing its body again.
+    /// Recovery keys are excluded: their replay still has to compare event
+    /// identity, and a mismatch is a collision rather than a completed delivery.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn ordinary_ingest_key_completed(
+        &self,
+        project_id: ProjectId,
+        ingest_key: &str,
+    ) -> StoreResult<bool> {
+        if crate::ops::recovery_ingest_key(ingest_key) {
+            return Ok(false);
+        }
+        let key = ingest_key.to_owned();
+        self.with_conn(move |conn| {
+            let completed: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT completed_at FROM ingest_keys \
+                     WHERE project_id = ?1 AND key = ?2",
+                    params![project_id.as_bytes(), key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(completed.is_some_and(|completed_at| completed_at.is_some()))
+        })
+        .await
+    }
+
     /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
     /// `sessions/<session_id>.md` page row. These are the scopes a re-home
     /// (`move-session` of a session already rooted in the destination)

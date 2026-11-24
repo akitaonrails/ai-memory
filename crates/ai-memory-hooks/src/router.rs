@@ -5607,6 +5607,20 @@ async fn process_authorized(
         Err(err) => return Err(err.into()),
     }
 
+    // A completed ordinary key has already stored its observation and finished
+    // its downstream effects. Rebuilding the body here scrubs the whole excerpt
+    // again, which for a multi-megabyte tool result outlives the spool drain
+    // timeout and the entry is retried forever (#2452). Recovery keys stay on
+    // the full path: a mismatched identity is a collision, not an ack.
+    if let Some(key) = env.ingest_key.as_deref()
+        && state
+            .reader
+            .ordinary_ingest_key_completed(proj, key)
+            .await?
+    {
+        return Ok(HookProcessingOutcome::Replayed);
+    }
+
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
     // session, or a prompt racing ahead of SessionStart, cannot trip the
