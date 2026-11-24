@@ -94,8 +94,9 @@ pub use profile::{
     ProjectProfileFlags,
 };
 pub use project_authz::{
-    AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
-    RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
+    AccessMode, GLOBAL_SCOPE_WRITE_FORBIDDEN, GrantLevel, ProjectAccess, ProjectAuthz,
+    ProjectPrincipal, RESTRICTED_PROJECT_FORBIDDEN, ScopeCaller, authorize_project,
+    resolve_project_authz,
 };
 pub use query_signals::{
     QUERY_SIGNAL_COUNT_CAP, QUERY_SIGNAL_TEXT_MAX_CHARS, QuerySignalRow, normalize_query,
@@ -135,10 +136,13 @@ pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ResolvedWriteScope, ScopeName, ScopeResolutionError,
     ScopeResolver, ScopeSource, WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for,
-    create_explicit_scope, create_explicit_scope_guarded, create_global_scope,
-    create_profile_scope, lookup_existing_scope, lookup_existing_scope_guarded,
-    lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
-    lookup_project_id_guarded, resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    authorize_scope_for_caller, create_explicit_scope, create_explicit_scope_guarded,
+    create_explicit_scope_guarded_for_caller, create_global_scope, create_profile_scope,
+    create_profile_scope_for_caller, lookup_existing_scope, lookup_existing_scope_guarded,
+    lookup_existing_scope_guarded_for_caller, lookup_existing_workspace, lookup_global_scope,
+    lookup_profile_scope, lookup_project_id_guarded, lookup_project_id_guarded_for_caller,
+    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    resolve_many_existing_scopes_guarded_for_caller,
 };
 pub use session_consolidation::{
     SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, TRANSPORT_RECOVERY_MAX_ATTEMPTS,

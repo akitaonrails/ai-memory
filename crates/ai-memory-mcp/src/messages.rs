@@ -8,11 +8,11 @@
 //! user carries an `AuthorizedViewer`, so a restricted project admits them only
 //! with a grant, and root carries none.
 
-use ai_memory_core::{ActorContext, AgentKind, AuthLevel, AuthorizedViewer, MessageId, UserId};
+use ai_memory_core::{ActorContext, AgentKind, AuthLevel, AuthorizedViewer, MessageId};
 use ai_memory_core::{ProjectId, WorkspaceId};
 use ai_memory_store::{
-    ProjectAccess, ReaderPool, ResolvedScope, StoreError, WriterHandle, authorize_scope_for,
-    lookup_existing_scope,
+    ProjectAccess, ReaderPool, ResolvedScope, ScopeCaller, StoreError, WriterHandle,
+    authorize_scope_for_caller, lookup_existing_scope,
 };
 use ai_memory_wiki::{AdmissionOp, Wiki};
 use axum::{
@@ -72,8 +72,8 @@ pub fn router(state: MessageState) -> Router {
         .with_state(state)
 }
 
-fn viewer_id(viewer: Viewer) -> Option<UserId> {
-    viewer.map(|Extension(viewer)| viewer.user())
+fn caller_from_auth(level: Option<AuthLevel>, viewer: Viewer) -> ScopeCaller {
+    ScopeCaller::from_auth(level, viewer.map(|Extension(viewer)| viewer))
 }
 
 /// Look up an existing scope and check the caller's grant on it. A write is
@@ -82,14 +82,14 @@ async fn authorized_scope(
     state: &MessageState,
     workspace: &str,
     project: &str,
-    viewer: Option<UserId>,
+    caller: ScopeCaller,
     need: ProjectAccess,
 ) -> Result<(WorkspaceId, ProjectId), Reply> {
     let scope = lookup_existing_scope(&state.reader, workspace, project)
         .await
         .map_err(scope_err)?;
     let writer = (need == ProjectAccess::Write).then_some(&state.writer);
-    authorize_scope_for(&state.reader, writer, scope, viewer, need)
+    authorize_scope_for_caller(&state.reader, writer, scope, caller, need)
         .await
         .map(ResolvedScope::as_tuple)
         .map_err(scope_err)
@@ -162,13 +162,15 @@ const fn default_limit() -> usize {
 pub(crate) async fn list(
     State(state): State<MessageState>,
     viewer: Viewer,
+    level: Option<Extension<AuthLevel>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Reply, Reply> {
+    let caller = caller_from_auth(level.map(|Extension(level)| level), viewer);
     let (ws, proj) = authorized_scope(
         &state,
         &query.workspace,
         &query.project,
-        viewer_id(viewer),
+        caller,
         ProjectAccess::Read,
     )
     .await?;
@@ -221,12 +223,12 @@ pub(crate) async fn send(
     headers: HeaderMap,
     Json(req): Json<SendBody>,
 ) -> Result<Reply, Reply> {
-    let viewer = viewer_id(viewer);
+    let caller = caller_from_auth(level.as_ref().map(|Extension(level)| *level), viewer);
     let (from_ws, from_proj) = authorized_scope(
         &state,
         &req.from_workspace,
         &req.from_project,
-        viewer,
+        caller,
         ProjectAccess::Read,
     )
     .await?;
@@ -234,7 +236,7 @@ pub(crate) async fn send(
         &state,
         &req.to_workspace,
         &req.to_project,
-        viewer,
+        caller,
         ProjectAccess::Write,
     )
     .await?;
@@ -328,11 +330,12 @@ pub(crate) async fn pop(
     headers: HeaderMap,
     Json(req): Json<PopBody>,
 ) -> Result<Reply, Reply> {
+    let caller = caller_from_auth(level.as_ref().map(|Extension(level)| *level), viewer);
     let (ws, proj) = authorized_scope(
         &state,
         &req.workspace,
         &req.project,
-        viewer_id(viewer),
+        caller,
         ProjectAccess::Write,
     )
     .await?;
@@ -420,11 +423,12 @@ pub(crate) async fn cancel(
     headers: HeaderMap,
     Json(req): Json<CancelBody>,
 ) -> Result<Reply, Reply> {
+    let caller = caller_from_auth(level.as_ref().map(|Extension(level)| *level), viewer);
     let (ws, proj) = authorized_scope(
         &state,
         &req.workspace,
         &req.project,
-        viewer_id(viewer),
+        caller,
         ProjectAccess::Write,
     )
     .await?;

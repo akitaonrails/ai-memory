@@ -2160,8 +2160,20 @@ async fn handle_handoff(
 ) -> impl IntoResponse {
     let actor = actor_identity(actor_ext);
     let skip_webhooks = admission_skips(level_ext, &headers);
-    let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
-    match fetch_and_accept_handoff(&state, query, actor, skip_webhooks, viewer).await {
+    let caller = ai_memory_store::ScopeCaller::from_auth(
+        level_ext.map(|axum::Extension(level)| level),
+        viewer_ext.map(|axum::Extension(viewer)| viewer),
+    );
+    match fetch_and_accept_handoff_at_for_caller(
+        &state,
+        query,
+        actor,
+        skip_webhooks,
+        caller,
+        jiff::Timestamp::now(),
+    )
+    .await
+    {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
         // A refusal is the one failure that must not look like "no handoff":
@@ -2182,6 +2194,7 @@ async fn handle_handoff(
     }
 }
 
+#[cfg(test)]
 async fn fetch_and_accept_handoff(
     state: &HookState,
     query: HandoffQuery,
@@ -2189,12 +2202,12 @@ async fn fetch_and_accept_handoff(
     skip_webhooks: Vec<String>,
     viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<Option<String>> {
-    fetch_and_accept_handoff_at(
+    fetch_and_accept_handoff_at_for_caller(
         state,
         query,
         actor,
         skip_webhooks,
-        viewer,
+        ai_memory_store::ScopeCaller::from(viewer),
         jiff::Timestamp::now(),
     )
     .await
@@ -2210,6 +2223,7 @@ fn delivery_flag_enabled(value: Option<&str>, default: bool) -> bool {
     }
 }
 
+#[cfg(test)]
 async fn fetch_and_accept_handoff_at(
     state: &HookState,
     query: HandoffQuery,
@@ -2218,6 +2232,26 @@ async fn fetch_and_accept_handoff_at(
     viewer: Option<ai_memory_core::UserId>,
     now: jiff::Timestamp,
 ) -> anyhow::Result<Option<String>> {
+    fetch_and_accept_handoff_at_for_caller(
+        state,
+        query,
+        actor,
+        skip_webhooks,
+        ai_memory_store::ScopeCaller::from(viewer),
+        now,
+    )
+    .await
+}
+
+async fn fetch_and_accept_handoff_at_for_caller(
+    state: &HookState,
+    query: HandoffQuery,
+    actor: Option<IdentityKey>,
+    skip_webhooks: Vec<String>,
+    caller: ai_memory_store::ScopeCaller,
+    now: jiff::Timestamp,
+) -> anyhow::Result<Option<String>> {
+    let viewer = caller.user_id();
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     // Keep the active-project key compatible with MCP transports: the native
     // session id is carried separately below to bind a destructive handoff
@@ -2229,7 +2263,7 @@ async fn fetch_and_accept_handoff_at(
     // Authorized before the active-project pointer is published, so a refused
     // repository does not become the caller's default for later calls.
     let (ws, proj) =
-        resolve_authorized_startup_scope(state, &query, actor.as_ref(), viewer).await?;
+        resolve_authorized_startup_scope_for_caller(state, &query, actor.as_ref(), caller).await?;
     // Mid-session notice poll (#1942): authorized like a session start, then
     // read-only. Returning here skips every claim, write and pointer publish
     // below.
@@ -2326,7 +2360,7 @@ async fn fetch_and_accept_handoff_at(
     let may_write_profile = match crate::grants::authorize_resolved(
         &state.reader,
         Some((ws, proj)),
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Write,
     )
     .await
@@ -2564,7 +2598,7 @@ async fn pinned_managed_hook_scope(
     state: &HookState,
     hint: ManagedHookHint<'_>,
     actor: Option<&IdentityKey>,
-    viewer: Option<ai_memory_core::UserId>,
+    caller: ai_memory_store::ScopeCaller,
 ) -> anyhow::Result<Option<(WorkspaceId, ProjectId)>> {
     let Some(run_id) = hint.run.and_then(|raw| ManagedRunId::from_str(raw).ok()) else {
         return Ok(None);
@@ -2594,14 +2628,14 @@ async fn pinned_managed_hook_scope(
         hint.native_session.unwrap_or_default(),
         &state.sanitizer,
     )?;
-    ai_memory_store::authorize_scope_for(
+    ai_memory_store::authorize_scope_for_caller(
         &state.reader,
         None,
         ai_memory_store::ResolvedScope {
             workspace_id,
             project_id,
         },
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Write,
     )
     .await?;
@@ -2644,11 +2678,27 @@ async fn pinned_managed_hook_scope(
 
 /// Resolve startup scope from a validated pinned run or the normal marker/name
 /// route, then apply the corresponding current project authorization.
+#[cfg(test)]
 async fn resolve_authorized_startup_scope(
     state: &HookState,
     query: &HandoffQuery,
     actor: Option<&IdentityKey>,
     viewer: Option<ai_memory_core::UserId>,
+) -> anyhow::Result<(WorkspaceId, ProjectId)> {
+    resolve_authorized_startup_scope_for_caller(
+        state,
+        query,
+        actor,
+        ai_memory_store::ScopeCaller::from(viewer),
+    )
+    .await
+}
+
+async fn resolve_authorized_startup_scope_for_caller(
+    state: &HookState,
+    query: &HandoffQuery,
+    actor: Option<&IdentityKey>,
+    caller: ai_memory_store::ScopeCaller,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     if let Some(scope) = pinned_managed_hook_scope(
@@ -2666,7 +2716,7 @@ async fn resolve_authorized_startup_scope(
             ),
         },
         actor,
-        viewer,
+        caller,
     )
     .await?
     {
@@ -2691,13 +2741,13 @@ async fn resolve_authorized_startup_scope(
         &aliases,
         ProjectSource::parse(query.project_src.as_deref()),
         false,
-        viewer,
+        caller.user_id(),
     )
     .await?;
     crate::grants::authorize_resolved(
         &state.reader,
         Some((ws, proj)),
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Read,
     )
     .await?;
@@ -2715,11 +2765,15 @@ async fn handle_brief(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> impl IntoResponse {
     let actor = actor_identity(actor_ext);
-    let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
-    match fetch_brief(&state, &query, actor.as_ref(), viewer).await {
+    let caller = ai_memory_store::ScopeCaller::from_auth(
+        level_ext.map(|axum::Extension(level)| level),
+        viewer_ext.map(|axum::Extension(viewer)| viewer),
+    );
+    match fetch_brief(&state, &query, actor.as_ref(), caller).await {
         Ok(brief) => (StatusCode::OK, brief.unwrap_or_default()),
         Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
             Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
@@ -2735,7 +2789,7 @@ async fn fetch_brief(
     state: &HookState,
     query: &HandoffQuery,
     actor: Option<&IdentityKey>,
-    viewer: Option<ai_memory_core::UserId>,
+    caller: ai_memory_store::ScopeCaller,
 ) -> anyhow::Result<Option<String>> {
     let project_change = crate::payload::query_flag_truthy(query.project_change.as_deref());
     if project_change && !state.project_briefs.enabled {
@@ -2747,7 +2801,8 @@ async fn fetch_brief(
     {
         return Ok(None);
     }
-    let (ws, proj) = resolve_authorized_startup_scope(state, query, actor, viewer).await?;
+    let (ws, proj) =
+        resolve_authorized_startup_scope_for_caller(state, query, actor, caller).await?;
     let forced;
     let query = if project_change {
         let Some(session) = query
@@ -5486,6 +5541,10 @@ async fn process_authorized(
         user: actor.as_ref().map(IdentityKey::storage_key),
         session_id: env.session_id.clone(),
     };
+    let caller = ai_memory_store::ScopeCaller::from_auth(
+        Some(level),
+        viewer.map(ai_memory_core::AuthorizedViewer),
+    );
     let pinned_scope = pinned_managed_hook_scope(
         state,
         ManagedHookHint {
@@ -5506,7 +5565,7 @@ async fn process_authorized(
             ),
         },
         actor.as_ref(),
-        viewer,
+        caller,
     )
     .await?;
     // Session-sticky attribution: for an event whose session already
@@ -5609,14 +5668,14 @@ async fn process_authorized(
     // Decided on the read pool, not the writer actor: this runs for every
     // captured event, and a round trip through the single writer per event is
     // the contention the hook path is built to avoid.
-    match ai_memory_store::authorize_scope_for(
+    match ai_memory_store::authorize_scope_for_caller(
         &state.reader,
         None,
         ai_memory_store::ResolvedScope {
             workspace_id: ws,
             project_id: proj,
         },
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Write,
     )
     .await
@@ -25560,8 +25619,10 @@ pub(crate) mod tests {
     }
 
     async fn subagent_brief(state: &Arc<HookState>, query: HandoffQuery) -> (StatusCode, String) {
-        read_handoff_response(handle_brief(State(state.clone()), Query(query), None, None).await)
-            .await
+        read_handoff_response(
+            handle_brief(State(state.clone()), Query(query), None, None, None).await,
+        )
+        .await
     }
 
     async fn upsert_brief_page(state: &HookState, cwd: &str, path: &str, body: &str) {
@@ -25785,6 +25846,7 @@ pub(crate) mod tests {
                 Query(subagent_brief_query(cwd, Some("true"))),
                 Some(axum::Extension(carol)),
                 None,
+                None,
             )
             .await,
         )
@@ -25867,6 +25929,7 @@ pub(crate) mod tests {
                     handle_brief(
                         State(state),
                         Query(query),
+                        None,
                         None,
                         Some(axum::Extension(AuthorizedViewer(viewer))),
                     )
@@ -26138,6 +26201,7 @@ pub(crate) mod tests {
                     handle_brief(
                         State(state),
                         Query(mid_session_query(&cwd, moved)),
+                        None,
                         None,
                         Some(axum::Extension(AuthorizedViewer(viewer))),
                     )

@@ -98,6 +98,16 @@ version in [`docs/changelog/`](docs/changelog/):
   in milliseconds while preserving `#1114` straddling-secret and PEM private-key
   redaction. (#2452)
 
+### Security
+
+- Enforce the reserved-scope write gate (`default/_global` and
+  `<workspace>/_profile`) and private-profile isolation (`_profile.<user_id>`)
+  for non-root trusted-proxy callers (`AuthLevel::User` without a database
+  `AuthorizedViewer`) across MCP tools, `/messages/*`, and hook/workstream
+  routes (`GHSA-v4vw-rf7v-cxgf`). Non-root proxied users can still read shared
+  scopes and write ordinary projects, while root-matched proxy identities and
+  the static root bearer retain full access.
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

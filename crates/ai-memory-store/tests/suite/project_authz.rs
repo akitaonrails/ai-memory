@@ -117,21 +117,25 @@ async fn authz_matrix_reader_and_writer_paths() {
         is_root: false,
         is_creator: true,
         user_id: None,
+        subject_to_project_grants: true,
     };
     let read_grantee = ProjectPrincipal {
         is_root: false,
         is_creator: false,
         user_id: Some(reader),
+        subject_to_project_grants: true,
     };
     let write_grantee = ProjectPrincipal {
         is_root: false,
         is_creator: false,
         user_id: Some(writer),
+        subject_to_project_grants: true,
     };
     let no_grant = ProjectPrincipal {
         is_root: false,
         is_creator: false,
         user_id: Some(nogrant),
+        subject_to_project_grants: true,
     };
     let anon = ProjectPrincipal::anonymous();
 
@@ -283,6 +287,7 @@ async fn ship_inert_open_admits_all_and_restricted_admits_root_and_creator() {
         is_root: false,
         is_creator: true,
         user_id: None,
+        subject_to_project_grants: true,
     };
     for principal in [ProjectPrincipal::root(), creator] {
         for need in [ProjectAccess::Read, ProjectAccess::Write] {
@@ -310,6 +315,7 @@ async fn ship_inert_open_admits_all_and_restricted_admits_root_and_creator() {
                 is_root: false,
                 is_creator: false,
                 user_id: Some(stranger),
+                subject_to_project_grants: true,
             },
             true,
             ProjectAccess::Read,
@@ -492,6 +498,8 @@ async fn pure_authorize_project_reference() {
         grant: None,
         workspace_grant: None,
         reserved_global: false,
+        private_profile: false,
+        subject_to_project_grants: true,
     };
     assert!(authorize_project(&deny, ProjectAccess::Read).is_err());
 
