@@ -402,7 +402,7 @@ and every `#[cfg(windows)]` **test** binary), so a Windows-only compile/link bre
 per merge on Linux. It landed as the `windows cross-build (msvc)` job in `ci.yml`. Gotcha for
 future maintainers: the target's `rust-std` must be added to the **1.95** toolchain that
 `rust-toolchain.toml` pins, not `stable`, or the build fails with "can't find crate for
-`core`"; the job pins `toolchain: "1.95"` for that reason.
+`core`"; the job runs `rustup target add` on that toolchain for that reason.
 
 ### Phase 1 (dockur VM): it runs the real suite green, but it is NOT a full-suite speed win
 
