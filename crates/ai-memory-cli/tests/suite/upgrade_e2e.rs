@@ -313,6 +313,117 @@ fn replacement_refresh_preserves_other_agents_hook_endpoint_and_auth() -> anyhow
     Ok(())
 }
 
+/// DSH's hook commands live in the `hooks.json` its `--apply` generates beside
+/// the staged scripts, not in a file of DSH's own, and DSH has no MCP entry
+/// to infer an endpoint from. The refresh must read that generated file.
+#[test]
+fn replacement_refresh_preserves_dsh_generated_hook_endpoint() -> anyhow::Result<()> {
+    use std::fs;
+    use std::path::Path;
+
+    use crate::e2e_support::hermetic;
+
+    const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
+    const HOOK_URL: &str = "https://memory.example.invalid/team";
+    const HOOK_TOKEN: &str = "aim_test_installed_hook_token";
+    const CONFIG_TOKEN: &str = "aim_test_configured_token";
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let data = home.join("data");
+    let hooks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+    let command = || {
+        let mut cmd = hermetic(BIN);
+        cmd.arg("--data-dir")
+            .arg(&data)
+            .args(["--language", "en"])
+            .env("HOME", home)
+            .env("AI_MEMORY_HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("APPDATA", home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", home.join("AppData/Local"))
+            .current_dir(home);
+        cmd
+    };
+    let output = command()
+        .args(["install-hooks", "--agent", "dsh"])
+        .args(["--server-url", HOOK_URL, "--auth-token", HOOK_TOKEN])
+        .arg("--hooks-dir")
+        .arg(&hooks)
+        .arg("--apply")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "dsh hook install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Staged under the data dir, or under the user's data dir when the test
+    // itself runs in a container (`hook_staging_root`).
+    let generated = [
+        data.join("hooks/dsh/hooks.json"),
+        home.join(".local/share/ai-memory/hooks/dsh/hooks.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .expect("install-hooks --agent dsh generated hooks.json");
+    let written = fs::read_to_string(&generated)?;
+    let installed = written.matches(HOOK_URL).count();
+    assert!(installed > 1);
+    // An older executable shows the refresh re-rendered the file rather than
+    // skipping DSH.
+    let old_exe = if cfg!(windows) {
+        r"C:\old\ai-memory.exe"
+    } else {
+        "/opt/old/ai-memory"
+    };
+    let mut hooks: serde_json::Value = serde_json::from_str(&written)?;
+    let commands = hooks["hooks"]
+        .as_object_mut()
+        .expect("hooks keyed by event")
+        .values_mut()
+        .filter_map(serde_json::Value::as_array_mut)
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .get_mut("hooks")
+                .and_then(serde_json::Value::as_array_mut)
+        })
+        .flatten()
+        .filter_map(|handler| handler.get_mut("command"));
+    let mut planted = false;
+    for command in commands {
+        if let Some(text) = command.as_str().filter(|text| text.contains(BIN)) {
+            *command = serde_json::Value::String(text.replace(BIN, old_exe));
+            planted = true;
+        }
+    }
+    assert!(planted || cfg!(windows), "no command names {BIN}");
+    fs::write(&generated, serde_json::to_vec(&hooks)?)?;
+    let token_file = data.join("auth-token");
+    let original_token = fs::read(&token_file)?;
+
+    let output = command()
+        .arg("upgrade-refresh-hooks")
+        .env("AI_MEMORY_AUTH_TOKEN", CONFIG_TOKEN)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "hook refresh failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let refreshed = fs::read_to_string(&generated)?;
+    assert!(!refreshed.contains(old_exe), "{refreshed}");
+    assert_eq!(
+        refreshed.matches(HOOK_URL).count(),
+        installed,
+        "{refreshed}"
+    );
+    assert!(!refreshed.contains("127.0.0.1:49374"), "{refreshed}");
+    assert_eq!(fs::read(&token_file)?, original_token);
+    Ok(())
+}
+
 /// Spawns a loopback release fixture and a real CLI subprocess: seconds,
 /// not milliseconds — slow tier (`cargo tf` / CI), not the everyday loop.
 mod slow {
