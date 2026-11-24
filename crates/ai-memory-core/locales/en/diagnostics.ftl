@@ -703,6 +703,7 @@ diag-copying = copying { $value0 }
 diag-reading-staged-hooks-at = reading staged hooks at { $value0 }
 diag-not-a-generated-typescript-integration = not a generated TypeScript integration: { $agent }
 diag-ai-memory-install-hooks-agent-apply = { "    " }ai-memory install-hooks --agent { $name } --apply
+diag-ai-memory-install-hooks-agent-apply-server-url = { "    " }ai-memory install-hooks --agent { $name } --apply --server-url { $value0 }
 diag-upgrade-download-limit-must-be-greater-than = upgrade download limit must be greater than zero
 diag-get = GET { $url }
 diag-get-returned = GET { $url } returned { $status }

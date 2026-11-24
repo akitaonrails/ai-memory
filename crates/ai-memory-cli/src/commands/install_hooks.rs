@@ -39,8 +39,9 @@ use crate::commands::render_shared::{
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
     is_portable_home_arg, kimi_code_hook_commands, local_hook_policy_v1_supported, mask_secret,
-    portable_hook_home, posix_path_arg, shell_quote, ts_auth_headers_fn, ts_capture_policy_v1,
-    ts_string_literal, ts_timeout_signal, yaml_single_quote,
+    portable_hook_home, posix_path_arg, powershell_call_operator, powershell_quote, shell_quote,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL, PiToolExposure};
@@ -193,10 +194,72 @@ pub(crate) fn installed_claude_hook_url(
     }
     let existing = existing_agent_config(args)?;
     let document: serde_json::Value = serde_json::from_str(&existing).ok()?;
-    baked_claude_hook_url(&document, data_dir)
+    baked_hook_url(&document, data_dir, "claude-code")
 }
 
-fn baked_claude_hook_url(document: &serde_json::Value, data_dir: &Path) -> Option<String> {
+/// [`installed_claude_hook_url`] for any agent whose `--apply` writes native
+/// hook commands into a hooks document: the endpoint they all share, so
+/// `upgrade` can re-render them in place instead of moving them to the
+/// loopback default. `None` when the installed config holds no ai-memory hooks,
+/// they disagree, or one carries something a refresh would lose.
+pub(crate) fn installed_hook_url(config: &Config, args: &InstallHooksArgs) -> Option<String> {
+    if args.agent == AgentChoice::ClaudeCode {
+        return installed_claude_hook_url(args, &config.data_dir);
+    }
+    if !local_hook_policy_v1_supported() {
+        return None;
+    }
+    let existing = match (args.agent, &args.config_file) {
+        // `run` resolves the CODEX_HOME-relative file into `args.config_file`
+        // before reading it; resolve it the same way here.
+        (AgentChoice::Codex, None) => {
+            fs::read_to_string(codex_hooks_path(&config.runtime_env).ok()?).ok()?
+        }
+        // DSH's hook config is the `hooks.json` its `--apply` generates beside
+        // the staged scripts, which DSH's patch points at.
+        (AgentChoice::Dsh, None) => fs::read_to_string(
+            hook_staging_root(
+                &config.data_dir,
+                ai_memory_wiki::backup::running_in_container(),
+            )
+            .join("hooks")
+            .join("dsh")
+            .join("hooks.json"),
+        )
+        .ok()?,
+        _ => existing_agent_config(args)?,
+    };
+    let agent = args.agent.kind().as_str();
+    if args.agent == AgentChoice::KimiCode {
+        return baked_toml_hook_url(&existing, &config.data_dir, agent);
+    }
+    let document: serde_json::Value = serde_json::from_str(&existing).ok()?;
+    baked_hook_url(&document, &config.data_dir, agent)
+}
+
+/// [`baked_hook_url`] for Kimi Code's `config.toml`, whose hooks are an array
+/// of `[[hooks]]` tables with one `command` string each.
+fn baked_toml_hook_url(existing: &str, data_dir: &Path, agent: &str) -> Option<String> {
+    let document: toml_edit::DocumentMut = existing.parse().ok()?;
+    let data_dir = data_dir.to_string_lossy();
+    let data_dir = strip_windows_verbatim_prefix(&data_dir);
+    let mut urls = document
+        .get("hooks")?
+        .as_array_of_tables()?
+        .iter()
+        .filter(|entry| is_ai_memory_toml_hook_entry(entry))
+        .map(|entry| {
+            let command = entry.get("command")?.as_str()?;
+            native_hook_url(&serde_json::json!({ "command": command }), &data_dir, agent)
+        });
+    let url = urls.next()??;
+    urls.all(|other| other.as_deref() == Some(url.as_str()))
+        .then_some(url)
+}
+
+/// The one endpoint every ai-memory handler in a hooks document (`hooks` keyed
+/// by event, entries nested under `hooks` or flat) sends to for `agent`.
+fn baked_hook_url(document: &serde_json::Value, data_dir: &Path, agent: &str) -> Option<String> {
     let hooks = ai_memory_claude_hooks(document)?;
     let data_dir = data_dir.to_string_lossy();
     let data_dir = strip_windows_verbatim_prefix(&data_dir);
@@ -211,20 +274,37 @@ fn baked_claude_hook_url(document: &serde_json::Value, data_dir: &Path) -> Optio
                 .map_or_else(|| std::slice::from_ref(entry), Vec::as_slice)
         })
         .filter(|handler| is_ai_memory_hook_entry(handler));
-    let url = native_claude_hook_url(handlers.next()?, &data_dir)?;
+    let url = native_hook_url(handlers.next()?, &data_dir, agent)?;
     handlers
-        .all(|handler| native_claude_hook_url(handler, &data_dir).as_deref() == Some(url.as_str()))
+        .all(|handler| native_hook_url(handler, &data_dir, agent).as_deref() == Some(url.as_str()))
         .then_some(url)
 }
 
-fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option<String> {
+/// The endpoint one installer-rendered native hook handler for `agent` sends
+/// to, when the handler carries nothing a refresh would lose: the same data
+/// dir, no inline credential, no custom prefix or extra flag.
+fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> Option<String> {
     let command = handler.get("command")?.as_str()?;
     let exec = handler.get("args");
     // A legacy Windows command double-quotes an absolute executable. A POSIX
     // home-relative command (#2035) also opens with a double quote, but as
     // `"$HOME/..."`; it must take the POSIX branch, not the Windows one.
-    let legacy_windows =
-        exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME");
+    // A PowerShell runner's Windows command invokes a single-quoted
+    // executable through the call operator (`& 'C:\...'`, #1462).
+    let quote = if exec.is_none()
+        && command.starts_with("& '")
+        && !powershell_call_operator(agent).is_empty()
+    {
+        HookCommandQuote::PowerShell
+    } else if exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME") {
+        HookCommandQuote::Windows
+    } else {
+        HookCommandQuote::Posix
+    };
+    let command = match quote {
+        HookCommandQuote::PowerShell => command.strip_prefix("& ")?,
+        _ => command,
+    };
     let words: Vec<&str> = if let Some(args) = exec {
         args.as_array()?
             .iter()
@@ -235,17 +315,19 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
         // The installer renders the data dir either absolute (`shell_quote`)
         // or, when it sits under `$HOME`, as the portable `"$HOME/..."` form
         // (#2035). Try both so a home-relative install is still recognized.
-        let rendered_dirs: Vec<String> = if legacy_windows {
-            vec![format!("\"{data_dir}\"")]
-        } else {
-            let mut forms = vec![shell_quote(data_dir)];
-            if let Some(home) = portable_hook_home("claude-code", false) {
-                let portable = posix_path_arg(Path::new(data_dir), Some(&home));
-                if !forms.contains(&portable) {
-                    forms.push(portable);
+        let rendered_dirs: Vec<String> = match quote {
+            HookCommandQuote::Windows => vec![format!("\"{data_dir}\"")],
+            HookCommandQuote::PowerShell => vec![powershell_quote(data_dir)],
+            HookCommandQuote::Posix => {
+                let mut forms = vec![shell_quote(data_dir)];
+                if let Some(home) = portable_hook_home(agent, false) {
+                    let portable = posix_path_arg(Path::new(data_dir), Some(&home));
+                    if !forms.contains(&portable) {
+                        forms.push(portable);
+                    }
                 }
+                forms
             }
-            forms
         };
         // Retain the connection only when the replacement will use the
         // same data directory for that endpoint's credentials.
@@ -256,12 +338,12 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
         // bare/shell-quoted word, the portable `"$HOME/..."` form (#2035), or
         // an older Linux upgrade's kernel deleted-executable marker. A complex
         // shell prefix can carry per-hook policy that a refresh would lose.
+        let posix = quote == HookCommandQuote::Posix;
         let is_installer_word = |word: &str| {
-            native_claude_hook_word(word, legacy_windows).is_some()
-                || (!legacy_windows && is_portable_home_arg(word))
+            native_hook_word(word, quote).is_some() || (posix && is_portable_home_arg(word))
         };
         (is_installer_word(executable)
-            || (!legacy_windows
+            || (posix
                 && executable
                     .strip_suffix(" (deleted)")
                     .is_some_and(is_installer_word)))
@@ -280,7 +362,7 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
         "--event",
         _,
         "--agent",
-        "claude-code",
+        named,
         "--server-url",
         raw,
         tail @ ..,
@@ -288,6 +370,9 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
     else {
         return None;
     };
+    if *named != agent {
+        return None;
+    }
     let tail = match tail {
         ["--project-strategy", _, rest @ ..] => rest,
         tail => tail,
@@ -300,7 +385,7 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
     let url = if exec.is_some() {
         (*raw).to_owned()
     } else {
-        native_claude_hook_word(raw, legacy_windows)?
+        native_hook_word(raw, quote)?
     };
     let parsed = reqwest::Url::parse(&url).ok()?;
     (matches!(parsed.scheme(), "http" | "https")
@@ -311,8 +396,27 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
     .then_some(url)
 }
 
-fn native_claude_hook_word(raw: &str, legacy_windows: bool) -> Option<String> {
-    if legacy_windows {
+/// How an installer-rendered native hook command string quotes its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookCommandQuote {
+    /// POSIX `shell_quote`, plus the portable `"$HOME/..."` path form (#2035).
+    Posix,
+    /// The double-quoted Windows command string.
+    Windows,
+    /// The Windows command string of an agent that runs hooks through
+    /// PowerShell: `& ` and single-quoted words, `''` standing for a quote.
+    PowerShell,
+}
+
+fn native_hook_word(raw: &str, quote: HookCommandQuote) -> Option<String> {
+    if quote == HookCommandQuote::PowerShell {
+        let value = raw
+            .strip_prefix('\'')?
+            .strip_suffix('\'')?
+            .replace("''", "'");
+        return (!value.is_empty() && powershell_quote(&value) == raw).then_some(value);
+    }
+    if quote == HookCommandQuote::Windows {
         let value = raw.strip_prefix('"')?.strip_suffix('"')?;
         return (!value.is_empty() && !value.contains('"')).then(|| value.to_owned());
     }
@@ -9807,7 +9911,7 @@ mod tests {
     const CAPTURE_ADMIT_GATE_TS: &str = "const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === \"allowlist\" && !markerPresent) return { disposition: \"drop\", payload };";
 
     #[test]
-    fn baked_claude_hook_url_requires_one_owned_native_endpoint() {
+    fn baked_hook_url_requires_one_owned_native_claude_endpoint() {
         let url = "https://memory.example.invalid/a!b";
         let data_dir = Path::new("data with spaces");
         let posix = serde_json::json!({
@@ -9829,16 +9933,16 @@ mod tests {
             "SessionEnd": [{"matcher": "", "hooks": [legacy_windows]}]
         }});
         assert_eq!(
-            baked_claude_hook_url(&settings, data_dir).as_deref(),
+            baked_hook_url(&settings, data_dir, "claude-code").as_deref(),
             Some(url)
         );
-        assert!(baked_claude_hook_url(&settings, Path::new("other data")).is_none());
+        assert!(baked_hook_url(&settings, Path::new("other data"), "claude-code").is_none());
 
         let args = settings["hooks"]["SessionStart"][0]["hooks"][0]["args"]
             .as_array_mut()
             .unwrap();
         args[8] = serde_json::json!("https://other.example.invalid");
-        assert!(baked_claude_hook_url(&settings, data_dir).is_none());
+        assert!(baked_hook_url(&settings, data_dir, "claude-code").is_none());
 
         let args = settings["hooks"]["SessionStart"][0]["hooks"][0]["args"]
             .as_array_mut()
@@ -9848,11 +9952,11 @@ mod tests {
             serde_json::json!("--auth-token"),
             serde_json::json!("synthetic-inline"),
         ]);
-        assert!(baked_claude_hook_url(&settings, data_dir).is_none());
+        assert!(baked_hook_url(&settings, data_dir, "claude-code").is_none());
     }
 
     #[test]
-    fn baked_claude_hook_url_preserves_custom_command_prefixes_for_manual_refresh() {
+    fn baked_hook_url_preserves_custom_claude_command_prefixes_for_manual_refresh() {
         let data_dir = Path::new("data with spaces");
         let settings = |executable: &str| {
             serde_json::json!({"hooks": {
@@ -9868,7 +9972,7 @@ mod tests {
             "'/old o'\\''brien/ai-memory'",
         ] {
             assert_eq!(
-                baked_claude_hook_url(&settings(executable), data_dir).as_deref(),
+                baked_hook_url(&settings(executable), data_dir, "claude-code").as_deref(),
                 Some("https://memory.example.invalid"),
                 "a canonical stale executable can be refreshed"
             );
@@ -9883,10 +9987,242 @@ mod tests {
             "/bin/wrapper /bin/ai-memory (deleted)",
         ] {
             assert!(
-                baked_claude_hook_url(&settings(executable), data_dir).is_none(),
+                baked_hook_url(&settings(executable), data_dir, "claude-code").is_none(),
                 "a custom prefix must stay available for manual refresh"
             );
         }
+    }
+
+    /// What `install-hooks --server-url` writes for each agent that keeps its
+    /// hooks in a JSON document reads back as that endpoint, and only for that
+    /// agent and data dir, so `upgrade` re-renders it instead of moving it to
+    /// loopback.
+    #[test]
+    fn baked_hook_url_reads_the_endpoint_every_json_hook_agent_renders() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let emit_root = Path::new("/srv/ai memory/data/hooks");
+        for (profile, agent) in [
+            (&CODEX_PROFILE, "codex"),
+            (&COPILOT_CLI_PROFILE, "copilot-cli"),
+            (&CURSOR_PROFILE, "cursor"),
+            (&GEMINI_PROFILE, "gemini-cli"),
+            (&COMMAND_CODE_PROFILE, "command-code"),
+        ] {
+            let document = build_profile_payload_for_agent(
+                profile,
+                emit_root,
+                remote,
+                None,
+                agent,
+                Some(data_dir),
+                None,
+                false,
+                true,
+            );
+            assert_eq!(
+                baked_hook_url(&document, data_dir, agent).as_deref(),
+                Some(remote),
+                "{agent}: {document}"
+            );
+            assert!(
+                baked_hook_url(&document, data_dir, "claude-code").is_none(),
+                "{agent}: another agent's commands are not this install"
+            );
+            assert!(
+                baked_hook_url(&document, Path::new("/srv/other"), agent).is_none(),
+                "{agent}: another data dir keeps other credentials"
+            );
+        }
+    }
+
+    /// DSH's generated `hooks.json` is the same kind of document, so the
+    /// endpoint it bakes reads back the same way.
+    #[test]
+    fn baked_hook_url_reads_the_endpoint_dsh_generates() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let document = build_dsh_hooks_payload(
+            Path::new("/srv/ai memory/data/hooks/dsh"),
+            remote,
+            None,
+            Some(data_dir),
+            None,
+            true,
+        );
+        assert_eq!(
+            baked_hook_url(&document, data_dir, "dsh").as_deref(),
+            Some(remote),
+            "{document}"
+        );
+        assert!(baked_hook_url(&document, Path::new("/srv/other"), "dsh").is_none());
+    }
+
+    /// The refresh keeps an endpoint only when re-rendering loses nothing, for
+    /// every agent as for Claude Code: a third-party hook in the same file is
+    /// ignored, while a second endpoint, an inline credential or a custom
+    /// prefix on one ai-memory hook leaves the endpoint unrecovered.
+    #[test]
+    fn baked_hook_url_refuses_what_a_refresh_would_lose_for_any_agent() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai-memory");
+        let handler = |prefix: &str, event: &str, url: &str, suffix: &str| {
+            serde_json::json!({
+                "type": "command",
+                "matcher": "",
+                "command": format!(
+                    "{prefix}/usr/local/bin/ai-memory --data-dir /srv/ai-memory hook --event {event} --agent cursor --server-url {}{suffix}",
+                    shell_quote(url)
+                )
+            })
+        };
+        let document = |stop: serde_json::Value| {
+            serde_json::json!({"version": 1, "hooks": {
+                "sessionStart": [handler("", "session-start", remote, "")],
+                "afterShellExecution": [{
+                    "type": "command",
+                    "command": "/opt/audit/bin/notify --server-url https://audit.example.invalid"
+                }],
+                "stop": [stop]
+            }})
+        };
+
+        let installed = document(handler("", "stop", remote, ""));
+        assert_eq!(
+            baked_hook_url(&installed, data_dir, "cursor").as_deref(),
+            Some(remote)
+        );
+        for (case, stop) in [
+            (
+                "a second endpoint",
+                handler("", "stop", "https://other.example.invalid", ""),
+            ),
+            (
+                "an inline credential",
+                handler("", "stop", remote, " --auth-token synthetic-inline"),
+            ),
+            (
+                "a custom prefix",
+                handler("AI_MEMORY_AUTO_HANDOFF=off ", "stop", remote, ""),
+            ),
+            (
+                "userinfo in the endpoint",
+                handler("", "stop", "https://user:pw@memory.example.invalid", ""),
+            ),
+        ] {
+            assert!(
+                baked_hook_url(&document(stop), data_dir, "cursor").is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    /// Kimi Code's `[[hooks]]` tables in `config.toml` read back the same way,
+    /// beside the user's own settings and hooks.
+    #[test]
+    fn baked_toml_hook_url_reads_kimi_code_hooks() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let render = |stop_url: &str| {
+            let mut document: toml_edit::DocumentMut =
+                "default_model = \"kimi-k2\"\n\n[[hooks]]\nevent = \"Stop\"\ncommand = \"notify-send done --server-url https://other.example.invalid\"\n"
+                    .parse()
+                    .unwrap();
+            let hooks = document["hooks"].as_array_of_tables_mut().unwrap();
+            for (event, command) in kimi_code_hook_commands(
+                Path::new("/srv/ai memory/data/hooks/kimi-code"),
+                remote,
+                None,
+                Some(data_dir),
+                None,
+                true,
+            ) {
+                let command = if event == "Stop" {
+                    command.replace(&shell_quote(remote), &shell_quote(stop_url))
+                } else {
+                    command
+                };
+                let mut table = toml_edit::Table::new();
+                table["event"] = toml_edit::value(event);
+                table["command"] = toml_edit::value(command);
+                hooks.push(table);
+            }
+            document.to_string()
+        };
+
+        assert_eq!(
+            baked_toml_hook_url(&render(remote), data_dir, "kimi-code").as_deref(),
+            Some(remote)
+        );
+        assert!(
+            baked_toml_hook_url(
+                &render("https://other.example.invalid"),
+                data_dir,
+                "kimi-code"
+            )
+            .is_none(),
+            "a second endpoint"
+        );
+        assert!(
+            baked_toml_hook_url(&render(remote), Path::new("/srv/other"), "kimi-code").is_none(),
+            "another data dir"
+        );
+        assert!(
+            baked_toml_hook_url("default_model = \"kimi-k2\"\n", data_dir, "kimi-code").is_none(),
+            "no hooks installed"
+        );
+    }
+
+    /// The Windows command of an agent that runs hooks through PowerShell,
+    /// composed as the renderer composes it: the call operator, then
+    /// single-quoted words with `''` for a quote (#1462).
+    #[test]
+    fn native_hook_url_reads_powershell_run_windows_commands() {
+        let remote = "https://memory.example.invalid/o'brien";
+        let exe = r"C:\Program Files\ai-memory\ai-memory.exe";
+        let data_dir = r"C:\Users\o'brien\AppData\Local\ai-memory";
+        let handler = |prefix: &str, agent: &str, suffix: &str| {
+            serde_json::json!({ "type": "command", "command": format!(
+                "{prefix}{} --data-dir {} hook --event session-start --agent {agent} --server-url {}{suffix}",
+                powershell_quote(exe),
+                powershell_quote(data_dir),
+                powershell_quote(remote)
+            )})
+        };
+        for agent in ["codex", "copilot-cli", "gemini-cli", "grok", "dsh"] {
+            assert_eq!(
+                native_hook_url(&handler("& ", agent, ""), data_dir, agent).as_deref(),
+                Some(remote),
+                "{agent}"
+            );
+            assert!(
+                native_hook_url(
+                    &handler("& ", agent, " --auth-token 'synthetic'"),
+                    data_dir,
+                    agent
+                )
+                .is_none(),
+                "{agent}: an inline credential"
+            );
+            assert!(
+                native_hook_url(
+                    &handler("& 'C:\\bin\\wrapper.exe' ", agent, ""),
+                    data_dir,
+                    agent
+                )
+                .is_none(),
+                "{agent}: a custom prefix"
+            );
+        }
+        // Cursor's Windows runner is not PowerShell, so the installer never
+        // writes this form for it.
+        assert!(native_hook_url(&handler("& ", "cursor", ""), data_dir, "cursor").is_none());
+        // A word PowerShell would read differently is not the installer's.
+        let unbalanced = serde_json::json!({ "command": format!(
+            "& 'C:\\ai-memory.exe' --data-dir {} hook --event stop --agent codex --server-url 'https://a.invalid/x'y'",
+            powershell_quote(data_dir)
+        )});
+        assert!(native_hook_url(&unbalanced, data_dir, "codex").is_none());
     }
 
     /// A home-relative install (#2035 renders the binary and data dir as
@@ -9896,7 +10232,7 @@ mod tests {
     /// restaging scripts, losing the endpoint.
     #[cfg(unix)]
     #[test]
-    fn native_claude_hook_url_recognizes_home_relative_commands() {
+    fn native_hook_url_recognizes_home_relative_claude_commands() {
         use crate::commands::render_shared::TestHookHome;
 
         let data_dir = "/home/tester/.local/share/ai-memory";
@@ -9918,7 +10254,7 @@ mod tests {
             "/opt/ai-memory/bin/ai-memory",
         ] {
             assert_eq!(
-                native_claude_hook_url(&settings(executable), data_dir).as_deref(),
+                native_hook_url(&settings(executable), data_dir, "claude-code").as_deref(),
                 Some("https://memory.example.invalid/team"),
                 "home-relative command should be recognized: {executable}"
             );
@@ -9930,7 +10266,7 @@ mod tests {
             "/bin/wrapper \"$HOME/.local/bin/ai-memory\"",
         ] {
             assert!(
-                native_claude_hook_url(&settings(executable), data_dir).is_none(),
+                native_hook_url(&settings(executable), data_dir, "claude-code").is_none(),
                 "a custom prefix must stay available for manual refresh: {executable}"
             );
         }

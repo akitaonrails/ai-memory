@@ -1170,7 +1170,15 @@ fn refresh_agent_list(config: &Config, agents: &StagedAgentList) {
 }
 
 fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
+    apply_staged_agent_hooks_with(config, name, apply_hooks_args(agent));
+}
+
+/// [`apply_staged_agent_hooks`] with the `install-hooks --apply` arguments it
+/// refreshes with, so a test can point the refresh at the hooks bundle instead
+/// of relying on where its own executable sits.
+fn apply_staged_agent_hooks_with(config: &Config, name: &str, args: InstallHooksArgs) {
     let i18n = &config.i18n;
+    let agent = args.agent;
     if agent == AgentChoice::ClaudeCode
         && let Some(settings) = claude_user_level_install_absent()
     {
@@ -1191,7 +1199,6 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
         }
         return;
     }
-    let args = apply_hooks_args(agent);
     let result = if agent == AgentChoice::ClaudeCode && !config.server_url_configured() {
         if let Some(url) = install_hooks::installed_claude_hook_url(&args, &config.data_dir) {
             install_hooks::run_with_preserved_hook_url(config, args, None, &url)
@@ -1202,6 +1209,23 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
             );
             restage_claude_scripts(config)
         }
+    } else if !config.server_url_configured()
+        && let Some(url) = install_hooks::installed_hook_url(config, &args)
+    {
+        // Keep the endpoint the installed hooks bake, as for Claude Code
+        // above: with no configured server_url the regular refresh falls
+        // back to loopback and drops a remote connection (#2204, #2374).
+        println!(
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "    ai-memory install-hooks --agent {name} --apply --server-url {}",
+                    super::render_shared::native_shell_quote(&url)
+                )
+            )
+        );
+        install_hooks::run_with_preserved_hook_url(config, args, None, &url)
     } else {
         println!(
             "{}",
@@ -1537,6 +1561,97 @@ mod tests {
             install_hooks::baked_generated_server_url("const OTHER = 1;"),
             None
         );
+    }
+
+    /// The staged-hook refresh `upgrade` runs, end to end on Codex, whose
+    /// hooks file follows the captured CODEX_HOME. With no configured
+    /// server_url it keeps the remote endpoint the installed hooks bake and
+    /// the hook token stored for it, instead of re-pointing them at loopback
+    /// with the local root bearer that `ai-memory init` minted.
+    #[test]
+    fn a_staged_codex_hook_refresh_keeps_its_installed_remote_server_and_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let runtime_env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "CODEX_HOME",
+            codex_home.to_str().unwrap(),
+        )]);
+        let remote = "https://memory.example.invalid/team";
+        let install = Config {
+            data_dir: temp.path().join("data"),
+            runtime_env: runtime_env.clone(),
+            ..Config::default()
+        };
+        let mut args = apply_hooks_args(AgentChoice::Codex);
+        args.server_url = Some(remote.into());
+        args.auth_token = Some("team-key-1".into());
+        args.hooks_dir = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"));
+        install_hooks::run(&install, args).unwrap();
+        let hooks = codex_home.join("hooks.json");
+        let token = crate::config::hook_auth_token_path_in(&install.data_dir);
+        assert!(fs::read_to_string(&hooks).unwrap().contains(remote));
+        assert_eq!(fs::read_to_string(&token).unwrap().trim(), "team-key-1");
+
+        let mut upgrade = Config {
+            data_dir: temp.path().join("data"),
+            runtime_env,
+            ..Config::default()
+        };
+        upgrade.auth.bearer_token = Some("local-root-bearer".into());
+        assert!(!upgrade.server_url_configured());
+        // Name the bundle: found from a test executable it is missing, and the
+        // refresh would skip the agent, leaving the file as installed.
+        let mut refresh = apply_hooks_args(AgentChoice::Codex);
+        refresh.hooks_dir = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"));
+        // An older executable in one command, written in the same form, shows
+        // the refresh re-rendered it rather than skipping the agent.
+        let mut installed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+        let command = &mut installed["hooks"]["SessionStart"][0]["hooks"][0]["command"];
+        let (exe, rest) = command
+            .as_str()
+            .unwrap()
+            .split_once(" --data-dir ")
+            .unwrap();
+        let old = if exe.starts_with("& '") {
+            r"& 'C:\old\ai-memory.exe'"
+        } else if exe.starts_with('"') && !exe.starts_with("\"$HOME") {
+            r#""C:\old\ai-memory.exe""#
+        } else {
+            "/opt/old/ai-memory"
+        };
+        *command = serde_json::Value::String(format!("{old} --data-dir {rest}"));
+        fs::write(&hooks, serde_json::to_vec(&installed).unwrap()).unwrap();
+        apply_staged_agent_hooks_with(&upgrade, "codex", refresh);
+
+        let refreshed = fs::read_to_string(&hooks).unwrap();
+        assert!(
+            !refreshed.contains("old/ai-memory") && !refreshed.contains("old\\\\ai-memory"),
+            "{refreshed}"
+        );
+        assert!(refreshed.contains(remote), "{refreshed}");
+        assert!(!refreshed.contains("127.0.0.1:49374"), "{refreshed}");
+        assert_eq!(fs::read_to_string(&token).unwrap().trim(), "team-key-1");
+
+        // The recovered endpoint is only a fallback: a configured server_url
+        // is the operator's current choice and still drives the refresh. In
+        // the same test because both phases stage Codex's scripts, which in a
+        // container share one directory outside the temp data dir.
+        let configured = Config {
+            server_url: "https://configured.example.invalid".into(),
+            server_url_explicit: true,
+            ..upgrade
+        };
+        let mut refresh = apply_hooks_args(AgentChoice::Codex);
+        refresh.hooks_dir = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"));
+        apply_staged_agent_hooks_with(&configured, "codex", refresh);
+        let refreshed = fs::read_to_string(&hooks).unwrap();
+        assert!(
+            refreshed.contains("https://configured.example.invalid"),
+            "{refreshed}"
+        );
+        assert!(!refreshed.contains(remote), "{refreshed}");
     }
 
     #[test]

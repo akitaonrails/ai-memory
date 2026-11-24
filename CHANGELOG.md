@@ -35,6 +35,19 @@ version in [`docs/changelog/`](docs/changelog/):
   a warning naming the ignored setting. An explicit `embedding_provider =
   "local"` still refuses an unknown model. (#2454)
 
+### Fixed
+
+- `ai-memory upgrade` no longer moves the hooks of Codex, Copilot CLI,
+  Cursor, Gemini CLI, Kimi Code and the other native-hook agents to the local
+  server. Installed with `install-hooks --server-url <remote> --auth-token
+  <token>` and refreshed with no `server_url` configured, their commands were
+  re-rendered with `http://127.0.0.1:49374`, and after `ai-memory init` the
+  local root bearer replaced the stored hook token. The refresh now keeps the
+  endpoint every installed hook shares and the hook credential stored for it,
+  as it already did for Claude Code, in each command form the installer
+  writes, including the PowerShell form those agents get on Windows. A
+  configured `server_url` or `AI_MEMORY_SERVER_URL` still wins. (#2455)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
