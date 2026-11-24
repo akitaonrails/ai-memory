@@ -9981,6 +9981,49 @@ mod tests {
         }
     }
 
+    /// What `install-hooks --server-url` writes for each agent that keeps its
+    /// hooks in a JSON document reads back as that endpoint, and only for that
+    /// agent and data dir, so `upgrade` re-renders it instead of moving it to
+    /// loopback.
+    #[test]
+    fn baked_hook_url_reads_the_endpoint_every_json_hook_agent_renders() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let emit_root = Path::new("/srv/ai memory/data/hooks");
+        for (profile, agent) in [
+            (&CODEX_PROFILE, "codex"),
+            (&COPILOT_CLI_PROFILE, "copilot-cli"),
+            (&CURSOR_PROFILE, "cursor"),
+            (&GEMINI_PROFILE, "gemini-cli"),
+            (&COMMAND_CODE_PROFILE, "command-code"),
+        ] {
+            let document = build_profile_payload_for_agent(
+                profile,
+                emit_root,
+                remote,
+                None,
+                agent,
+                Some(data_dir),
+                None,
+                false,
+                true,
+            );
+            assert_eq!(
+                baked_hook_url(&document, data_dir, agent).as_deref(),
+                Some(remote),
+                "{agent}: {document}"
+            );
+            assert!(
+                baked_hook_url(&document, data_dir, "claude-code").is_none(),
+                "{agent}: another agent's commands are not this install"
+            );
+            assert!(
+                baked_hook_url(&document, Path::new("/srv/other"), agent).is_none(),
+                "{agent}: another data dir keeps other credentials"
+            );
+        }
+    }
+
     /// A home-relative install (#2035 renders the binary and data dir as
     /// `"$HOME/..."`) must still be recognized by the upgrade refresh, so its
     /// Claude endpoint and credentials are preserved. Before this, recognition
