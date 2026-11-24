@@ -3571,6 +3571,21 @@ impl Config {
         }
     }
 
+    /// The configured `embedding_model` that the unset-provider default
+    /// cannot run, so [`Self::embedder_config`] runs the default local model
+    /// instead. `None` when a provider is set, no model is set, or the model
+    /// is a local one. `serve` warns with it at startup.
+    #[must_use]
+    pub fn ignored_embedding_model(&self) -> Option<&str> {
+        if non_empty(self.embedding_provider.as_deref()).is_some() {
+            return None;
+        }
+        let model = non_empty(self.embedding_model.as_deref())?;
+        ai_memory_llm::resolve_local_model(model)
+            .is_err()
+            .then_some(model)
+    }
+
     /// Build the configured embedder settings, if hybrid search is enabled.
     ///
     /// # Errors
