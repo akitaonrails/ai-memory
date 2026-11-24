@@ -1600,11 +1600,10 @@ fn best_body_excerpt(
     }
 }
 
-/// Reduce a hook-supplied string to its first line.
+/// Reduce a hook-supplied string to its first nonblank line.
 ///
-/// Terminators are LF, CRLF, and a lone CR (`str::lines`). An empty first
-/// line (a payload that starts with a newline) yields `None` so the caller
-/// can fall back instead of storing `""`.
+/// Skip leading blank lines, including whitespace-only lines from a paste.
+/// A wholly blank payload yields `None` so the caller can fall back.
 ///
 /// This is the only shaping `title_hint` gets before it reaches the
 /// sanitizer: the 80-char display cap used to happen here too, but that ran
@@ -1614,12 +1613,10 @@ fn best_body_excerpt(
 /// `ai_memory_core::sanitize::truncate_for_title`, applied by
 /// `Sanitized::new` *after* `Sanitizer::scrub`.
 fn first_line(s: String) -> Option<String> {
-    // `str::lines` treats `\n`, `\r\n`, and a lone `\r` as terminators and
-    // does not keep them. Stopping only at `\n` left a trailing CR on
-    // Windows prompts, which the sanitizer preserves and `truncate_for_title`
-    // does not strip, so the CR was stored in the observation title.
-    let line = s.lines().next().unwrap_or("").to_string();
-    (!line.is_empty()).then_some(line)
+    // Keep the complete chosen line for sanitization, without a CRLF terminator.
+    s.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Cap core lifecycle body fields before the native hook writes its local
@@ -3798,11 +3795,7 @@ mod tests {
             q.clone(),
             serde_json::json!({ "prompt": "\r\nhello" }),
         );
-        assert!(
-            env.title_hint.is_none(),
-            "empty first line after leading CRLF must not become a CR or empty title, got {:?}",
-            env.title_hint
-        );
+        assert_eq!(env.title_hint.as_deref(), Some("hello"));
 
         // Very long single line → title_hint keeps every character; the
         // 80-char cap now happens later, after sanitization.
@@ -3811,6 +3804,34 @@ mod tests {
         let title = env.title_hint.unwrap();
         assert_eq!(title.chars().count(), 200);
         assert!(!title.contains('…'));
+    }
+
+    #[test]
+    fn user_prompt_title_skips_blank_lines_without_shortening_the_body() {
+        let q = HookQuery {
+            event: "UserPromptSubmit".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        for prefix in ["\n\n", "\r\n\r\n", " \t\n\u{2003}\n"] {
+            let prompt = format!("{prefix}<pasted_content id=\"example\">\nKeep the decision here");
+            let env = HookEnvelope::from_query_and_body(
+                q.clone(),
+                serde_json::json!({ "prompt": prompt }),
+            );
+            assert_eq!(
+                env.title_hint.as_deref(),
+                Some("<pasted_content id=\"example\">")
+            );
+            assert_eq!(env.body_excerpt.as_deref(), Some(prompt.as_str()));
+        }
+        for prompt in ["", " \t\n\r\n\u{2003}"] {
+            let env = HookEnvelope::from_query_and_body(
+                q.clone(),
+                serde_json::json!({ "prompt": prompt }),
+            );
+            assert!(env.title_hint.is_none());
+        }
     }
 
     #[test]
