@@ -91,11 +91,13 @@ pub fn run(config: &Config, args: RestoreAgentsArgs) -> Result<()> {
     let codex_override = agent_config_home(config.runtime_env.var_os("CODEX_HOME"));
     let copilot_override = agent_config_home(std::env::var_os("COPILOT_HOME"));
     let gemini_override = agent_config_home(config.runtime_env.var_os("GEMINI_CLI_HOME"));
+    let grok_override = agent_config_home(config.runtime_env.var_os("GROK_HOME"));
     let overrides = TargetOverrides {
         claude: claude_override.as_deref(),
         codex: codex_override.as_deref(),
         copilot: copilot_override.as_deref(),
         gemini: gemini_override.as_deref(),
+        grok: grok_override.as_deref(),
     };
     let mut archive_paths = HashSet::with_capacity(manifest.entries.len());
     let mut target_paths = HashSet::with_capacity(manifest.entries.len());
@@ -382,6 +384,8 @@ struct TargetOverrides<'a> {
     copilot: Option<&'a Path>,
     /// `GEMINI_CLI_HOME`.
     gemini: Option<&'a Path>,
+    /// `GROK_HOME`.
+    grok: Option<&'a Path>,
 }
 
 fn resolve_target(
@@ -451,6 +455,12 @@ fn resolve_target(
             custom_dir.to_path_buf(),
             custom_dir.join(&entry.target_relative),
         ));
+    }
+    if entry.agent == AgentKind::Grok
+        && let Some(custom_dir) = overrides.grok
+        && let Some(relative) = entry.target_relative.strip_prefix(".grok/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
     }
     Ok((home.to_path_buf(), home.join(&entry.target_relative)))
 }

@@ -38,6 +38,7 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
         .env_remove("CODEX_HOME")
         .env_remove("COPILOT_HOME")
         .env_remove("GEMINI_CLI_HOME")
+        .env_remove("GROK_HOME")
         .env_remove("KIMI_CODE_HOME")
         .env_remove("KIRO_HOME");
     #[cfg(windows)]
