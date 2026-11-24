@@ -10083,6 +10083,62 @@ mod tests {
         }
     }
 
+    /// Kimi Code's `[[hooks]]` tables in `config.toml` read back the same way,
+    /// beside the user's own settings and hooks.
+    #[test]
+    fn baked_toml_hook_url_reads_kimi_code_hooks() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let render = |stop_url: &str| {
+            let mut document: toml_edit::DocumentMut =
+                "default_model = \"kimi-k2\"\n\n[[hooks]]\nevent = \"Stop\"\ncommand = \"notify-send done --server-url https://other.example.invalid\"\n"
+                    .parse()
+                    .unwrap();
+            let hooks = document["hooks"].as_array_of_tables_mut().unwrap();
+            for (event, command) in kimi_code_hook_commands(
+                Path::new("/srv/ai memory/data/hooks/kimi-code"),
+                remote,
+                None,
+                Some(data_dir),
+                None,
+                true,
+            ) {
+                let command = if event == "Stop" {
+                    command.replace(&shell_quote(remote), &shell_quote(stop_url))
+                } else {
+                    command
+                };
+                let mut table = toml_edit::Table::new();
+                table["event"] = toml_edit::value(event);
+                table["command"] = toml_edit::value(command);
+                hooks.push(table);
+            }
+            document.to_string()
+        };
+
+        assert_eq!(
+            baked_toml_hook_url(&render(remote), data_dir, "kimi-code").as_deref(),
+            Some(remote)
+        );
+        assert!(
+            baked_toml_hook_url(
+                &render("https://other.example.invalid"),
+                data_dir,
+                "kimi-code"
+            )
+            .is_none(),
+            "a second endpoint"
+        );
+        assert!(
+            baked_toml_hook_url(&render(remote), Path::new("/srv/other"), "kimi-code").is_none(),
+            "another data dir"
+        );
+        assert!(
+            baked_toml_hook_url("default_model = \"kimi-k2\"\n", data_dir, "kimi-code").is_none(),
+            "no hooks installed"
+        );
+    }
+
     /// A home-relative install (#2035 renders the binary and data dir as
     /// `"$HOME/..."`) must still be recognized by the upgrade refresh, so its
     /// Claude endpoint and credentials are preserved. Before this, recognition
