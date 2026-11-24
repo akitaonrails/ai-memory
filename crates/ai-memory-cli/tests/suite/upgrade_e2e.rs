@@ -158,6 +158,161 @@ fn replacement_refresh_preserves_claude_hook_endpoint_and_auth() -> anyhow::Resu
     Ok(())
 }
 
+/// The same refresh for agents other than Claude Code: Codex (nested JSON
+/// hooks), Cursor (flat JSON hooks) and Kimi Code (`[[hooks]]` in TOML).
+/// Installed against a remote server with a team token, they keep both
+/// across `upgrade-refresh-hooks` even when a different bearer is configured;
+/// a configured server URL still re-renders them.
+#[test]
+fn replacement_refresh_preserves_other_agents_hook_endpoint_and_auth() -> anyhow::Result<()> {
+    use std::fs;
+    use std::path::Path;
+
+    use crate::e2e_support::hermetic;
+
+    const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
+    const HOOK_URL: &str = "https://memory.example.invalid/team";
+    const CONFIG_URL: &str = "https://configured.example.invalid";
+    const HOOK_TOKEN: &str = "aim_test_installed_hook_token";
+    const CONFIG_TOKEN: &str = "aim_test_configured_token";
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let data = home.join("data");
+    let agents = [
+        ("codex", home.join(".codex").join("hooks.json")),
+        ("cursor", home.join(".cursor").join("hooks.json")),
+        ("kimi-code", home.join(".kimi-code").join("config.toml")),
+    ];
+    for (_, path) in &agents {
+        fs::create_dir_all(path.parent().expect("config dir"))?;
+    }
+    let hooks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+    let command = || {
+        let mut cmd = hermetic(BIN);
+        cmd.arg("--data-dir")
+            .arg(&data)
+            .args(["--language", "en"])
+            .env("HOME", home)
+            .env("AI_MEMORY_HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("APPDATA", home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", home.join("AppData/Local"))
+            .current_dir(home);
+        cmd
+    };
+    // A hooks file's text with JSON escapes undone: Cursor's writer escapes
+    // `/`, which would hide every URL from a plain text count.
+    let text = |path: &Path| -> anyhow::Result<String> {
+        let raw = fs::read_to_string(path)?;
+        Ok(match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => serde_json::to_string(&value)?,
+            Err(_) => raw,
+        })
+    };
+    fn plant(value: &mut serde_json::Value, from: &str, to: &str) -> bool {
+        match value {
+            serde_json::Value::String(text) if text.contains(from) => {
+                *text = text.replace(from, to);
+                true
+            }
+            // Every command, not the first match `any` would stop at.
+            serde_json::Value::Array(items) => {
+                let mut hit = false;
+                for item in items {
+                    hit |= plant(item, from, to);
+                }
+                hit
+            }
+            serde_json::Value::Object(map) => {
+                let mut hit = false;
+                for item in map.values_mut() {
+                    hit |= plant(item, from, to);
+                }
+                hit
+            }
+            _ => false,
+        }
+    }
+    let mut installed = Vec::new();
+    for (agent, path) in &agents {
+        let output = command()
+            .args(["install-hooks", "--agent", agent])
+            .args(["--server-url", HOOK_URL, "--auth-token", HOOK_TOKEN])
+            .arg("--hooks-dir")
+            .arg(&hooks)
+            .arg("--apply")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{agent} hook install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written = text(path)?;
+        assert!(written.matches(HOOK_URL).count() > 1, "{agent}: {written}");
+        assert!(!written.contains(HOOK_TOKEN), "{agent}: {written}");
+        installed.push(written.matches(HOOK_URL).count());
+    }
+    let token_file = data.join("auth-token");
+    let original_token = fs::read(&token_file)?;
+    // An older executable in the JSON hooks shows the refresh re-rendered
+    // them rather than skipping the agent.
+    let old_exe = if cfg!(windows) {
+        r"C:\old\ai-memory.exe"
+    } else {
+        "/opt/old/ai-memory"
+    };
+    for (agent, path) in &agents[..2] {
+        let mut hooks: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        let planted = plant(&mut hooks, BIN, old_exe);
+        assert!(planted || cfg!(windows), "{agent}: no command names {BIN}");
+        fs::write(path, serde_json::to_vec(&hooks)?)?;
+    }
+
+    let output = command()
+        .arg("upgrade-refresh-hooks")
+        .env("AI_MEMORY_AUTH_TOKEN", CONFIG_TOKEN)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "hook refresh failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for ((agent, path), count) in agents.iter().zip(&installed) {
+        let refreshed = text(path)?;
+        assert!(!refreshed.contains(old_exe), "{agent}: {refreshed}");
+        assert_eq!(
+            refreshed.matches(HOOK_URL).count(),
+            *count,
+            "{agent}: {refreshed}"
+        );
+        assert!(
+            !refreshed.contains("127.0.0.1:49374"),
+            "{agent}: {refreshed}"
+        );
+    }
+    assert_eq!(fs::read(&token_file)?, original_token);
+
+    let output = command()
+        .arg("upgrade-refresh-hooks")
+        .env("AI_MEMORY_SERVER_URL", CONFIG_URL)
+        .env("AI_MEMORY_AUTH_TOKEN", CONFIG_TOKEN)
+        .output()?;
+    assert!(output.status.success(), "configured hook refresh failed");
+    for ((agent, path), count) in agents.iter().zip(&installed) {
+        let refreshed = text(path)?;
+        assert_eq!(
+            refreshed.matches(CONFIG_URL).count(),
+            *count,
+            "{agent}: {refreshed}"
+        );
+        assert!(!refreshed.contains(HOOK_URL), "{agent}: {refreshed}");
+    }
+    assert_eq!(fs::read_to_string(&token_file)?.trim(), CONFIG_TOKEN);
+    Ok(())
+}
+
 /// Spawns a loopback release fixture and a real CLI subprocess: seconds,
 /// not milliseconds — slow tier (`cargo tf` / CI), not the everyday loop.
 mod slow {
