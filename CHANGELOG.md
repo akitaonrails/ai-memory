@@ -63,6 +63,11 @@ version in [`docs/changelog/`](docs/changelog/):
 - Stabilized duplicate-title ordering in lint reports to avoid redundant
   report revisions and keep the briefing's warning-page list consistent. (#2461)
 
+### Fixed
+
+- Kept Gemini CLI utility commands such as `--debug mcp list` in passthrough
+  mode so `ai-memory run gemini` leaves their arguments intact. (#2435)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

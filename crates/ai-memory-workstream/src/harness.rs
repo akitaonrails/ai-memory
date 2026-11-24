@@ -1118,10 +1118,10 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
         ]
         .as_slice(),
     };
-    let first = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
-        kiro_root_subcommand(args)
-    } else {
-        args.first().and_then(|arg| arg.to_str())
+    let first = match harness {
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => kiro_root_subcommand(args),
+        ManagedHarness::Gemini => gemini_root_subcommand(args),
+        _ => args.first().and_then(|arg| arg.to_str()),
     };
     if first.is_some_and(|value| utility.contains(&value)) {
         LaunchMode::Passthrough
@@ -1297,6 +1297,29 @@ fn kiro_root_positional(args: &[OsString]) -> Option<usize> {
             continue;
         }
         return Some(index);
+    }
+    None
+}
+
+/// Gemini accepts its global debug option before a utility command. Leave
+/// session-only options untouched so their values cannot be read as commands.
+fn gemini_root_subcommand(mut args: &[OsString]) -> Option<&str> {
+    while let Some((arg, rest)) = args.split_first() {
+        let text = arg.to_str()?;
+        args = match text {
+            "--debug" | "-d" => {
+                if rest
+                    .first()
+                    .is_some_and(|value| value == "true" || value == "false")
+                {
+                    &rest[1..]
+                } else {
+                    rest
+                }
+            }
+            "--no-debug" | "--debug=true" | "--debug=false" | "-d=true" | "-d=false" => rest,
+            _ => return Some(text),
+        };
     }
     None
 }
@@ -4424,6 +4447,43 @@ mod tests {
             ManagedHarness::Gemini,
             &[OsString::from("-i"), OsString::from("summarize")]
         ));
+    }
+
+    #[test]
+    fn gemini_debug_options_keep_utility_launches_in_passthrough() {
+        let linked = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        for debug in [
+            &["--debug"][..],
+            &["-d"],
+            &["--no-debug"],
+            &["--debug", "false"],
+            &["--debug=true"],
+        ] {
+            let args: Vec<_> = debug
+                .iter()
+                .copied()
+                .chain(["mcp", "list"])
+                .map(OsString::from)
+                .collect();
+            let plan = build_launch_plan(ManagedHarness::Gemini, None, args.clone(), Some(linked))
+                .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{args:?}");
+            assert_eq!(plan.args, args);
+        }
+
+        let args = ["--debug", "--prompt", "mcp"];
+        let plan = build_launch_plan(
+            ManagedHarness::Gemini,
+            None,
+            args.into_iter().map(OsString::from).collect(),
+            Some(linked),
+        )
+        .unwrap();
+        assert_eq!(plan.mode, LaunchMode::Session);
+        assert_eq!(
+            strings(&plan.args),
+            ["--debug", "--prompt", "mcp", "--resume", linked]
+        );
     }
 
     #[test]
