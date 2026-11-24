@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed duplicate-title lint to compare the indexed titles shown in the page
+  list, including titles derived from a Markdown heading or filename. (#2447)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

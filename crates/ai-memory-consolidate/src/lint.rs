@@ -19,6 +19,7 @@ const LINT_SYSTEM_PROMPT: &str = include_str!("../prompts/lint_system.md");
 
 use crate::EmbeddingCoord;
 use crate::cold_cluster::cosine_distance;
+use crate::consolidator::title_collision_key;
 use ai_memory_core::{PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
@@ -461,21 +462,13 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
                 detail: None,
             });
         }
-        // Duplicate-title tracking: peek the frontmatter for a `title` field.
-        // An empty/blank title is not a meaningful shared title — several
-        // pages carrying `title: ""` (e.g. auto-improve pages whose stored
-        // frontmatter title was never filled) must not all collapse into one
-        // bogus `Multiple pages share title ""` finding (#599). Real titles
-        // still dedupe as before.
-        if let Some(fm) = frontmatter.as_ref()
-            && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
-            && !t.trim().is_empty()
-        {
-            // Case-insensitive with whitespace collapsed: the key the
-            // consolidator's `title_collision_key` and the curator group by.
-            let key = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Use the title shown in page listings, including H1-derived titles
+        // that the wiki does not store in frontmatter. Skip blank legacy
+        // titles so they do not collapse into one bogus finding (#599).
+        let title = title_collision_key(&c.title);
+        if !title.is_empty() {
             titles
-                .entry(key.to_lowercase())
+                .entry(title)
                 .or_default()
                 .push(c.path.as_str().to_string());
         }
@@ -1020,6 +1013,7 @@ mod tests {
             |path: &str, pinned: bool, frontmatter: &str, compacted: bool| DecayCandidate {
                 id: ai_memory_core::PageId::new(),
                 path: ai_memory_core::PagePath::new(path).unwrap(),
+                title: String::new(),
                 tier: Tier::Episodic,
                 pinned,
                 updated_at_us: sixty_days_ago,
@@ -1049,6 +1043,7 @@ mod tests {
         let candidate = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("sessions/2026-06-20.md").unwrap(),
+            title: "A session nobody reopened".into(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: sixty_days_ago,
@@ -1094,6 +1089,7 @@ mod tests {
         let candidates = vec![DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("sessions/old.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: very_old,
@@ -1114,6 +1110,7 @@ mod tests {
         let a = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            title: "Karpathy Wiki".into(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: Timestamp::now().as_microsecond(),
@@ -1142,6 +1139,7 @@ mod tests {
         let a = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            title: "Release  Notes".into(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: Timestamp::now().as_microsecond(),
@@ -1154,6 +1152,7 @@ mod tests {
         };
         let b = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
+            title: " release notes ".into(),
             frontmatter_json: r#"{"title": " release notes "}"#.into(),
             ..a.clone()
         };
@@ -1170,6 +1169,7 @@ mod tests {
         let base = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            title: String::new(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: Timestamp::now().as_microsecond(),
@@ -1182,6 +1182,7 @@ mod tests {
         };
         let blank = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
+            title: "   ".into(),
             frontmatter_json: r#"{"title": "   "}"#.into(),
             ..base.clone()
         };
@@ -1199,6 +1200,7 @@ mod tests {
         let candidate = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/no-impl-without-test.md").unwrap(),
+            title: "Never ship code without a test".into(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: Timestamp::now().as_microsecond(),
@@ -1227,6 +1229,7 @@ mod tests {
         let candidate = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("_rules/no-impl-without-test.md").unwrap(),
+            title: String::new(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: Timestamp::now().as_microsecond(),
@@ -1252,6 +1255,7 @@ mod tests {
         let candidate = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/karpathy-wiki.md").unwrap(),
+            title: "Karpathy Wiki".into(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: Timestamp::now().as_microsecond(),
@@ -1276,6 +1280,7 @@ mod tests {
         let expired_episodic = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("sessions/old.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: very_old,
@@ -1289,6 +1294,7 @@ mod tests {
         let expired_rule = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("_rules/expired.md").unwrap(),
+            title: String::new(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: very_old,
@@ -1302,6 +1308,7 @@ mod tests {
         let live_page = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/live.md").unwrap(),
+            title: "Shared Title".into(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: Timestamp::now().as_microsecond(),
@@ -1315,6 +1322,7 @@ mod tests {
         let expired_duplicate = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/expired-dupe.md").unwrap(),
+            title: "Shared Title".into(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: very_old,
@@ -1339,6 +1347,7 @@ mod tests {
         let candidate = DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("concepts/ttl.md").unwrap(),
+            title: String::new(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: now_us,
@@ -1407,6 +1416,7 @@ mod tests {
         let candidates = vec![DecayCandidate {
             id: ai_memory_core::PageId::new(),
             path: ai_memory_core::PagePath::new("sessions/old.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: very_old,

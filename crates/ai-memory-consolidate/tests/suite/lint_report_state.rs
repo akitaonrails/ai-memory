@@ -160,6 +160,90 @@ fn report_body(fx: &Fixture) -> String {
         .body
 }
 
+#[tokio::test]
+async fn duplicate_title_lint_uses_the_indexed_title() {
+    let fx = fixture().await;
+    write_page(
+        &fx,
+        "notes/heading-a.md",
+        serde_json::Value::Null,
+        "# Release  Notes\n\nFirst page.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/heading-b.md",
+        serde_json::Value::Null,
+        "# release notes\n\nSecond page.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/explicit.md",
+        serde_json::json!({"title": "RELEASE NOTES"}),
+        "# Different heading\n\nThird page.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/override.md",
+        serde_json::json!({"title": "Different title"}),
+        "# Release Notes\n\nThe indexed title comes from frontmatter.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/expired.md",
+        serde_json::json!({"expires_at": "2000-01-01"}),
+        "# Release Notes\n\nExpired page.",
+    )
+    .await;
+    for path in ["concepts/handbook.md", "notes/handbook.md"] {
+        write_page(
+            &fx,
+            path,
+            serde_json::Value::Null,
+            "The filename supplies the title.",
+        )
+        .await;
+    }
+
+    let report = run_lint(
+        &fx.store.reader,
+        &fx.wiki,
+        None,
+        fx.ws,
+        fx.proj,
+        LintOptions {
+            dry_run: true,
+            ..options(false, false)
+        },
+    )
+    .await
+    .unwrap();
+    let mut duplicate_groups: Vec<_> = report
+        .findings
+        .into_iter()
+        .filter(|finding| finding.kind == "duplicate")
+        .map(|mut finding| {
+            finding.pages.sort();
+            finding.pages
+        })
+        .collect();
+    duplicate_groups.sort();
+    assert_eq!(
+        duplicate_groups,
+        [
+            vec!["concepts/handbook.md", "notes/handbook.md"],
+            vec![
+                "notes/explicit.md",
+                "notes/heading-a.md",
+                "notes/heading-b.md"
+            ],
+        ]
+    );
+}
+
 async fn seed_knowledge(fx: &Fixture) {
     write_page(
         fx,
