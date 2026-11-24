@@ -203,6 +203,9 @@ start/end tags and self-closing tags produce the same separators.
 Paragraph tab-stop definitions are formatting and do not insert text.
 
 XLSX extraction reads the base cell text and omits pronunciation annotations.
+A blank cell that the workbook omitted stays in its column when the gap is
+at most 32 columns, so a later value remains under its header. A wider jump
+keeps a single separator and is not expanded into the empty rectangle.
 It accepts the Open XML SDK's unnumbered `xl/worksheets/sheet.xml` part
 alongside numbered worksheet parts.
 
