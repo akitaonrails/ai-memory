@@ -1474,7 +1474,13 @@ antigravity-cli` configura cinco de seus
 A transcrição é lida apenas quando `transcriptPath` aponta para o próprio
 `~/.gemini/<app>/brain/<conversationId>/.system_generated/logs/transcript.jsonl` da conversa
 (ou o `transcript_full.jsonl` ao lado dele, relatado pela CLI), sendo
-`<app>` um entre `antigravity`, `antigravity-cli` ou `antigravity-ide`. Outro
+`<app>` um entre `antigravity`, `antigravity-cli` ou `antigravity-ide`. Para
+agentes Antigravity ACP cujo diretório `brain` fica fora de
+`~/.gemini/<app>/brain`, operadores podem habilitar raízes locais adicionais via
+`[capture] antigravity_transcript_roots` em `<data_dir>/config.toml` ou
+`AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (separadas pelo delimitador de lista de
+caminhos do SO, limitadas a 16 raízes absolutas sem componentes `.`/`..`; nunca
+lidas de `.ai-memory.toml` nem de payloads de hook). Outro
 arquivo, a transcrição de outra conversa e um diretório em symlink que aponte para
 fora da conversa são recusados. Um hook lê no máximo 8 MiB sob um
 limite de tempo de sistema de arquivos de 100 ms; um timeout mantém o cursor intocado para que o próximo

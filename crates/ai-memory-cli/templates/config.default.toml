@@ -758,6 +758,22 @@ brief_on_project_change = false
 # [hook_spool]
 # max_attempts = 8
 
+# Client-side hook capture settings.
+#
+# antigravity_transcript_roots adds operator-owned root directories where
+# Antigravity hooks may read a conversation's transcript
+# (`<root>/<conversationId>/.system_generated/logs/transcript.jsonl` or
+# `transcript_full.jsonl`), for Antigravity ACP agents whose brain root lives
+# outside `~/.gemini/<app>/brain`. Empty by default (only the built-in
+# `~/.gemini/<app>/brain` roots are accepted). Each entry must be absolute (or
+# `~`-prefixed), contain no `.` or `..` components, canonicalize to a real
+# directory, and at most 16 roots are checked; symlink escapes inside a root
+# are refused. Never read from `.ai-memory.toml` or hook payloads. Env
+# equivalent: `AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (OS path-list
+# separated: `:` on Unix, `;` on Windows).
+# [capture]
+# antigravity_transcript_roots = []
+
 # Session handoff delivery and creation. These settings apply to every operator
 # on the server.
 #

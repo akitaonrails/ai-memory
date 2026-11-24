@@ -352,6 +352,12 @@ Defined by `SanitizeConfig` in `ai-memory-core`. Built-in redaction patterns alw
 | --- | --- | --- | --- |
 | `max_attempts` | `8` (`DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS`) | `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` | Failed drain passes before a spooled hook event is dropped. 0 disables the limit. |
 
+## `[capture]`
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `antigravity_transcript_roots` | `[]` | `AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` | Additional operator-owned root directories where Antigravity hooks may read `<root>/<conversationId>/.system_generated/logs/transcript.jsonl` or `transcript_full.jsonl` (for Antigravity ACP agents outside `~/.gemini/<app>/brain`). Each entry must be absolute (or `~`-prefixed), contain no `.` or `..` components, and canonicalize to a real directory; at most 16 roots are checked. Env uses OS path-list separation (`:` on Unix, `;` on Windows). Never read from `.ai-memory.toml` or hook payloads. |
+
 ## `[routing]`
 
 | Key | Default | Env equivalent | Purpose |

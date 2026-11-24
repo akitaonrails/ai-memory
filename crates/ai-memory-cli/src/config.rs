@@ -763,6 +763,8 @@ pub struct Config {
     pub routing: RoutingSettings,
     /// Client-side hook spool retry policy.
     pub hook_spool: HookSpoolSettings,
+    /// `[capture]` — client-side hook capture settings.
+    pub capture: CaptureSettings,
     /// `[ingest]` — server-side drop list for tool events (#1241).
     pub ingest: IngestSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
@@ -1547,6 +1549,18 @@ pub struct IngestSettings {
     pub drop_list: Box<ai_memory_hooks::IngestDropList>,
 }
 
+/// Client-side hook capture settings (`[capture]` in `<data_dir>/config.toml`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureSettings {
+    /// Additional operator-owned Antigravity transcript root directories
+    /// (for example an Antigravity ACP agent whose brain root lives outside
+    /// `~/.gemini/<app>/brain`). Empty by default.
+    ///
+    /// Never read from `.ai-memory.toml` or hook payloads.
+    pub antigravity_transcript_roots: Vec<PathBuf>,
+}
+
 /// Client-side hook spool retry policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
@@ -1660,6 +1674,7 @@ impl Default for Config {
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
             hook_spool: HookSpoolSettings::default(),
+            capture: CaptureSettings::default(),
             ingest: IngestSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
@@ -2651,6 +2666,17 @@ fn apply_fts_stopwords_env(config: &mut Config, raw: Option<&str>) {
     );
 }
 
+fn apply_antigravity_transcript_roots_env(config: &mut Config, raw: Option<&std::ffi::OsStr>) {
+    let Some(raw) = raw else { return };
+    for path in std::env::split_paths(raw) {
+        if !path.as_os_str().is_empty()
+            && !config.capture.antigravity_transcript_roots.contains(&path)
+        {
+            config.capture.antigravity_transcript_roots.push(path);
+        }
+    }
+}
+
 fn apply_hook_spool_max_attempts_env(config: &mut Config, raw: Option<&str>) {
     let Some(raw) = raw else { return };
     config.hook_spool.max_attempts = raw
@@ -2768,6 +2794,12 @@ impl Config {
                 .as_deref(),
         );
         apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
+        apply_antigravity_transcript_roots_env(
+            &mut config,
+            runtime_env
+                .var_os("AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS")
+                .as_deref(),
+        );
         apply_run_require_server_env(&mut config, runtime_env.run_require_server());
         // The flat spelling would otherwise resolve to `run_exit_prompt`,
         // not `run.exit_prompt`, through figment's `__` split.
@@ -4833,6 +4865,32 @@ mod tests {
         );
         assert_eq!(cfg.ingest.drop_tool_use_id_prefixes, ["toolu_plugin_"]);
         assert_eq!(cfg.ingest.drop_tool_names, ["mcp__noisy__poll"]);
+        assert!(cfg.capture.antigravity_transcript_roots.is_empty());
+    }
+
+    #[test]
+    fn antigravity_transcript_roots_load_from_config_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[capture]\nantigravity_transcript_roots = [\"/opt/acp/brain\"]\n",
+        )
+        .unwrap();
+        let env = RuntimeEnv::with_process_env_for_tests(&[(
+            "AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS",
+            "/var/lib/acp-brain",
+        )]);
+        let cfg =
+            Config::load_with_runtime_env(Some(&cfg_path), Some(dir.path().to_path_buf()), env)
+                .unwrap();
+        assert_eq!(
+            cfg.capture.antigravity_transcript_roots,
+            vec![
+                PathBuf::from("/opt/acp/brain"),
+                PathBuf::from("/var/lib/acp-brain"),
+            ]
+        );
     }
 
     /// #1269: a thin client must reach the server the SAME config starts.

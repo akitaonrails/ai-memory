@@ -11,6 +11,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in extra Antigravity transcript roots for Antigravity ACP agents whose
+  brain directory lives outside `~/.gemini/<app>/brain`: operators can set
+  `[capture] antigravity_transcript_roots` in `<data_dir>/config.toml` and/or
+  `AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (OS path-list separated, empty by
+  default so default containment is unchanged). Extra roots are capped at 16
+  absolute directories with no `.` or `..` components, enforce exact canonical
+  `<root>/<conversationId>/.system_generated/logs` containment plus regular-file
+  `O_NOFOLLOW | O_NONBLOCK` opens, and are never read from repository
+  `.ai-memory.toml` files or hook payloads. (#2453)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
