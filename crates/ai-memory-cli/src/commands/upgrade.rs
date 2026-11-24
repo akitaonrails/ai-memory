@@ -1633,6 +1633,25 @@ mod tests {
         assert!(refreshed.contains(remote), "{refreshed}");
         assert!(!refreshed.contains("127.0.0.1:49374"), "{refreshed}");
         assert_eq!(fs::read_to_string(&token).unwrap().trim(), "team-key-1");
+
+        // The recovered endpoint is only a fallback: a configured server_url
+        // is the operator's current choice and still drives the refresh. In
+        // the same test because both phases stage Codex's scripts, which in a
+        // container share one directory outside the temp data dir.
+        let configured = Config {
+            server_url: "https://configured.example.invalid".into(),
+            server_url_explicit: true,
+            ..upgrade
+        };
+        let mut refresh = apply_hooks_args(AgentChoice::Codex);
+        refresh.hooks_dir = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"));
+        apply_staged_agent_hooks_with(&configured, "codex", refresh);
+        let refreshed = fs::read_to_string(&hooks).unwrap();
+        assert!(
+            refreshed.contains("https://configured.example.invalid"),
+            "{refreshed}"
+        );
+        assert!(!refreshed.contains(remote), "{refreshed}");
     }
 
     #[test]
