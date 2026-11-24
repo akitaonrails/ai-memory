@@ -315,8 +315,8 @@ async fn the_report_frontmatter_feeds_the_lint_summary_and_briefing() {
 
     // Seven pairs sharing a title: seven `duplicate` warnings naming
     // fourteen pages, of which the summary lists the first five.
-    for i in 0..7 {
-        for side in ["a", "b"] {
+    for i in (0..7).rev() {
+        for side in ["b", "a"] {
             write_page(
                 &fx,
                 &format!("notes/{i}-{side}.md"),
@@ -340,13 +340,20 @@ async fn the_report_frontmatter_feeds_the_lint_summary_and_briefing() {
     assert_eq!(summary.warnings, 7);
     // The `_rules/` page adds an `info` rule suggestion.
     assert_eq!(summary.findings, 8);
-    assert_eq!(summary.warning_pages.len(), 5);
-    assert!(
-        summary
-            .warning_pages
-            .iter()
-            .all(|p| p.starts_with("notes/"))
+    assert_eq!(
+        summary.warning_pages,
+        [
+            "notes/0-a.md",
+            "notes/0-b.md",
+            "notes/1-a.md",
+            "notes/1-b.md",
+            "notes/2-a.md",
+        ]
     );
+
+    let report = report_body(&fx);
+    lint(&fx, None, options(false, false)).await;
+    assert_eq!(report_body(&fx), report);
 
     let briefing = reader
         .briefing_for_project_with_slot_visibility(

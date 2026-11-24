@@ -58,6 +58,11 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed duplicate-title lint to compare the indexed titles shown in the page
   list, including titles derived from a Markdown heading or filename. (#2447)
 
+### Fixed
+
+- Stabilized duplicate-title ordering in lint reports to avoid redundant
+  report revisions and keep the briefing's warning-page list consistent. (#2461)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

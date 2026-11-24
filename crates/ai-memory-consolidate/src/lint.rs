@@ -497,16 +497,22 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         }
     }
 
-    for (title, paths) in titles {
-        if paths.len() > 1 {
-            out.push(LintFinding {
-                kind: "duplicate".into(),
-                severity: "warning".into(),
-                message: format!("Multiple pages share title {title:?}"),
-                pages: paths,
-                detail: None,
-            });
-        }
+    // Report revisions and the briefing's warning-page sample both depend
+    // on the order of these findings.
+    let mut duplicates: Vec<_> = titles
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .collect();
+    duplicates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    for (title, mut paths) in duplicates {
+        paths.sort_unstable();
+        out.push(LintFinding {
+            kind: "duplicate".into(),
+            severity: "warning".into(),
+            message: format!("Multiple pages share title {title:?}"),
+            pages: paths,
+            detail: None,
+        });
     }
 
     out

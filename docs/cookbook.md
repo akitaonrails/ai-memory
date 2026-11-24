@@ -351,7 +351,8 @@ compacted or merged stays in git and the supersession chain, recoverable with
   across every project, with the `lint` provider (`[llm.lint]` or the default
   one). `memory_briefing` then reports the warning count of each project's
   `_lint/report.md`, and a session start in a project with warnings gets one
-  line pointing at the report.
+  line pointing at the report. Duplicate-title findings are ordered by
+  normalized title, with page paths ordered within each group.
 - **Review similar knowledge:** run `memory_lint` (through your agent or the
   CLI); with embeddings configured it emits `similarity_candidate` findings
   for same-topic page pairs, advisory only. Similarity reads shared vocabulary
