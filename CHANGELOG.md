@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept Gemini CLI utility commands such as `--debug mcp list` in passthrough
+  mode so `ai-memory run gemini` leaves their arguments intact. (#2435)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
