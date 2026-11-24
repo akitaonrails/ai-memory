@@ -84,6 +84,20 @@ version in [`docs/changelog/`](docs/changelog/):
   mismatch stays a collision, and an ended session can still repair its wiki
   commit. (#2452)
 
+### Fixed
+
+- Hook spool drain and large `PostToolUse` sanitization: `post_batch` and
+  `post_hook` now classify post-connect request/response timeouts
+  (`err.is_timeout() && !err.is_connect()`, backed by a 2 s `connect_timeout`
+  on `build_client`) as `Failed` instead of `Unreachable` so a slow or poison
+  head entry charges `attempts` and drops at `MAX_ATTEMPTS` instead of stalling
+  subsequent spooled events forever, while connection-refused, DNS, and connect
+  timeout outages stay `Unreachable` with zero attempt charge; server-side
+  `durable_body` now scrubs a UTF-8-safe `cap + 64 KiB` overlap window before
+  truncating to the per-event cap so multi-MiB `tool_response` payloads finish
+  in milliseconds while preserving `#1114` straddling-secret and PEM private-key
+  redaction. (#2452)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

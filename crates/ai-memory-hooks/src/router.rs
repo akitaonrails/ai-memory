@@ -5392,19 +5392,38 @@ fn is_subagent_compaction(env: &HookEnvelope) -> bool {
         && body_is_subagent(env.agent, &env.raw)
 }
 
-/// Durable body for a hook observation: scrub the **full** excerpt first,
-/// then apply the per-event ceiling to the redacted text.
+/// Extra bytes past `durable_body_cap(event)` included in the prefix passed to
+/// [`Sanitizer::scrub`] (#2452).
+///
+/// Any secret straddling the durable-body cap (API keys, JWTs, bearer tokens,
+/// env-var assignments, complete PEM/PGP private-key blocks, and unterminated
+/// PEM blocks) completes well inside 64 KiB past the cut, while multi-MiB tool
+/// outputs no longer run every sanitizer regex and shadow-view pass over
+/// megabytes that `truncate_utf8_bytes` would immediately discard.
+const DURABLE_BODY_SCRUB_OVERLAP_BYTES: usize = 64 * 1024;
+
+/// Durable body for a hook observation: scrub a bounded UTF-8 prefix of the
+/// excerpt (`cap + DURABLE_BODY_SCRUB_OVERLAP_BYTES`) first, then apply the
+/// per-event ceiling to the redacted text.
 ///
 /// The cap used to run inside excerpt extraction in `payload`, before the
 /// sanitizer ever saw the text — a secret straddling the cutoff was cut in
 /// half, leaving a prefix too short to match a pattern, stored in clear text
-/// (#1114). This is the body-side twin of the #980 title-hint fix: scrub and
-/// cap together, in that order, at the persistence boundary.
+/// (#1114). Scrubbing `cap + 64 KiB` preserves full straddling-secret
+/// redaction (including PEM private keys) without spending seconds scanning
+/// multi-MiB tool responses that are immediately truncated to `cap` (#2452).
 fn durable_body(event: HookEvent, excerpt: Option<&str>, sanitizer: &Sanitizer) -> String {
     let Some(excerpt) = excerpt else {
         return String::new();
     };
-    truncate_utf8_bytes(&sanitizer.scrub(excerpt), durable_body_cap(event))
+    let cap = durable_body_cap(event);
+    let window_limit = cap.saturating_add(DURABLE_BODY_SCRUB_OVERLAP_BYTES);
+    let window = if excerpt.len() <= window_limit {
+        excerpt
+    } else {
+        &excerpt[..excerpt.floor_char_boundary(window_limit)]
+    };
+    truncate_utf8_bytes(&sanitizer.scrub(window), cap)
 }
 
 async fn process_authorized(
@@ -28592,6 +28611,121 @@ pub(crate) mod tests {
             "body exceeded the 2 KB cap: {body:?}"
         );
         assert!(body.ends_with('…'));
+    }
+
+    /// Regression for #2452: a multi-MiB `PostToolUse` `tool_response` must
+    /// finish `durable_body` and ingest well under 1s instead of running every
+    /// sanitizer regex and shadow-view pass over megabytes that are immediately
+    /// discarded at `TOOL_EXCERPT_MAX_BYTES`.
+    #[tokio::test]
+    async fn durable_body_bounds_scrub_window_for_multi_mb_tool_response() {
+        let sanitizer = Sanitizer::builtin();
+        // Include backslashes so `Sanitizer::scrub` builds the Shadow view too.
+        let huge = format!("line\\n{}", "a\\b".repeat(2 * 1024 * 1024));
+        let start = std::time::Instant::now();
+        let body = durable_body(HookEvent::PostToolUse, Some(&huge), &sanitizer);
+        let elapsed = start.elapsed();
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "body exceeded 2 KB cap: len={}",
+            body.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "durable_body took {elapsed:?} on a multi-MiB tool_response"
+        );
+
+        // End-to-end through `process` with a 4 MiB PostToolUse payload.
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-2452-huge",
+                "tool_response": "x".repeat(4 * 1024 * 1024),
+            }),
+        );
+        let start = std::time::Instant::now();
+        process(&state, env, None, Vec::new()).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "PostToolUse ingest took {elapsed:?} on a 4 MiB tool_response"
+        );
+    }
+
+    /// Security control for #1114 + #2452: bounding `durable_body`'s scrub
+    /// window to `cap + DURABLE_BODY_SCRUB_OVERLAP_BYTES` must still completely
+    /// redact both an API key and a PEM private-key block (complete and
+    /// unterminated) starting just before `TOOL_EXCERPT_MAX_BYTES` in a
+    /// multi-MiB `tool_response`.
+    #[tokio::test]
+    async fn issue_1114_straddling_api_key_and_pem_redacted_in_large_tool_response() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let api_key = "sk-ant-leak-0123456789abcdef0123456789abcdef";
+        let pem_begin = concat!("-----BEGIN ", "PRIVATE KEY-----");
+        let pem_end = concat!("-----END ", "PRIVATE KEY-----");
+        let pem_line = format!("MIIE{}", "A".repeat(60));
+        let complete_pem = format!("{pem_begin}\n{pem_line}\n{pem_line}\n{pem_line}\n{pem_end}");
+        let unterminated_pem = format!(
+            "{pem_begin}\n{}",
+            format!("{pem_line}\n").repeat(1_200) // > 64 KiB so the window cuts mid-PEM
+        );
+        let trailing_mb = "z".repeat(4 * 1024 * 1024);
+
+        for (label, secret, needle) in [
+            ("api_key", api_key.to_string(), "sk-ant-leak"),
+            ("complete_pem", complete_pem, pem_begin),
+            ("unterminated_pem", unterminated_pem, pem_begin),
+        ] {
+            let sid = SessionId::new();
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PostToolUse".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid.to_string(),
+                    "cwd": "/repo",
+                    "tool_name": "Read",
+                    "tool_use_id": format!("call-2452-{label}"),
+                    "tool_response": format!("{} {secret}\n{trailing_mb}", "x".repeat(1_890)),
+                }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+
+            let observations = state.reader.observations_for_session(sid).await.unwrap();
+            let body = observations
+                .iter()
+                .find(|o| o.kind == ObservationKind::PostToolUse)
+                .unwrap_or_else(|| panic!("{label}: post-tool-use observation recorded"))
+                .body
+                .clone();
+            assert!(
+                !body.contains(needle) && !body.contains(&pem_line),
+                "{label}: unredacted secret fragment survived the cap: {body:?}"
+            );
+            assert!(
+                body.contains("REDACT"),
+                "{label}: body carries no redaction marker: {body:?}"
+            );
+            assert!(
+                body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+                "{label}: body exceeded 2 KB cap: len={}",
+                body.len()
+            );
+        }
     }
 
     #[test]
