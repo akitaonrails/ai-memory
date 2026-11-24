@@ -3251,6 +3251,16 @@ async fn configure_embedder(
         );
         return Ok((wiki, None));
     };
+    if let Some(ignored) = config.ignored_embedding_model() {
+        tracing::warn!(
+            embedding_model = ignored,
+            model = %cfg.model,
+            "embedding_model is not a local model and embedding_provider is unset; \
+             running the default local embedder with its default model. Set \
+             embedding_provider to the provider that serves this model, or remove \
+             embedding_model (docs/local-embeddings.md)"
+        );
+    }
     let provider_name = cfg.provider.name().to_string();
     let is_local = cfg.provider == ai_memory_llm::EmbedderChoice::Local;
     let model = cfg.model.clone();

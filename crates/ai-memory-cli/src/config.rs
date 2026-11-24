@@ -3571,6 +3571,21 @@ impl Config {
         }
     }
 
+    /// The configured `embedding_model` that the unset-provider default
+    /// cannot run, so [`Self::embedder_config`] runs the default local model
+    /// instead. `None` when a provider is set, no model is set, or the model
+    /// is a local one. `serve` warns with it at startup.
+    #[must_use]
+    pub fn ignored_embedding_model(&self) -> Option<&str> {
+        if non_empty(self.embedding_provider.as_deref()).is_some() {
+            return None;
+        }
+        let model = non_empty(self.embedding_model.as_deref())?;
+        ai_memory_llm::resolve_local_model(model)
+            .is_err()
+            .then_some(model)
+    }
+
     /// Build the configured embedder settings, if hybrid search is enabled.
     ///
     /// # Errors
@@ -3619,7 +3634,16 @@ impl Config {
             },
         };
         let model = if provider == EmbedderChoice::Local {
-            ai_memory_llm::resolve_local_model(&model)?.id.to_string()
+            match ai_memory_llm::resolve_local_model(&model) {
+                Ok(spec) => spec.id.to_string(),
+                // The unset-provider default is best-effort: a name it cannot
+                // run, typically one left from a hosted provider, keeps the
+                // default model, which is also what every release before the
+                // multilingual model ran with that config. Refusing it would
+                // stop `serve` on upgrade. An explicit `local` still refuses.
+                Err(_) if defaulted => ai_memory_llm::LOCAL_MODEL.to_string(),
+                Err(error) => return Err(error),
+            }
         } else {
             model
         };
@@ -7280,6 +7304,83 @@ input_token_safety_margin = {margin}
         let msg = err.to_string();
         assert!(msg.contains("nonexistent-local-model"), "{msg}");
         assert!(msg.contains("intfloat/multilingual-e5-small"), "{msg}");
+    }
+
+    #[test]
+    fn unset_provider_keeps_the_default_local_model_for_a_hosted_embedding_model() {
+        // A model left from a hosted provider once the provider line is
+        // gone. Earlier releases ran the default local model with this
+        // config, and its stored vectors carry that model's name.
+        for leftover in [
+            "text-embedding-3-small",
+            "voyage-3",
+            "nonexistent-local-model",
+        ] {
+            let cfg = Config {
+                embedding_model: Some(leftover.into()),
+                ..Config::default()
+            };
+            let embedder = cfg
+                .embedder_config()
+                .unwrap_or_else(|err| panic!("{leftover}: {err}"))
+                .unwrap();
+            assert_eq!(embedder.provider, EmbedderChoice::Local, "{leftover}");
+            assert!(embedder.defaulted, "{leftover}");
+            assert_eq!(embedder.model, ai_memory_llm::LOCAL_MODEL, "{leftover}");
+            assert_eq!(embedder.dim, 384, "{leftover}");
+        }
+    }
+
+    #[test]
+    fn unset_provider_still_runs_the_local_model_embedding_model_names() {
+        // The documented way to pick the multilingual model needs no
+        // provider line (config.default.toml, docs/local-embeddings.md).
+        for configured in ["intfloat/multilingual-e5-small", "multilingual-e5-small"] {
+            let cfg = Config {
+                embedding_model: Some(configured.into()),
+                ..Config::default()
+            };
+            let embedder = cfg.embedder_config().unwrap().unwrap();
+            assert_eq!(embedder.provider, EmbedderChoice::Local, "{configured}");
+            assert!(embedder.defaulted, "{configured}");
+            assert_eq!(
+                embedder.model, "intfloat/multilingual-e5-small",
+                "{configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_embedding_model_names_only_a_model_the_default_cannot_run() {
+        let with = |provider: Option<&str>, model: Option<&str>| Config {
+            embedding_provider: provider.map(Into::into),
+            embedding_model: model.map(Into::into),
+            ..Config::default()
+        };
+        assert_eq!(
+            with(None, Some("text-embedding-3-small")).ignored_embedding_model(),
+            Some("text-embedding-3-small")
+        );
+        // A blank provider is the unset default too.
+        assert_eq!(
+            with(Some("  "), Some("voyage-3")).ignored_embedding_model(),
+            Some("voyage-3")
+        );
+        for (provider, model) in [
+            (None, None),
+            (None, Some("   ")),
+            (None, Some("all-MiniLM-L6-v2")),
+            (None, Some("multilingual-e5-small")),
+            (Some("openai"), Some("text-embedding-3-small")),
+            (Some("local"), Some("nonexistent-local-model")),
+            (Some("none"), Some("text-embedding-3-small")),
+        ] {
+            assert_eq!(
+                with(provider, model).ignored_embedding_model(),
+                None,
+                "{provider:?} {model:?}"
+            );
+        }
     }
 
     #[test]

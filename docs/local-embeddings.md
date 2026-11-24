@@ -23,6 +23,13 @@ the model (or a slim build without the feature) keeps the FTS-only
 behaviour with a warning. Opt out with `embedding_provider = "none"`; an
 explicitly configured provider is never overridden.
 
+With no `embedding_provider`, `embedding_model` chooses between the two
+local models. Any other name, such as a hosted model left behind after the
+provider line was removed, is ignored: the server logs a warning at startup
+and runs the default model, as releases before the multilingual model did.
+With `embedding_provider = "local"` set explicitly, an unknown name stops
+the server instead.
+
 ```toml
 # config.toml — all optional as of 2.0
 embedding_provider = "local"                           # explicit: hard-fails if unavailable
