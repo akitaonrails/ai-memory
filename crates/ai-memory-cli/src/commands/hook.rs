@@ -1168,11 +1168,60 @@ fn run_before_deadline<T: Send + 'static>(
     receiver.recv_timeout(budget).ok()
 }
 
+/// Additional operator-owned Antigravity transcript roots, OS path-list
+/// separated (`:` on Unix, `;` on Windows). Never read from `.ai-memory.toml`
+/// or hook payloads.
+const ANTIGRAVITY_TRANSCRIPT_ROOTS_ENV: &str = "AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS";
+
+fn parse_antigravity_transcript_roots_from_toml(raw: &str) -> Vec<PathBuf> {
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(array) = doc
+        .get("capture")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|table| table.get("antigravity_transcript_roots"))
+        .and_then(toml_edit::Item::as_array)
+    else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .filter_map(toml_edit::Value::as_str)
+        .filter(|entry| !entry.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn antigravity_extra_transcript_roots(data_dir: &Path, runtime_env: &RuntimeEnv) -> Vec<PathBuf> {
+    antigravity_extra_transcript_roots_with(data_dir, |name| runtime_env.var_os(name))
+}
+
+fn antigravity_extra_transcript_roots_with(
+    data_dir: &Path,
+    mut lookup: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let config_path = data_dir.join("config.toml");
+    if let Ok(raw) = fs::read_to_string(&config_path) {
+        roots.extend(parse_antigravity_transcript_roots_from_toml(&raw));
+    }
+    if let Some(raw) = lookup(ANTIGRAVITY_TRANSCRIPT_ROOTS_ENV) {
+        for path in std::env::split_paths(&raw) {
+            if !path.as_os_str().is_empty() && !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+    }
+    roots
+}
+
 /// The `user-prompt` events for the prompts Antigravity wrote to this
 /// conversation's transcript since the last read. Antigravity puts no
 /// prompt in any hook payload; `transcriptPath` names the transcript and is
 /// read only inside the conversation's own `brain/<conversationId>/`
-/// directory under `home` ([`ai_memory_hooks::antigravity_transcript_path`]).
+/// directory under `home` or an operator-configured extra root
+/// ([`ai_memory_hooks::antigravity_transcript_path_with_roots`]).
 /// Each body keeps the event's conversation and workspace fields so the
 /// server scopes it like the event itself, and is capped and scrubbed like
 /// any client-side prompt; the server sanitizes it again on ingest.
@@ -1180,6 +1229,7 @@ fn antigravity_transcript_prompt_events(
     data_dir: &Path,
     home: Option<&Path>,
     raw: &serde_json::Value,
+    extra_roots: Vec<PathBuf>,
 ) -> Option<AntigravityPromptEvents> {
     let conversation = ai_memory_hooks::antigravity_conversation_id(raw)?.to_owned();
     let declared = raw.get("transcriptPath")?.as_str()?.to_owned();
@@ -1191,7 +1241,11 @@ fn antigravity_transcript_prompt_events(
     let cursor_path = antigravity_transcript_cursor_path(data_dir, &conversation);
     let (cursor_path, read) =
         run_before_deadline(ANTIGRAVITY_TRANSCRIPT_READ_BUDGET, move || {
-            let transcript = ai_memory_hooks::antigravity_transcript_path(&request, &home)?;
+            let transcript = ai_memory_hooks::antigravity_transcript_path_with_roots(
+                &request,
+                &home,
+                &extra_roots,
+            )?;
             let cursor = load_antigravity_transcript_cursor(&cursor_path);
             let read = ai_memory_hooks::read_transcript_prompts(&transcript, &cursor)?;
             Some((cursor_path, read))
@@ -2282,7 +2336,10 @@ where
         let mut antigravity_prompts = (agent_kind == AgentKind::AntigravityCli
             && (antigravity_turn_only
                 || matches!(hook_event, HookEvent::SessionStart | HookEvent::Stop)))
-        .then(|| antigravity_transcript_prompt_events(&dd, home.as_deref(), &json))
+        .then(|| {
+            let extra_roots = antigravity_extra_transcript_roots(&dd, &runtime_env);
+            antigravity_transcript_prompt_events(&dd, home.as_deref(), &json, extra_roots)
+        })
         .flatten();
         let spool_prompts = |prompts: AntigravityPromptEvents| {
             let mut spooled = true;
@@ -8768,6 +8825,128 @@ mod tests {
                 ("stop".to_owned(), None)
             ]
         );
+    }
+
+    /// End-to-end native hook test for opt-in Antigravity ACP transcript roots
+    /// (#2453): unconfigured extra roots and repo-local `.ai-memory.toml`
+    /// cannot widen transcript containment, while operator-owned
+    /// `<data_dir>/config.toml` `[capture] antigravity_transcript_roots` and
+    /// `AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` allow reading the ACP
+    /// conversation's own transcript.
+    #[tokio::test]
+    async fn antigravity_acp_extra_transcript_roots_are_operator_configured_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, workspace, acp_root) = (
+            tmp.path().join("home"),
+            tmp.path().join("repo"),
+            tmp.path().join("acp-brain"),
+        );
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let acp_logs = acp_root.join("acp-conv-1/.system_generated/logs");
+        std::fs::create_dir_all(&acp_logs).unwrap();
+        let acp_transcript = acp_logs.join("transcript.jsonl");
+        std::fs::write(&acp_transcript, "").unwrap();
+        append_user_input(&acp_transcript, 0, "acp user prompt");
+        let stop = serde_json::json!({"terminationReason": "NO_TOOL_CALL", "fullyIdle": true});
+
+        // 1. Unconfigured: ACP root is outside `~/.gemini/<app>/brain` and
+        //    spools no user-prompt.
+        let data_unconfigured = tmp.path().join("data-unconfigured");
+        run_agy_hook(
+            &data_unconfigured,
+            &home,
+            "stop",
+            agy_event_payload("acp-conv-1", &workspace, &acp_transcript, stop.clone()),
+        )
+        .await;
+        assert_eq!(
+            spooled_events(&data_unconfigured),
+            [("stop".to_owned(), None)]
+        );
+        assert!(!antigravity_transcript_prompts_captured(
+            &data_unconfigured,
+            "acp-conv-1"
+        ));
+
+        // 2. Adversarial: a repository-local `.ai-memory.toml` declaring
+        //    `[capture] antigravity_transcript_roots` MUST NOT inject a root.
+        let acp_root_toml = toml_edit::Value::from(acp_root.to_str().unwrap()).to_string();
+        std::fs::write(
+            workspace.join(".ai-memory.toml"),
+            format!("[capture]\nantigravity_transcript_roots = [{acp_root_toml}]\n"),
+        )
+        .unwrap();
+        let data_marker = tmp.path().join("data-marker");
+        run_agy_hook(
+            &data_marker,
+            &home,
+            "stop",
+            agy_event_payload("acp-conv-1", &workspace, &acp_transcript, stop.clone()),
+        )
+        .await;
+        assert_eq!(spooled_events(&data_marker), [("stop".to_owned(), None)]);
+        assert!(!antigravity_transcript_prompts_captured(
+            &data_marker,
+            "acp-conv-1"
+        ));
+
+        // 3. Operator `<data_dir>/config.toml`: spools `user-prompt` + `stop`.
+        let data_config = tmp.path().join("data-config");
+        std::fs::create_dir_all(&data_config).unwrap();
+        std::fs::write(
+            data_config.join("config.toml"),
+            format!("[capture]\nantigravity_transcript_roots = [{acp_root_toml}]\n"),
+        )
+        .unwrap();
+        run_agy_hook(
+            &data_config,
+            &home,
+            "stop",
+            agy_event_payload("acp-conv-1", &workspace, &acp_transcript, stop.clone()),
+        )
+        .await;
+        assert_eq!(
+            spooled_events(&data_config),
+            [
+                ("user-prompt".to_owned(), Some("acp user prompt".to_owned())),
+                ("stop".to_owned(), None),
+            ]
+        );
+        assert!(antigravity_transcript_prompts_captured(
+            &data_config,
+            "acp-conv-1"
+        ));
+
+        // 4. Operator env `AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (via
+        //    injectable `RuntimeEnv`): spools `user-prompt` + `stop`.
+        let data_env = tmp.path().join("data-env");
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_env.clone()),
+            antigravity_hook_args("stop", &dead_server_url()),
+            agy_event_payload("acp-conv-1", &workspace, &acp_transcript, stop),
+            &mut stdout,
+            |_, _| Ok(()),
+            Some(home),
+            RuntimeEnv::with_process_env_for_tests(&[(
+                ANTIGRAVITY_TRANSCRIPT_ROOTS_ENV,
+                acp_root.to_str().unwrap(),
+            )]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            spooled_events(&data_env),
+            [
+                ("user-prompt".to_owned(), Some("acp user prompt".to_owned())),
+                ("stop".to_owned(), None),
+            ]
+        );
+        assert!(antigravity_transcript_prompts_captured(
+            &data_env,
+            "acp-conv-1"
+        ));
     }
 
     /// A repository the allowlist leaves out emits nothing, prompts included,

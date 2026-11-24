@@ -1563,7 +1563,13 @@ antigravity-cli` wires five of its
 The transcript is read only when `transcriptPath` names the conversation's own
 `~/.gemini/<app>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
 (or the `transcript_full.jsonl` beside it, which the CLI reports), with
-`<app>` one of `antigravity`, `antigravity-cli` or `antigravity-ide`. Another
+`<app>` one of `antigravity`, `antigravity-cli` or `antigravity-ide`. For
+Antigravity ACP agents whose brain directory lives outside
+`~/.gemini/<app>/brain`, operators may opt in to additional local roots via
+`[capture] antigravity_transcript_roots` in `<data_dir>/config.toml` or
+`AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (OS path-list separated, capped at 16
+absolute roots with no `.`/`..` components; never read from `.ai-memory.toml`
+or hook payloads). Another
 file, another conversation's transcript and a symlinked directory that leads
 out of the conversation are refused. One hook reads at most 8 MiB under a
 100 ms filesystem deadline; a timeout leaves the cursor untouched so the next
