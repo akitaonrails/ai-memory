@@ -276,8 +276,11 @@ fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> 
     // A legacy Windows command double-quotes an absolute executable. A POSIX
     // home-relative command (#2035) also opens with a double quote, but as
     // `"$HOME/..."`; it must take the POSIX branch, not the Windows one.
-    let legacy_windows =
-        exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME");
+    let quote = if exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME") {
+        HookCommandQuote::Windows
+    } else {
+        HookCommandQuote::Posix
+    };
     let words: Vec<&str> = if let Some(args) = exec {
         args.as_array()?
             .iter()
@@ -288,17 +291,18 @@ fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> 
         // The installer renders the data dir either absolute (`shell_quote`)
         // or, when it sits under `$HOME`, as the portable `"$HOME/..."` form
         // (#2035). Try both so a home-relative install is still recognized.
-        let rendered_dirs: Vec<String> = if legacy_windows {
-            vec![format!("\"{data_dir}\"")]
-        } else {
-            let mut forms = vec![shell_quote(data_dir)];
-            if let Some(home) = portable_hook_home(agent, false) {
-                let portable = posix_path_arg(Path::new(data_dir), Some(&home));
-                if !forms.contains(&portable) {
-                    forms.push(portable);
+        let rendered_dirs: Vec<String> = match quote {
+            HookCommandQuote::Windows => vec![format!("\"{data_dir}\"")],
+            HookCommandQuote::Posix => {
+                let mut forms = vec![shell_quote(data_dir)];
+                if let Some(home) = portable_hook_home(agent, false) {
+                    let portable = posix_path_arg(Path::new(data_dir), Some(&home));
+                    if !forms.contains(&portable) {
+                        forms.push(portable);
+                    }
                 }
+                forms
             }
-            forms
         };
         // Retain the connection only when the replacement will use the
         // same data directory for that endpoint's credentials.
@@ -309,12 +313,12 @@ fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> 
         // bare/shell-quoted word, the portable `"$HOME/..."` form (#2035), or
         // an older Linux upgrade's kernel deleted-executable marker. A complex
         // shell prefix can carry per-hook policy that a refresh would lose.
+        let posix = quote == HookCommandQuote::Posix;
         let is_installer_word = |word: &str| {
-            native_claude_hook_word(word, legacy_windows).is_some()
-                || (!legacy_windows && is_portable_home_arg(word))
+            native_hook_word(word, quote).is_some() || (posix && is_portable_home_arg(word))
         };
         (is_installer_word(executable)
-            || (!legacy_windows
+            || (posix
                 && executable
                     .strip_suffix(" (deleted)")
                     .is_some_and(is_installer_word)))
@@ -356,7 +360,7 @@ fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> 
     let url = if exec.is_some() {
         (*raw).to_owned()
     } else {
-        native_claude_hook_word(raw, legacy_windows)?
+        native_hook_word(raw, quote)?
     };
     let parsed = reqwest::Url::parse(&url).ok()?;
     (matches!(parsed.scheme(), "http" | "https")
@@ -367,8 +371,17 @@ fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> 
     .then_some(url)
 }
 
-fn native_claude_hook_word(raw: &str, legacy_windows: bool) -> Option<String> {
-    if legacy_windows {
+/// How an installer-rendered native hook command string quotes its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookCommandQuote {
+    /// POSIX `shell_quote`, plus the portable `"$HOME/..."` path form (#2035).
+    Posix,
+    /// The double-quoted Windows command string.
+    Windows,
+}
+
+fn native_hook_word(raw: &str, quote: HookCommandQuote) -> Option<String> {
+    if quote == HookCommandQuote::Windows {
         let value = raw.strip_prefix('"')?.strip_suffix('"')?;
         return (!value.is_empty() && !value.contains('"')).then(|| value.to_owned());
     }
