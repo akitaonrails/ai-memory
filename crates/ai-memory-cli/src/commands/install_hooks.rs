@@ -216,8 +216,32 @@ pub(crate) fn installed_hook_url(config: &Config, args: &InstallHooksArgs) -> Op
         }
         _ => existing_agent_config(args)?,
     };
+    let agent = args.agent.kind().as_str();
+    if args.agent == AgentChoice::KimiCode {
+        return baked_toml_hook_url(&existing, &config.data_dir, agent);
+    }
     let document: serde_json::Value = serde_json::from_str(&existing).ok()?;
-    baked_hook_url(&document, &config.data_dir, args.agent.kind().as_str())
+    baked_hook_url(&document, &config.data_dir, agent)
+}
+
+/// [`baked_hook_url`] for Kimi Code's `config.toml`, whose hooks are an array
+/// of `[[hooks]]` tables with one `command` string each.
+fn baked_toml_hook_url(existing: &str, data_dir: &Path, agent: &str) -> Option<String> {
+    let document: toml_edit::DocumentMut = existing.parse().ok()?;
+    let data_dir = data_dir.to_string_lossy();
+    let data_dir = strip_windows_verbatim_prefix(&data_dir);
+    let mut urls = document
+        .get("hooks")?
+        .as_array_of_tables()?
+        .iter()
+        .filter(|entry| is_ai_memory_toml_hook_entry(entry))
+        .map(|entry| {
+            let command = entry.get("command")?.as_str()?;
+            native_hook_url(&serde_json::json!({ "command": command }), &data_dir, agent)
+        });
+    let url = urls.next()??;
+    urls.all(|other| other.as_deref() == Some(url.as_str()))
+        .then_some(url)
 }
 
 /// The one endpoint every ai-memory handler in a hooks document (`hooks` keyed
