@@ -5612,7 +5612,11 @@ async fn process_authorized(
     // again, which for a multi-megabyte tool result outlives the spool drain
     // timeout and the entry is retried forever (#2452). Recovery keys stay on
     // the full path: a mismatched identity is a collision, not an ack.
-    if let Some(key) = env.ingest_key.as_deref()
+    // SessionEnd stays there too. A replay of an ended session is
+    // `AlreadyEnded`, which can still repair the wiki commit, and that
+    // decision is made inside admission rather than from the key alone.
+    if env.event != HookEvent::SessionEnd
+        && let Some(key) = env.ingest_key.as_deref()
         && state
             .reader
             .ordinary_ingest_key_completed(proj, key)
