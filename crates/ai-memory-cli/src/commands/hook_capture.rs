@@ -955,6 +955,9 @@ const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
 /// `system-proxy` feature, so no OS proxy setting is read either way.
 /// Redirects are disabled so a 3xx from an SSO portal or proxy never drops
 /// spooled events, replays payloads, or injects foreign HTML into context.
+/// A bounded `connect_timeout` ensures a dead or blackholed host surfaces as
+/// a connect error (`Unreachable`, #493) rather than a post-connect response
+/// timeout (`Failed`, #2452).
 /// Built once per invocation and reused for both the event POST and the
 /// handoff GET. Default root certs are kept so HTTPS targets (e.g. a TLS
 /// proxy) still work.
@@ -962,6 +965,7 @@ pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -978,11 +982,12 @@ pub enum PostOutcome {
     /// backpressure, the event was never processed. Keep it queued WITHOUT
     /// bumping attempts so saturation never burns the entry's retry budget.
     Saturated,
-    /// Any other non-2xx: the server answered and refused. A genuine miss
-    /// that should count against the retry limit.
+    /// Any other non-2xx or a post-connect request/response timeout: the
+    /// server was reached (TCP connected) but failed or did not answer in
+    /// time. A genuine miss that should count against the retry limit (#2452).
     Failed,
     /// The request never reached a server — connection refused, DNS failure,
-    /// or timeout. Distinguished from [`Self::Failed`] because it says
+    /// or connect timeout. Distinguished from [`Self::Failed`] because it says
     /// something about the *endpoint* rather than the entry: every other
     /// spooled event addressed to the same endpoint will fail the same way,
     /// so the drain can skip past them instead of stopping at the first one
@@ -1045,6 +1050,11 @@ pub async fn post_hook(
             PostOutcome::Refused
         }
         Ok(_) => PostOutcome::Failed,
+        // Post-connect timeout: the server accepted TCP and the request but
+        // did not answer before the deadline. Charge the entry like a 5xx so a
+        // slow/poison payload cannot stall the spool forever (#2452). Connect
+        // timeouts and DNS/refusal errors stay `Unreachable` (#493).
+        Err(err) if err.is_timeout() && !err.is_connect() => PostOutcome::Failed,
         Err(_) => PostOutcome::Unreachable,
     }
 }
@@ -1082,9 +1092,9 @@ pub enum BatchOutcome {
     /// when a global saturation happens after earlier skipped items.
     SaturatedIndices(Vec<usize>),
     /// The request never reached a server — connection refused, DNS failure,
-    /// or timeout. Says something about the *endpoint*, not the batch: every
-    /// other entry addressed there will fail identically, so the drain skips
-    /// past them rather than stopping at the first (#493).
+    /// or connect timeout. Says something about the *endpoint*, not the batch:
+    /// every other entry addressed there will fail identically, so the drain
+    /// skips past them rather than stopping at the first (#493).
     Unreachable,
     /// `404`/`405` — the server has no `/hook/batch` (a pre-upgrade build). The
     /// caller falls back to per-event `POST /hook` for the rest of the drain.
@@ -1093,9 +1103,10 @@ pub enum BatchOutcome {
     /// [`PostOutcome::Unauthorized`]; the whole batch shares one identity, so
     /// a rejected credential fails all of it and none of it was processed.
     Unauthorized,
-    /// Transport error or any other non-2xx: the batch outcome is unknown. The
-    /// drain charges conservatively so trailing events that may never have been
-    /// attempted do not burn retry budget.
+    /// Post-connect request/response timeout or any other non-2xx: the batch
+    /// outcome is unknown. The drain charges conservatively (head entry only)
+    /// so trailing events that may never have been attempted do not burn retry
+    /// budget while a poison head entry cannot stall the spool forever (#2452).
     Failed,
 }
 
@@ -1170,6 +1181,7 @@ pub async fn post_batch(
                 BatchOutcome::Failed
             }
         }
+        Err(err) if err.is_timeout() && !err.is_connect() => BatchOutcome::Failed,
         Err(_) => BatchOutcome::Unreachable,
     }
 }
@@ -1475,6 +1487,48 @@ mod tests {
                 post_batch(&build_client(), &url, "[]", None, Duration::from_secs(1)).await;
             assert_eq!(outcome, BatchOutcome::Failed, "{status} is retryable");
         }
+    }
+
+    #[tokio::test]
+    async fn post_hook_and_post_batch_response_timeout_is_failed_not_unreachable() {
+        // #2452: once TCP connects and the HTTP request is sent, a response
+        // timeout must classify as `Failed` (not `Unreachable`) so the spool
+        // drain charges `attempts` on a poison entry instead of stalling
+        // forever, while connection-refused stays `Unreachable` (#493).
+        async fn serve_slow_once(delay: Duration) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                        .await;
+                }
+            });
+            format!("http://{addr}/hook/batch")
+        }
+
+        let client = build_client();
+        let batch_url = serve_slow_once(Duration::from_millis(400)).await;
+        let batch_outcome =
+            post_batch(&client, &batch_url, "[]", None, Duration::from_millis(80)).await;
+        assert_eq!(
+            batch_outcome,
+            BatchOutcome::Failed,
+            "post-connect batch timeout must charge attempts as Failed, not Unreachable"
+        );
+
+        let hook_url = serve_slow_once(Duration::from_millis(400)).await;
+        let hook_outcome =
+            post_hook(&client, &hook_url, "{}", None, Duration::from_millis(80)).await;
+        assert_eq!(
+            hook_outcome,
+            PostOutcome::Failed,
+            "post-connect single-event timeout must charge attempts as Failed, not Unreachable"
+        );
     }
 
     #[tokio::test]
