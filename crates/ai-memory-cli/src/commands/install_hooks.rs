@@ -10036,6 +10036,28 @@ mod tests {
         }
     }
 
+    /// DSH's generated `hooks.json` is the same kind of document, so the
+    /// endpoint it bakes reads back the same way.
+    #[test]
+    fn baked_hook_url_reads_the_endpoint_dsh_generates() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let document = build_dsh_hooks_payload(
+            Path::new("/srv/ai memory/data/hooks/dsh"),
+            remote,
+            None,
+            Some(data_dir),
+            None,
+            true,
+        );
+        assert_eq!(
+            baked_hook_url(&document, data_dir, "dsh").as_deref(),
+            Some(remote),
+            "{document}"
+        );
+        assert!(baked_hook_url(&document, Path::new("/srv/other"), "dsh").is_none());
+    }
+
     /// The refresh keeps an endpoint only when re-rendering loses nothing, for
     /// every agent as for Claude Code: a third-party hook in the same file is
     /// ignored, while a second endpoint, an inline credential or a custom
