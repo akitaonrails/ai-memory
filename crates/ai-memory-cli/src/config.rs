@@ -7351,6 +7351,39 @@ input_token_safety_margin = {margin}
     }
 
     #[test]
+    fn ignored_embedding_model_names_only_a_model_the_default_cannot_run() {
+        let with = |provider: Option<&str>, model: Option<&str>| Config {
+            embedding_provider: provider.map(Into::into),
+            embedding_model: model.map(Into::into),
+            ..Config::default()
+        };
+        assert_eq!(
+            with(None, Some("text-embedding-3-small")).ignored_embedding_model(),
+            Some("text-embedding-3-small")
+        );
+        // A blank provider is the unset default too.
+        assert_eq!(
+            with(Some("  "), Some("voyage-3")).ignored_embedding_model(),
+            Some("voyage-3")
+        );
+        for (provider, model) in [
+            (None, None),
+            (None, Some("   ")),
+            (None, Some("all-MiniLM-L6-v2")),
+            (None, Some("multilingual-e5-small")),
+            (Some("openai"), Some("text-embedding-3-small")),
+            (Some("local"), Some("nonexistent-local-model")),
+            (Some("none"), Some("text-embedding-3-small")),
+        ] {
+            assert_eq!(
+                with(provider, model).ignored_embedding_model(),
+                None,
+                "{provider:?} {model:?}"
+            );
+        }
+    }
+
+    #[test]
     fn openai_embedding_falls_back_to_llm_api_key_for_openrouter() {
         let cfg = Config {
             embedding_provider: Some("openai".into()),
