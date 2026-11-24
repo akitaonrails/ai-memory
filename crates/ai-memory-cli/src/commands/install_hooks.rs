@@ -215,6 +215,18 @@ pub(crate) fn installed_hook_url(config: &Config, args: &InstallHooksArgs) -> Op
         (AgentChoice::Codex, None) => {
             fs::read_to_string(codex_hooks_path(&config.runtime_env).ok()?).ok()?
         }
+        // DSH's hook config is the `hooks.json` its `--apply` generates beside
+        // the staged scripts, which DSH's patch points at.
+        (AgentChoice::Dsh, None) => fs::read_to_string(
+            hook_staging_root(
+                &config.data_dir,
+                ai_memory_wiki::backup::running_in_container(),
+            )
+            .join("hooks")
+            .join("dsh")
+            .join("hooks.json"),
+        )
+        .ok()?,
         _ => existing_agent_config(args)?,
     };
     let agent = args.agent.kind().as_str();
