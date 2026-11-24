@@ -118,6 +118,113 @@ async fn fixture() -> Fixture {
     }
 }
 
+#[tokio::test]
+async fn access_mode_changes_are_audited_but_repeats_and_missing_projects_are_not() {
+    let f = fixture().await;
+    let writer = &f.store.writer;
+    for (mode, previous) in [
+        (AccessMode::Restricted, AccessMode::Open),
+        (AccessMode::Restricted, AccessMode::Restricted),
+        (AccessMode::Open, AccessMode::Restricted),
+    ] {
+        assert_eq!(
+            writer.set_access_mode(f.project, mode).await.unwrap(),
+            Some(previous)
+        );
+    }
+    assert_eq!(
+        writer
+            .set_access_mode(ProjectId::new(), AccessMode::Restricted)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let conn = rusqlite::Connection::open(f.store.db_path()).unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT workspace_id, project_id, author_id, detail, at FROM audit_log \
+         WHERE op = 'set_project_access' ORDER BY id",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2, "only actual transitions are recorded");
+    for (row, (previous, mode)) in rows
+        .iter()
+        .zip([("open", "restricted"), ("restricted", "open")])
+    {
+        assert_eq!(row.0, f.ws.as_bytes());
+        assert_eq!(row.1, f.project.as_bytes());
+        assert_eq!(row.2, None, "the root bearer has no users row");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&row.3).unwrap(),
+            serde_json::json!({"previous": previous, "mode": mode})
+        );
+        assert!(row.4 > 0);
+    }
+}
+
+#[tokio::test]
+async fn access_mode_change_rolls_back_when_audit_cannot_be_written() {
+    let f = fixture().await;
+    let conn = rusqlite::Connection::open(f.store.db_path()).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_access_audit BEFORE INSERT ON audit_log \
+         WHEN NEW.op = 'set_project_access' \
+         BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
+    )
+    .unwrap();
+    assert!(
+        f.store
+            .writer
+            .set_access_mode(f.project, AccessMode::Restricted)
+            .await
+            .is_err()
+    );
+    let mode: String = conn
+        .query_row(
+            "SELECT access_mode FROM projects WHERE id = ?1",
+            [f.project.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "open", "an unaudited change must not take effect");
+
+    conn.execute_batch("DROP TRIGGER reject_access_audit")
+        .unwrap();
+    assert_eq!(
+        f.store
+            .writer
+            .set_access_mode(f.project, AccessMode::Restricted)
+            .await
+            .unwrap(),
+        Some(AccessMode::Open)
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE op = 'set_project_access'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "the writer remains usable after a rolled-back change"
+    );
+}
+
 /// Every caller shape against both modes, at both levels.
 ///
 /// Root arrives with no viewer and is never checked. In an open project every

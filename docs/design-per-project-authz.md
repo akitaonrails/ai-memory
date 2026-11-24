@@ -26,6 +26,9 @@ makes `restricted` safe end-to-end:
 - **Management surface**, root-only: `ai-memory project access`,
   `ai-memory user grant|revoke|grants`, `ai-memory project grants`, and the
   matching `/admin` routes; every change is recorded in `audit_log`.
+  Access-mode transitions use `set_project_access` with the previous and new
+  modes, scope and operator, committed in the same transaction as the change.
+  Repeating the current mode creates no audit row.
   `[auth] new_projects_restricted` makes new projects start `restricted`.
 - **Captures** into a project the author may not write are dropped and counted
   (`dropped_unauthorized`), never retried.

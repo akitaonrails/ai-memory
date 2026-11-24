@@ -9859,6 +9859,7 @@ struct ProjectAccessRequest {
 async fn handle_project_access(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    operator: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(request): Json<ProjectAccessRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
@@ -9891,7 +9892,7 @@ async fn handle_project_access(
     let (_, project_id) = lookup_ws_proj_no_create(&state, workspace, project).await?;
     let previous = state
         .writer
-        .set_access_mode(project_id, mode)
+        .set_access_mode_as(project_id, mode, operator.map(|axum::Extension(id)| id))
         .await
         .map_err(|e| internal_err(e.to_string()))?
         .ok_or_else(|| {
@@ -17442,8 +17443,77 @@ mod tests {
         let (_, json) = call("root-token", restrict.clone()).await;
         assert_eq!(json["changed"], false, "repeating a mode is not a change");
 
-        let (status, _) = call("not-root", restrict).await;
+        let (status, _) = call(
+            "not-root",
+            serde_json::json!({"workspace": "default", "project": "client-work", "mode": "open"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        let db = rusqlite::Connection::open(_tmp.path().join("db/memory.sqlite")).unwrap();
+        let (mode, audit_count): (String, i64) = db.query_row(
+            "SELECT access_mode, (SELECT COUNT(*) FROM audit_log WHERE op = 'set_project_access') \
+             FROM projects WHERE name = 'client-work'",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(
+            mode, "restricted",
+            "the non-root request must not reopen the project"
+        );
+        assert_eq!(
+            audit_count, 1,
+            "repeats and refused requests do not record a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_access_records_the_authenticated_operator() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let operator = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "operator".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::Root,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let router = router.layer(axum::Extension(operator));
+        write_fixture_page(&router, "team", "client-work", "notes/a.md").await;
+        let (status, json) = admin_call(
+            &router, "POST", "/admin/projects/access", "root-token",
+            Some(serde_json::json!({"workspace": "team", "project": "client-work", "mode": "restricted"})),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let (actor, workspace, project, detail) = db
+            .query_row(
+                "SELECT a.author_id, w.name, p.name, a.detail FROM audit_log a \
+             JOIN projects p ON p.id = a.project_id \
+             JOIN workspaces w ON w.id = a.workspace_id \
+             WHERE a.op = 'set_project_access'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(actor, operator.as_bytes());
+        assert_eq!(workspace, "team");
+        assert_eq!(project, "client-work");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&detail).unwrap(),
+            serde_json::json!({"previous": "open", "mode": "restricted"})
+        );
     }
 
     #[tokio::test]

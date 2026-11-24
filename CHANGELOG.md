@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Recorded project access-mode changes in `audit_log` with the workspace,
+  project, operator and previous/new modes. The change and audit row commit
+  together, so an audit failure leaves access unchanged; repeated modes do
+  not add audit rows. (#2446)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
