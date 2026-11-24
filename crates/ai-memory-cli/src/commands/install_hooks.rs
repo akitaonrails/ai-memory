@@ -196,6 +196,30 @@ pub(crate) fn installed_claude_hook_url(
     baked_hook_url(&document, data_dir, "claude-code")
 }
 
+/// [`installed_claude_hook_url`] for any agent whose `--apply` writes native
+/// hook commands into a hooks document: the endpoint they all share, so
+/// `upgrade` can re-render them in place instead of moving them to the
+/// loopback default. `None` when the installed config holds no ai-memory hooks,
+/// they disagree, or one carries something a refresh would lose.
+pub(crate) fn installed_hook_url(config: &Config, args: &InstallHooksArgs) -> Option<String> {
+    if args.agent == AgentChoice::ClaudeCode {
+        return installed_claude_hook_url(args, &config.data_dir);
+    }
+    if !local_hook_policy_v1_supported() {
+        return None;
+    }
+    let existing = match (args.agent, &args.config_file) {
+        // `run` resolves the CODEX_HOME-relative file into `args.config_file`
+        // before reading it; resolve it the same way here.
+        (AgentChoice::Codex, None) => {
+            fs::read_to_string(codex_hooks_path(&config.runtime_env).ok()?).ok()?
+        }
+        _ => existing_agent_config(args)?,
+    };
+    let document: serde_json::Value = serde_json::from_str(&existing).ok()?;
+    baked_hook_url(&document, &config.data_dir, args.agent.kind().as_str())
+}
+
 /// The one endpoint every ai-memory handler in a hooks document (`hooks` keyed
 /// by event, entries nested under `hooks` or flat) sends to for `agent`.
 fn baked_hook_url(document: &serde_json::Value, data_dir: &Path, agent: &str) -> Option<String> {

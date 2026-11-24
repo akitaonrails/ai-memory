@@ -1202,6 +1202,23 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
             );
             restage_claude_scripts(config)
         }
+    } else if !config.server_url_configured()
+        && let Some(url) = install_hooks::installed_hook_url(config, &args)
+    {
+        // Keep the endpoint the installed hooks bake, as for Claude Code
+        // above: with no configured server_url the regular refresh falls
+        // back to loopback and drops a remote connection (#2204, #2374).
+        println!(
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "    ai-memory install-hooks --agent {name} --apply --server-url {}",
+                    super::render_shared::native_shell_quote(&url)
+                )
+            )
+        );
+        install_hooks::run_with_preserved_hook_url(config, args, None, &url)
     } else {
         println!(
             "{}",
