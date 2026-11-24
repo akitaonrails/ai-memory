@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `ai-memory serve` starts again when `embedding_model` names a model the
+  local embedder cannot run, such as `text-embedding-3-small` left behind
+  after the `embedding_provider` line was removed. 3.6.0 refused to start with
+  "unknown local embedding model"; with no provider set, the default local
+  embedder now keeps its default model, as releases before 3.6.0 did, and logs
+  a warning naming the ignored setting. An explicit `embedding_provider =
+  "local"` still refuses an unknown model. (#2454)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
