@@ -4199,11 +4199,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, IngestObservationOutcome::ResumePending);
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap(),
+            "an incomplete key must stay on the full replay path"
+        );
         store
             .writer
             .complete_observation_ingest(proj_a, "entry-1".into())
             .await
             .unwrap();
+        assert!(
+            store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap()
+        );
         let complete = store
             .writer
             .insert_observation_ingest(
@@ -4242,6 +4271,21 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap(),
+            "an expired ordinary key must fall through to be swept and inserted"
+        );
         let reused = store
             .writer
             .insert_observation_ingest(
@@ -4270,6 +4314,21 @@ mod tests {
             .complete_observation_ingest(proj_a, recovery_key.clone())
             .await
             .unwrap();
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    &recovery_key,
+                )
+                .await
+                .unwrap(),
+            "a recovery key still has to compare event identity"
+        );
         let conn = Connection::open(store.db_path()).unwrap();
         conn.execute(
             "UPDATE ingest_keys SET seen_at = 1 WHERE project_id = ?1 AND key = ?2",

@@ -6651,6 +6651,95 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether an ordinary ingest key in this project is already complete and
+    /// unexpired for the given live, unpurged session, owner, and agent.
+    ///
+    /// A replay can acknowledge that delivery without scrubbing its body again
+    /// only when the full admission invariants also hold:
+    /// - The key is an ordinary key (`recovery_retained = 0`), is marked
+    ///   complete (`completed_at IS NOT NULL`), and has not aged past the
+    ///   30-day [`crate::ops::INGEST_KEY_TTL_MICROS`] sweep window.
+    /// - The target session row exists, is not recorded in `purged_sessions`
+    ///   for `(session_id, workspace_id, project_id)`, has a valid owner
+    ///   admitted by `owner_filter`, and matches `agent_kind`.
+    ///
+    /// In any other case this returns `false` so the request falls through to
+    /// the full `admit_hook_session_event` path (which sweeps expired keys,
+    /// rejects collisions/mismatches/purged sessions, or handles recovery keys).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn ordinary_ingest_key_completed(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        owner_filter: &OwnerFilter,
+        ingest_key: &str,
+    ) -> StoreResult<bool> {
+        if crate::ops::recovery_ingest_key(ingest_key) {
+            return Ok(false);
+        }
+        let key = ingest_key.to_owned();
+        let owner_filter = owner_filter.clone();
+        let cutoff = Timestamp::now().as_microsecond() - crate::ops::INGEST_KEY_TTL_MICROS;
+        self.with_conn(move |conn| {
+            let completed: bool = conn.query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM ingest_keys \
+                     WHERE project_id = ?1 \
+                       AND key = ?2 \
+                       AND recovery_retained = 0 \
+                       AND completed_at IS NOT NULL \
+                       AND seen_at >= ?3 \
+                 )",
+                params![project_id.as_bytes(), key, cutoff],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if !completed {
+                return Ok(false);
+            }
+            let purged: bool = conn.query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM purged_sessions \
+                     WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                 )",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if purged {
+                return Ok(false);
+            }
+            let existing: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT agent_kind, actor_user FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((agent, owner)) = existing else {
+                return Ok(false);
+            };
+            if owner
+                .as_deref()
+                .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
+                || !owner_filter.admits(owner.as_deref())
+            {
+                return Ok(false);
+            }
+            if agent != agent_kind.as_str() {
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .await
+    }
+
     /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
     /// `sessions/<session_id>.md` page row. These are the scopes a re-home
     /// (`move-session` of a session already rooted in the destination)

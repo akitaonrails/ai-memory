@@ -3770,9 +3770,9 @@ pub fn insert_observation(
 /// Ingest-keys older than this are swept opportunistically on every keyed
 /// insert. Ordinary keys only need to outlive the client spool (7 days + retry
 /// backoff); recovery keys remain tied to their stored session until it is purged.
-const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+pub(crate) const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 
-fn recovery_ingest_key(key: &str) -> bool {
+pub(crate) fn recovery_ingest_key(key: &str) -> bool {
     key.strip_prefix("recovery_").is_some_and(|digest| {
         digest.len() == 55 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     })

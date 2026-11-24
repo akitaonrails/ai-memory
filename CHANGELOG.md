@@ -75,6 +75,15 @@ version in [`docs/changelog/`](docs/changelog/):
   still uses one separator, so a sparse sheet is not expanded into the empty
   rectangle. (#2458)
 
+### Fixed
+
+- A repeated delivery of an ordinary hook whose ingest key had already
+  completed is acknowledged before its body is scrubbed again. A
+  multi-megabyte tool result no longer has to be reprocessed on every spool
+  retry. Recovery keys and `SessionEnd` still take the full path: a recovery
+  mismatch stays a collision, and an ended session can still repair its wiki
+  commit. (#2452)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

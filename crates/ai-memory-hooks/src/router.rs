@@ -5607,22 +5607,6 @@ async fn process_authorized(
         Err(err) => return Err(err.into()),
     }
 
-    // Hooks are fire-and-forget and may arrive out of order. Begin the
-    // session idempotently before every observation so a resumed agent
-    // session, or a prompt racing ahead of SessionStart, cannot trip the
-    // observations.session_id foreign key.
-    // Stamp the authenticated operator so anything that later picks "the open
-    // session for this scope" can tell whose it is — but only where operators
-    // are actually told apart. On an unauthenticated server, and on one that
-    // authenticates a single operator, this stays None and the session is
-    // shared, as before. The same value owns the SessionEnd handoff below, so
-    // the session and its baton can never disagree about who they belong to.
-    let owner_stamp = owner_stamp_for_event(state, actor.as_ref()).await;
-    // A keyed event claims its project-scoped key in the same transaction as
-    // the observation. A pending replay resumes the downstream wiki/handoff
-    // effects without duplicating the observation; only a delivery whose
-    // effects were marked complete is skipped.
-    let ingest_key = env.ingest_key.clone();
     let owner_filter = if env.all_owners_requested {
         if !matches!(env.event, HookEvent::SessionEnd) {
             return Err(StoreError::SessionCollision.into());
@@ -5645,6 +5629,45 @@ async fn process_authorized(
                 ai_memory_core::OwnerFilter::User(id.storage_key())
             })
     };
+
+    // A completed ordinary key has already stored its observation and finished
+    // its downstream effects. Rebuilding the body here scrubs the whole excerpt
+    // again, which for a multi-megabyte tool result outlives the spool drain
+    // timeout and the entry is retried forever (#2452). Recovery keys stay on
+    // the full path: a mismatched identity is a collision, not an ack.
+    // SessionEnd stays there too. A replay of an ended session is
+    // `AlreadyEnded`, which can still repair the wiki commit, and that
+    // decision is made inside admission rather than from the key alone.
+    // The reader check also verifies the 30-day key TTL and live session
+    // invariants (unpurged, owner-admitted, matching agent) so expired keys,
+    // purged sessions, and owner/agent collisions still fall through to full
+    // admission.
+    if env.event != HookEvent::SessionEnd
+        && let Some(key) = env.ingest_key.as_deref()
+        && state
+            .reader
+            .ordinary_ingest_key_completed(ws, proj, session_id, env.agent, &owner_filter, key)
+            .await?
+    {
+        return Ok(HookProcessingOutcome::Replayed);
+    }
+
+    // Hooks are fire-and-forget and may arrive out of order. Begin the
+    // session idempotently before every observation so a resumed agent
+    // session, or a prompt racing ahead of SessionStart, cannot trip the
+    // observations.session_id foreign key.
+    // Stamp the authenticated operator so anything that later picks "the open
+    // session for this scope" can tell whose it is — but only where operators
+    // are actually told apart. On an unauthenticated server, and on one that
+    // authenticates a single operator, this stays None and the session is
+    // shared, as before. The same value owns the SessionEnd handoff below, so
+    // the session and its baton can never disagree about who they belong to.
+    let owner_stamp = owner_stamp_for_event(state, actor.as_ref()).await;
+    // A keyed event claims its project-scoped key in the same transaction as
+    // the observation. A pending replay resumes the downstream wiki/handoff
+    // effects without duplicating the observation; only a delivery whose
+    // effects were marked complete is skipped.
+    let ingest_key = env.ingest_key.clone();
     let cwd_norm = env
         .cwd
         .as_deref()
@@ -12023,6 +12046,295 @@ pub(crate) mod tests {
             6,
             "session-start + resumed pending + first keyed + fresh key + 2 keyless"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_key_fast_path_enforces_ttl_and_session_invariants() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+        let sid = "77777777-7777-7777-7777-777777777777";
+        let cwd = tmp.path().join("fast-path-invariants");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let make_env = |event: &str, agent: &str, key: Option<&str>, prompt: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some(agent.into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "prompt": prompt,
+                }),
+            )
+        };
+
+        // 1. Store an ordinary keyed event for Alice (claude-code).
+        let stored = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored, HookProcessingOutcome::Stored);
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let (ws, proj, _) = state
+            .reader
+            .find_session_scope(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 2. Completed ordinary ingest key replay returns Replayed and does not re-insert.
+        let replayed = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed, HookProcessingOutcome::Replayed);
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 3. `all_owners_requested` on non-SessionEnd still rejects with SessionCollision.
+        let mut all_owners_env = make_env(
+            "user-prompt-submit",
+            "claude-code",
+            Some("entry-1"),
+            "hello",
+        );
+        all_owners_env.all_owners_requested = true;
+        let all_owners_err = process_authorized(
+            &state,
+            all_owners_env,
+            alice.clone(),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            all_owners_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 4. Cross-owner replay on a completed ordinary key still rejects with SessionCollision.
+        let cross_owner_err = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            bob.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            cross_owner_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 5. Wrong-agent replay on a completed ordinary key still rejects with SessionAgentMismatch.
+        let wrong_agent_err = process_authorized(
+            &state,
+            make_env("user-prompt-submit", "codex", Some("entry-1"), "hello"),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            wrong_agent_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionAgentMismatch {
+                bound: AgentKind::ClaudeCode
+            })
+        ));
+
+        // 6. Expired completed ordinary key (>30d seen_at) falls through and is swept/accepted.
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute(
+            "UPDATE ingest_keys SET seen_at = 1 WHERE project_id = ?1 AND key = 'entry-1'",
+            rusqlite::params![proj.as_bytes()],
+        )
+        .unwrap();
+        drop(db);
+        let expired_reused = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "reused",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(expired_reused, HookProcessingOutcome::Stored);
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // 7. Recovery keys stay on the full path: mismatched identity is a SessionCollision.
+        let recovery_key = format!("recovery_{}", "b".repeat(55));
+        let recovery_stored = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some(&recovery_key),
+                "original recovery body",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovery_stored, HookProcessingOutcome::Stored);
+        let recovery_collision = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some(&recovery_key),
+                "tampered recovery body",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            recovery_collision.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 8. SessionEnd stays on the full admission path even with a completed ordinary key.
+        let ended = process_authorized(
+            &state,
+            make_env("session-end", "claude-code", Some("entry-end"), "done"),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, HookProcessingOutcome::Stored);
+        let mut non_admin_all_owners_end =
+            make_env("session-end", "claude-code", Some("entry-end"), "done");
+        non_admin_all_owners_end.all_owners_requested = true;
+        let end_collision = process_authorized(
+            &state,
+            non_admin_all_owners_end,
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            end_collision.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 9. Purged session replay on a completed ordinary key falls through to SessionPurged.
+        state
+            .writer
+            .purge_session(
+                ws,
+                proj,
+                session_id,
+                None,
+                ai_memory_store::Compaction::Skip,
+                ai_memory_store::PurgeMode::Commit,
+            )
+            .await
+            .unwrap();
+        let purged_err = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            alice,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            purged_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionPurged(_))
+        ));
     }
 
     #[tokio::test]
