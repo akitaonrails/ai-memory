@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Stabilized duplicate-title ordering in lint reports to avoid redundant
+  report revisions and keep the briefing's warning-page list consistent. (#2461)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
