@@ -7624,7 +7624,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json, expires_at, salience, compacted_at \
+                        frontmatter_json, expires_at, salience, compacted_at, title \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -16595,6 +16595,8 @@ pub struct DecayCandidate {
     pub id: PageId,
     /// Relative wiki path.
     pub path: PagePath,
+    /// The indexed page title, including a heading or path-stem fallback.
+    pub title: String,
     /// Tier (the sweep only considers `episodic`).
     pub tier: ai_memory_core::Tier,
     /// Pinned flag — true means "never decay".
@@ -16645,6 +16647,7 @@ fn row_to_decay_candidate(
     let expires_at_us: Option<i64> = row.get(8)?;
     let salience: Option<f64> = row.get(9)?;
     let compacted_at_us: Option<i64> = row.get(10)?;
+    let title: String = row.get(11)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -16657,6 +16660,7 @@ fn row_to_decay_candidate(
         expires_at_us,
         salience,
         compacted_at_us,
+        title,
     ))
 }
 
@@ -16673,10 +16677,12 @@ fn materialise_decay_candidate(
     expires_at_us: Option<i64>,
     salience: Option<f64>,
     compacted_at_us: Option<i64>,
+    title: String,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
         path: PagePath::new(path)?,
+        title,
         tier: tier_str
             .parse::<ai_memory_core::Tier>()
             .map_err(StoreError::from)?,

@@ -2657,7 +2657,7 @@ const EXISTING_TITLES_PROMPT_LIMIT: usize = 15;
 /// Case-insensitive, whitespace-collapsed title key — the same grouping
 /// the M8 duplicate-title lint uses, so "collides here" means "the lint
 /// flags it there".
-fn title_collision_key(title: &str) -> String {
+pub(crate) fn title_collision_key(title: &str) -> String {
     title
         .split_whitespace()
         .collect::<Vec<_>>()

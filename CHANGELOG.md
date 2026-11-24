@@ -53,6 +53,11 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed `backup-agents` and `restore-agents` to honor `GEMINI_CLI_HOME`
   for Gemini CLI's global settings and skills. (#2459)
 
+### Fixed
+
+- Fixed duplicate-title lint to compare the indexed titles shown in the page
+  list, including titles derived from a Markdown heading or filename. (#2447)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
