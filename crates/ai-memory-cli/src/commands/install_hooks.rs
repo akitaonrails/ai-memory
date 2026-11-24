@@ -10139,6 +10139,58 @@ mod tests {
         );
     }
 
+    /// The Windows command of an agent that runs hooks through PowerShell,
+    /// composed as the renderer composes it: the call operator, then
+    /// single-quoted words with `''` for a quote (#1462).
+    #[test]
+    fn native_hook_url_reads_powershell_run_windows_commands() {
+        let remote = "https://memory.example.invalid/o'brien";
+        let exe = r"C:\Program Files\ai-memory\ai-memory.exe";
+        let data_dir = r"C:\Users\o'brien\AppData\Local\ai-memory";
+        let handler = |prefix: &str, agent: &str, suffix: &str| {
+            serde_json::json!({ "type": "command", "command": format!(
+                "{prefix}{} --data-dir {} hook --event session-start --agent {agent} --server-url {}{suffix}",
+                powershell_quote(exe),
+                powershell_quote(data_dir),
+                powershell_quote(remote)
+            )})
+        };
+        for agent in ["codex", "copilot-cli", "gemini-cli", "grok", "dsh"] {
+            assert_eq!(
+                native_hook_url(&handler("& ", agent, ""), data_dir, agent).as_deref(),
+                Some(remote),
+                "{agent}"
+            );
+            assert!(
+                native_hook_url(
+                    &handler("& ", agent, " --auth-token 'synthetic'"),
+                    data_dir,
+                    agent
+                )
+                .is_none(),
+                "{agent}: an inline credential"
+            );
+            assert!(
+                native_hook_url(
+                    &handler("& 'C:\\bin\\wrapper.exe' ", agent, ""),
+                    data_dir,
+                    agent
+                )
+                .is_none(),
+                "{agent}: a custom prefix"
+            );
+        }
+        // Cursor's Windows runner is not PowerShell, so the installer never
+        // writes this form for it.
+        assert!(native_hook_url(&handler("& ", "cursor", ""), data_dir, "cursor").is_none());
+        // A word PowerShell would read differently is not the installer's.
+        let unbalanced = serde_json::json!({ "command": format!(
+            "& 'C:\\ai-memory.exe' --data-dir {} hook --event stop --agent codex --server-url 'https://a.invalid/x'y'",
+            powershell_quote(data_dir)
+        )});
+        assert!(native_hook_url(&unbalanced, data_dir, "codex").is_none());
+    }
+
     /// A home-relative install (#2035 renders the binary and data dir as
     /// `"$HOME/..."`) must still be recognized by the upgrade refresh, so its
     /// Claude endpoint and credentials are preserved. Before this, recognition
