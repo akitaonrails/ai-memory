@@ -4234,13 +4234,20 @@ the binary is genuine. Point it only at origins you control. Prefer an
 on-path attacker can substitute both the archive and its matching checksum.
 Each response body is capped at 128 MiB.
 
-When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the Claude Code
-refresh reuses the endpoint shared by its installed native hooks and leaves
-the hook credential files alone. If the hook commands use different URLs,
-contain inline credentials, or cannot be safely re-rendered as native hooks,
-upgrade refreshes the staged scripts and keeps the existing settings. To
-update those hooks, re-run `ai-memory install-hooks --apply --agent claude-code`
-with the original connection options.
+When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the refresh reuses the
+endpoint an agent's installed native hooks share and leaves the hook
+credential files alone. This covers Claude Code, Codex, Copilot CLI, Cursor,
+Gemini CLI, Kimi Code and the other agents whose hooks file
+`install-hooks --apply` writes; the generated integrations (OpenCode, Omp, Pi,
+OpenClaw) keep the endpoint their file names. If Claude Code's hook commands
+use different URLs, contain inline credentials, or cannot be safely
+re-rendered as native hooks, upgrade refreshes the staged scripts and keeps
+the existing settings. To update those hooks, re-run
+`ai-memory install-hooks --apply --agent claude-code` with the original
+connection options. Another agent's hooks in that state are refreshed as
+before, with the configured connection, so re-run
+`ai-memory install-hooks --apply --agent <agent>` with the original
+`--server-url` and `--auth-token` if they pointed at a remote server.
 
 ### Hook files after an update
 
