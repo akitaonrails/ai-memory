@@ -7317,6 +7317,25 @@ input_token_safety_margin = {margin}
     }
 
     #[test]
+    fn unset_provider_still_runs_the_local_model_embedding_model_names() {
+        // The documented way to pick the multilingual model needs no
+        // provider line (config.default.toml, docs/local-embeddings.md).
+        for configured in ["intfloat/multilingual-e5-small", "multilingual-e5-small"] {
+            let cfg = Config {
+                embedding_model: Some(configured.into()),
+                ..Config::default()
+            };
+            let embedder = cfg.embedder_config().unwrap().unwrap();
+            assert_eq!(embedder.provider, EmbedderChoice::Local, "{configured}");
+            assert!(embedder.defaulted, "{configured}");
+            assert_eq!(
+                embedder.model, "intfloat/multilingual-e5-small",
+                "{configured}"
+            );
+        }
+    }
+
+    #[test]
     fn openai_embedding_falls_back_to_llm_api_key_for_openrouter() {
         let cfg = Config {
             embedding_provider: Some("openai".into()),
