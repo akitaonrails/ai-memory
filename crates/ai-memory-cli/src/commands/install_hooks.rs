@@ -211,13 +211,18 @@ fn baked_claude_hook_url(document: &serde_json::Value, data_dir: &Path) -> Optio
                 .map_or_else(|| std::slice::from_ref(entry), Vec::as_slice)
         })
         .filter(|handler| is_ai_memory_hook_entry(handler));
-    let url = native_claude_hook_url(handlers.next()?, &data_dir)?;
+    let url = native_hook_url(handlers.next()?, &data_dir, "claude-code")?;
     handlers
-        .all(|handler| native_claude_hook_url(handler, &data_dir).as_deref() == Some(url.as_str()))
+        .all(|handler| {
+            native_hook_url(handler, &data_dir, "claude-code").as_deref() == Some(url.as_str())
+        })
         .then_some(url)
 }
 
-fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option<String> {
+/// The endpoint one installer-rendered native hook handler for `agent` sends
+/// to, when the handler carries nothing a refresh would lose: the same data
+/// dir, no inline credential, no custom prefix or extra flag.
+fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> Option<String> {
     let command = handler.get("command")?.as_str()?;
     let exec = handler.get("args");
     // A legacy Windows command double-quotes an absolute executable. A POSIX
@@ -239,7 +244,7 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
             vec![format!("\"{data_dir}\"")]
         } else {
             let mut forms = vec![shell_quote(data_dir)];
-            if let Some(home) = portable_hook_home("claude-code", false) {
+            if let Some(home) = portable_hook_home(agent, false) {
                 let portable = posix_path_arg(Path::new(data_dir), Some(&home));
                 if !forms.contains(&portable) {
                     forms.push(portable);
@@ -280,7 +285,7 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
         "--event",
         _,
         "--agent",
-        "claude-code",
+        named,
         "--server-url",
         raw,
         tail @ ..,
@@ -288,6 +293,9 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
     else {
         return None;
     };
+    if *named != agent {
+        return None;
+    }
     let tail = match tail {
         ["--project-strategy", _, rest @ ..] => rest,
         tail => tail,
@@ -9896,7 +9904,7 @@ mod tests {
     /// restaging scripts, losing the endpoint.
     #[cfg(unix)]
     #[test]
-    fn native_claude_hook_url_recognizes_home_relative_commands() {
+    fn native_hook_url_recognizes_home_relative_claude_commands() {
         use crate::commands::render_shared::TestHookHome;
 
         let data_dir = "/home/tester/.local/share/ai-memory";
@@ -9918,7 +9926,7 @@ mod tests {
             "/opt/ai-memory/bin/ai-memory",
         ] {
             assert_eq!(
-                native_claude_hook_url(&settings(executable), data_dir).as_deref(),
+                native_hook_url(&settings(executable), data_dir, "claude-code").as_deref(),
                 Some("https://memory.example.invalid/team"),
                 "home-relative command should be recognized: {executable}"
             );
@@ -9930,7 +9938,7 @@ mod tests {
             "/bin/wrapper \"$HOME/.local/bin/ai-memory\"",
         ] {
             assert!(
-                native_claude_hook_url(&settings(executable), data_dir).is_none(),
+                native_hook_url(&settings(executable), data_dir, "claude-code").is_none(),
                 "a custom prefix must stay available for manual refresh: {executable}"
             );
         }
