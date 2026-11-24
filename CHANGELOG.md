@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `backup-agents` and `restore-agents` to honor `GEMINI_CLI_HOME`
+  for Gemini CLI's global settings and skills. (#2459)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added

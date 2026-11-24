@@ -434,8 +434,11 @@ pub fn discover_assets(
 
     // 4. Gemini CLI
     if filter_agent(AgentKind::GeminiCli) {
-        let gemini_dir = home.join(".gemini");
         if want_global {
+            let gemini_dir = agent_config_home(env.var_os("GEMINI_CLI_HOME"))
+                .as_deref()
+                .unwrap_or(home)
+                .join(".gemini");
             push_if_file(
                 &mut assets,
                 AgentKind::GeminiCli,

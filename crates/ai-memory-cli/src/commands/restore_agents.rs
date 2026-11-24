@@ -90,6 +90,13 @@ pub fn run(config: &Config, args: RestoreAgentsArgs) -> Result<()> {
     let claude_override = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
     let codex_override = agent_config_home(config.runtime_env.var_os("CODEX_HOME"));
     let copilot_override = agent_config_home(std::env::var_os("COPILOT_HOME"));
+    let gemini_override = agent_config_home(config.runtime_env.var_os("GEMINI_CLI_HOME"));
+    let overrides = TargetOverrides {
+        claude: claude_override.as_deref(),
+        codex: codex_override.as_deref(),
+        copilot: copilot_override.as_deref(),
+        gemini: gemini_override.as_deref(),
+    };
     let mut archive_paths = HashSet::with_capacity(manifest.entries.len());
     let mut target_paths = HashSet::with_capacity(manifest.entries.len());
     let mut planned = Vec::new();
@@ -153,11 +160,6 @@ pub fn run(config: &Config, args: RestoreAgentsArgs) -> Result<()> {
             );
         }
 
-        let overrides = TargetOverrides {
-            claude: claude_override.as_deref(),
-            codex: codex_override.as_deref(),
-            copilot: copilot_override.as_deref(),
-        };
         let (base, target_path) = resolve_target(entry, &home, &cwd, overrides)?;
         if !target_paths.insert(target_path.clone()) {
             bail!(
@@ -378,6 +380,8 @@ struct TargetOverrides<'a> {
     codex: Option<&'a Path>,
     /// `COPILOT_HOME`.
     copilot: Option<&'a Path>,
+    /// `GEMINI_CLI_HOME`.
+    gemini: Option<&'a Path>,
 }
 
 fn resolve_target(
@@ -438,6 +442,15 @@ fn resolve_target(
         && let Some(relative) = entry.target_relative.strip_prefix(".copilot/")
     {
         return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
+    if entry.agent == AgentKind::GeminiCli
+        && let Some(custom_dir) = overrides.gemini
+        && entry.target_relative.starts_with(".gemini/")
+    {
+        return Ok((
+            custom_dir.to_path_buf(),
+            custom_dir.join(&entry.target_relative),
+        ));
     }
     Ok((home.to_path_buf(), home.join(&entry.target_relative)))
 }
