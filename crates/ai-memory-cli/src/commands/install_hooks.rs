@@ -193,10 +193,12 @@ pub(crate) fn installed_claude_hook_url(
     }
     let existing = existing_agent_config(args)?;
     let document: serde_json::Value = serde_json::from_str(&existing).ok()?;
-    baked_claude_hook_url(&document, data_dir)
+    baked_hook_url(&document, data_dir, "claude-code")
 }
 
-fn baked_claude_hook_url(document: &serde_json::Value, data_dir: &Path) -> Option<String> {
+/// The one endpoint every ai-memory handler in a hooks document (`hooks` keyed
+/// by event, entries nested under `hooks` or flat) sends to for `agent`.
+fn baked_hook_url(document: &serde_json::Value, data_dir: &Path, agent: &str) -> Option<String> {
     let hooks = ai_memory_claude_hooks(document)?;
     let data_dir = data_dir.to_string_lossy();
     let data_dir = strip_windows_verbatim_prefix(&data_dir);
@@ -211,11 +213,9 @@ fn baked_claude_hook_url(document: &serde_json::Value, data_dir: &Path) -> Optio
                 .map_or_else(|| std::slice::from_ref(entry), Vec::as_slice)
         })
         .filter(|handler| is_ai_memory_hook_entry(handler));
-    let url = native_hook_url(handlers.next()?, &data_dir, "claude-code")?;
+    let url = native_hook_url(handlers.next()?, &data_dir, agent)?;
     handlers
-        .all(|handler| {
-            native_hook_url(handler, &data_dir, "claude-code").as_deref() == Some(url.as_str())
-        })
+        .all(|handler| native_hook_url(handler, &data_dir, agent).as_deref() == Some(url.as_str()))
         .then_some(url)
 }
 
@@ -9815,7 +9815,7 @@ mod tests {
     const CAPTURE_ADMIT_GATE_TS: &str = "const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === \"allowlist\" && !markerPresent) return { disposition: \"drop\", payload };";
 
     #[test]
-    fn baked_claude_hook_url_requires_one_owned_native_endpoint() {
+    fn baked_hook_url_requires_one_owned_native_claude_endpoint() {
         let url = "https://memory.example.invalid/a!b";
         let data_dir = Path::new("data with spaces");
         let posix = serde_json::json!({
@@ -9837,16 +9837,16 @@ mod tests {
             "SessionEnd": [{"matcher": "", "hooks": [legacy_windows]}]
         }});
         assert_eq!(
-            baked_claude_hook_url(&settings, data_dir).as_deref(),
+            baked_hook_url(&settings, data_dir, "claude-code").as_deref(),
             Some(url)
         );
-        assert!(baked_claude_hook_url(&settings, Path::new("other data")).is_none());
+        assert!(baked_hook_url(&settings, Path::new("other data"), "claude-code").is_none());
 
         let args = settings["hooks"]["SessionStart"][0]["hooks"][0]["args"]
             .as_array_mut()
             .unwrap();
         args[8] = serde_json::json!("https://other.example.invalid");
-        assert!(baked_claude_hook_url(&settings, data_dir).is_none());
+        assert!(baked_hook_url(&settings, data_dir, "claude-code").is_none());
 
         let args = settings["hooks"]["SessionStart"][0]["hooks"][0]["args"]
             .as_array_mut()
@@ -9856,11 +9856,11 @@ mod tests {
             serde_json::json!("--auth-token"),
             serde_json::json!("synthetic-inline"),
         ]);
-        assert!(baked_claude_hook_url(&settings, data_dir).is_none());
+        assert!(baked_hook_url(&settings, data_dir, "claude-code").is_none());
     }
 
     #[test]
-    fn baked_claude_hook_url_preserves_custom_command_prefixes_for_manual_refresh() {
+    fn baked_hook_url_preserves_custom_claude_command_prefixes_for_manual_refresh() {
         let data_dir = Path::new("data with spaces");
         let settings = |executable: &str| {
             serde_json::json!({"hooks": {
@@ -9876,7 +9876,7 @@ mod tests {
             "'/old o'\\''brien/ai-memory'",
         ] {
             assert_eq!(
-                baked_claude_hook_url(&settings(executable), data_dir).as_deref(),
+                baked_hook_url(&settings(executable), data_dir, "claude-code").as_deref(),
                 Some("https://memory.example.invalid"),
                 "a canonical stale executable can be refreshed"
             );
@@ -9891,7 +9891,7 @@ mod tests {
             "/bin/wrapper /bin/ai-memory (deleted)",
         ] {
             assert!(
-                baked_claude_hook_url(&settings(executable), data_dir).is_none(),
+                baked_hook_url(&settings(executable), data_dir, "claude-code").is_none(),
                 "a custom prefix must stay available for manual refresh"
             );
         }
