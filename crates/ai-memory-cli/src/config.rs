@@ -7292,6 +7292,31 @@ input_token_safety_margin = {margin}
     }
 
     #[test]
+    fn unset_provider_keeps_the_default_local_model_for_a_hosted_embedding_model() {
+        // A model left from a hosted provider once the provider line is
+        // gone. Earlier releases ran the default local model with this
+        // config, and its stored vectors carry that model's name.
+        for leftover in [
+            "text-embedding-3-small",
+            "voyage-3",
+            "nonexistent-local-model",
+        ] {
+            let cfg = Config {
+                embedding_model: Some(leftover.into()),
+                ..Config::default()
+            };
+            let embedder = cfg
+                .embedder_config()
+                .unwrap_or_else(|err| panic!("{leftover}: {err}"))
+                .unwrap();
+            assert_eq!(embedder.provider, EmbedderChoice::Local, "{leftover}");
+            assert!(embedder.defaulted, "{leftover}");
+            assert_eq!(embedder.model, ai_memory_llm::LOCAL_MODEL, "{leftover}");
+            assert_eq!(embedder.dim, 384, "{leftover}");
+        }
+    }
+
+    #[test]
     fn openai_embedding_falls_back_to_llm_api_key_for_openrouter() {
         let cfg = Config {
             embedding_provider: Some("openai".into()),
