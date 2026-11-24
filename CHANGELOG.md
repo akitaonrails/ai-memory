@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- XLSX import kept a cell under its header when an earlier blank cell was
+  omitted from the worksheet, for a gap of up to 32 columns. A wider jump
+  still uses one separator, so a sparse sheet is not expanded into the empty
+  rectangle. (#2458)
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
