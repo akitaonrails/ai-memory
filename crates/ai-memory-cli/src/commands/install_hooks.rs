@@ -39,8 +39,9 @@ use crate::commands::render_shared::{
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
     is_portable_home_arg, kimi_code_hook_commands, local_hook_policy_v1_supported, mask_secret,
-    portable_hook_home, posix_path_arg, shell_quote, ts_auth_headers_fn, ts_capture_policy_v1,
-    ts_string_literal, ts_timeout_signal, yaml_single_quote,
+    portable_hook_home, posix_path_arg, powershell_call_operator, powershell_quote, shell_quote,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL, PiToolExposure};
@@ -276,10 +277,21 @@ fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> 
     // A legacy Windows command double-quotes an absolute executable. A POSIX
     // home-relative command (#2035) also opens with a double quote, but as
     // `"$HOME/..."`; it must take the POSIX branch, not the Windows one.
-    let quote = if exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME") {
+    // A PowerShell runner's Windows command invokes a single-quoted
+    // executable through the call operator (`& 'C:\...'`, #1462).
+    let quote = if exec.is_none()
+        && command.starts_with("& '")
+        && !powershell_call_operator(agent).is_empty()
+    {
+        HookCommandQuote::PowerShell
+    } else if exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME") {
         HookCommandQuote::Windows
     } else {
         HookCommandQuote::Posix
+    };
+    let command = match quote {
+        HookCommandQuote::PowerShell => command.strip_prefix("& ")?,
+        _ => command,
     };
     let words: Vec<&str> = if let Some(args) = exec {
         args.as_array()?
@@ -293,6 +305,7 @@ fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> 
         // (#2035). Try both so a home-relative install is still recognized.
         let rendered_dirs: Vec<String> = match quote {
             HookCommandQuote::Windows => vec![format!("\"{data_dir}\"")],
+            HookCommandQuote::PowerShell => vec![powershell_quote(data_dir)],
             HookCommandQuote::Posix => {
                 let mut forms = vec![shell_quote(data_dir)];
                 if let Some(home) = portable_hook_home(agent, false) {
@@ -378,9 +391,19 @@ enum HookCommandQuote {
     Posix,
     /// The double-quoted Windows command string.
     Windows,
+    /// The Windows command string of an agent that runs hooks through
+    /// PowerShell: `& ` and single-quoted words, `''` standing for a quote.
+    PowerShell,
 }
 
 fn native_hook_word(raw: &str, quote: HookCommandQuote) -> Option<String> {
+    if quote == HookCommandQuote::PowerShell {
+        let value = raw
+            .strip_prefix('\'')?
+            .strip_suffix('\'')?
+            .replace("''", "'");
+        return (!value.is_empty() && powershell_quote(&value) == raw).then_some(value);
+    }
     if quote == HookCommandQuote::Windows {
         let value = raw.strip_prefix('"')?.strip_suffix('"')?;
         return (!value.is_empty() && !value.contains('"')).then(|| value.to_owned());

@@ -3147,7 +3147,7 @@ pub(crate) fn native_shell_quote(s: &str) -> String {
     }
 }
 
-fn powershell_quote(s: &str) -> String {
+pub(crate) fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -3174,7 +3174,7 @@ fn powershell_quote(s: &str) -> String {
 /// observed, because both the failure and the false fix are silent: a wrong
 /// answer either way produces a hook that installs cleanly and captures
 /// nothing.
-fn powershell_call_operator(agent: &str) -> &'static str {
+pub(crate) fn powershell_call_operator(agent: &str) -> &'static str {
     // Codex evaluates `~/.codex/hooks.json` command strings with PowerShell
     // on Windows (#515, reproduced against Codex CLI on a native install).
     // Grok Build CLI does the same for `~/.grok/hooks/*.json` (observed on
