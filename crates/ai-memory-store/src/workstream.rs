@@ -142,8 +142,12 @@ pub(crate) fn authorize_run_mutation(
         authority.distinguishes_operators,
     )?;
     match authority.project_policy {
-        RunProjectPolicy::TrustedProxyLegacy => Ok(()),
-        RunProjectPolicy::Grants => project_authz
+        RunProjectPolicy::TrustedProxyLegacy
+            if !project_authz.reserved_global && !project_authz.private_profile =>
+        {
+            Ok(())
+        }
+        RunProjectPolicy::TrustedProxyLegacy | RunProjectPolicy::Grants => project_authz
             .authorize(crate::ProjectAccess::Write)
             .map_err(|failure| StoreError::Forbidden(failure.message())),
     }

@@ -885,6 +885,8 @@ mod tests {
                 grant: Some(level),
                 workspace_grant: None,
                 reserved_global: false,
+                private_profile: false,
+                subject_to_project_grants: true,
             };
             assert!(
                 crate::authorize_project(&ctx, crate::ProjectAccess::Read).is_ok(),
