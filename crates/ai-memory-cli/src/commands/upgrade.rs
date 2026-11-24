@@ -1170,7 +1170,15 @@ fn refresh_agent_list(config: &Config, agents: &StagedAgentList) {
 }
 
 fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
+    apply_staged_agent_hooks_with(config, name, apply_hooks_args(agent));
+}
+
+/// [`apply_staged_agent_hooks`] with the `install-hooks --apply` arguments it
+/// refreshes with, so a test can point the refresh at the hooks bundle instead
+/// of relying on where its own executable sits.
+fn apply_staged_agent_hooks_with(config: &Config, name: &str, args: InstallHooksArgs) {
     let i18n = &config.i18n;
+    let agent = args.agent;
     if agent == AgentChoice::ClaudeCode
         && let Some(settings) = claude_user_level_install_absent()
     {
@@ -1191,7 +1199,6 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
         }
         return;
     }
-    let args = apply_hooks_args(agent);
     let result = if agent == AgentChoice::ClaudeCode && !config.server_url_configured() {
         if let Some(url) = install_hooks::installed_claude_hook_url(&args, &config.data_dir) {
             install_hooks::run_with_preserved_hook_url(config, args, None, &url)
