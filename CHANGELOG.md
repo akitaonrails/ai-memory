@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.6.1] - 2026-11-24
+
 ### Fixed
 
 - Recorded project access-mode changes in `audit_log` with the workspace,
@@ -6405,7 +6407,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.1...HEAD
+[3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
 [3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
 [3.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.2
 [3.5.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.1
