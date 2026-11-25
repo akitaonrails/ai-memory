@@ -967,19 +967,23 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// handoff GET. Default root certs are kept so HTTPS targets (e.g. a TLS
 /// proxy) still work.
 pub fn build_client() -> reqwest::Client {
+    build_client_with_connect_timeout(CONNECT_TIMEOUT)
+}
+
+pub(crate) fn build_client_with_connect_timeout(connect_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// A request deadline that does not outlast [`CONNECT_TIMEOUT`] cannot prove the
+/// A request deadline that does not outlast `connect_timeout` cannot prove the
 /// request reached the server, so its timeout is deferred instead of charged
 /// (#2465).
-fn post_outcome_on_deadline_timeout(timeout: Duration) -> PostOutcome {
-    if timeout <= CONNECT_TIMEOUT {
+fn post_outcome_on_deadline_timeout(timeout: Duration, connect_timeout: Duration) -> PostOutcome {
+    if timeout <= connect_timeout {
         return PostOutcome::Unreachable;
     }
 
@@ -987,8 +991,8 @@ fn post_outcome_on_deadline_timeout(timeout: Duration) -> PostOutcome {
 }
 
 /// Batch counterpart of [`post_outcome_on_deadline_timeout`].
-fn batch_outcome_on_deadline_timeout(timeout: Duration) -> BatchOutcome {
-    if timeout <= CONNECT_TIMEOUT {
+fn batch_outcome_on_deadline_timeout(timeout: Duration, connect_timeout: Duration) -> BatchOutcome {
+    if timeout <= connect_timeout {
         return BatchOutcome::Unreachable;
     }
 
@@ -1046,12 +1050,24 @@ pub enum PostOutcome {
 /// this with a budget that tolerates a remote/slow server. Returns a
 /// [`PostOutcome`] (never errors) so the drain can give a 429 (saturation) a
 /// free retry while still bounding genuine failures by `MAX_ATTEMPTS`.
+#[cfg(test)]
 pub async fn post_hook(
     client: &reqwest::Client,
     url: &str,
     body: &str,
     token: Option<&str>,
     timeout: Duration,
+) -> PostOutcome {
+    post_hook_with_connect_timeout(client, url, body, token, timeout, CONNECT_TIMEOUT).await
+}
+
+pub(crate) async fn post_hook_with_connect_timeout(
+    client: &reqwest::Client,
+    url: &str,
+    body: &str,
+    token: Option<&str>,
+    timeout: Duration,
+    connect_timeout: Duration,
 ) -> PostOutcome {
     let mut req = client
         .post(url)
@@ -1085,7 +1101,7 @@ pub async fn post_hook(
         // while still connecting — so it is deferred without charging a retry
         // (#2465).
         Err(err) if err.is_timeout() && !err.is_connect() => {
-            post_outcome_on_deadline_timeout(timeout)
+            post_outcome_on_deadline_timeout(timeout, connect_timeout)
         }
         Err(_) => PostOutcome::Unreachable,
     }
@@ -1155,6 +1171,18 @@ pub async fn post_batch(
     token: Option<&str>,
     timeout: Duration,
 ) -> BatchOutcome {
+    post_batch_with_connect_timeout(client, batch_url, payload, token, timeout, CONNECT_TIMEOUT)
+        .await
+}
+
+pub(crate) async fn post_batch_with_connect_timeout(
+    client: &reqwest::Client,
+    batch_url: &str,
+    payload: &str,
+    token: Option<&str>,
+    timeout: Duration,
+    connect_timeout: Duration,
+) -> BatchOutcome {
     let mut req = client
         .post(batch_url)
         .header("Content-Type", "application/json")
@@ -1218,7 +1246,7 @@ pub async fn post_batch(
         // have expired while still connecting — so it is deferred without
         // charging a retry (#2465).
         Err(err) if err.is_timeout() && !err.is_connect() => {
-            batch_outcome_on_deadline_timeout(timeout)
+            batch_outcome_on_deadline_timeout(timeout, connect_timeout)
         }
         Err(_) => BatchOutcome::Unreachable,
     }
@@ -1372,12 +1400,12 @@ mod tests {
     /// the client's failure is a request timeout, not a connect error. The
     /// accept proves TCP connected even though the request never got a reply
     /// (#2465).
-    fn serve_silent_once(path: &str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    async fn serve_silent_once(path: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            if let Ok((_stream, _)) = listener.accept() {
-                std::thread::sleep(Duration::from_secs(2));
+        tokio::spawn(async move {
+            if let Ok((_stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
         format!("http://{addr}{path}")
@@ -1566,13 +1594,28 @@ mod tests {
             format!("http://{addr}/hook/batch")
         }
 
-        let client = build_client();
-        let deadline = CONNECT_TIMEOUT + Duration::from_millis(50);
-        let batch_url = serve_slow_once(CONNECT_TIMEOUT + Duration::from_millis(500)).await;
-        let hook_url = serve_slow_once(CONNECT_TIMEOUT + Duration::from_millis(500)).await;
+        let connect_timeout = Duration::from_millis(50);
+        let client = build_client_with_connect_timeout(connect_timeout);
+        let deadline = connect_timeout + Duration::from_millis(50);
+        let batch_url = serve_slow_once(deadline + Duration::from_millis(300)).await;
+        let hook_url = serve_slow_once(deadline + Duration::from_millis(300)).await;
         let (batch_outcome, hook_outcome) = tokio::join!(
-            post_batch(&client, &batch_url, "[]", None, deadline),
-            post_hook(&client, &hook_url, "{}", None, deadline),
+            post_batch_with_connect_timeout(
+                &client,
+                &batch_url,
+                "[]",
+                None,
+                deadline,
+                connect_timeout,
+            ),
+            post_hook_with_connect_timeout(
+                &client,
+                &hook_url,
+                "{}",
+                None,
+                deadline,
+                connect_timeout,
+            ),
         );
         assert_eq!(
             batch_outcome,
@@ -1592,7 +1635,7 @@ mod tests {
         // often ~1s and so shorter than CONNECT_TIMEOUT. Such a deadline
         // cannot prove the request reached the server, so the event must stay
         // queued instead of costing a retry attempt.
-        let url = serve_silent_once("/hook");
+        let url = serve_silent_once("/hook").await;
         let outcome = post_hook(
             &build_client(),
             &url,
@@ -1613,7 +1656,7 @@ mod tests {
     async fn post_batch_defers_a_timeout_shorter_than_the_connect_budget() {
         // #2465, batch path: same short-deadline ambiguity as `post_hook`, so
         // the batch stays queued rather than charging the head entry.
-        let url = serve_silent_once("/hook/batch");
+        let url = serve_silent_once("/hook/batch").await;
         let outcome = post_batch(
             &build_client(),
             &url,
