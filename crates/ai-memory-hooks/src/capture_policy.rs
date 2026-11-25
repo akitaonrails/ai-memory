@@ -2126,7 +2126,8 @@ pub fn file_target(agent: AgentKind, raw: &Value) -> Option<FileTarget> {
 /// patch names), every directory, file and path-like glob argument of a
 /// search/list tool, and every shell argument that names a path (one with a
 /// separator, after `~/` expansion) resolved from the tool's `workdir` or the
-/// `cwd`, plus that directory itself.
+/// `cwd`, plus that directory itself, and every file Claude Code says the
+/// call changed (`bashEditDiff`).
 ///
 /// A checkout's `ignore_paths` protect its files wherever the call is made
 /// from, so a client applies the policy of each location's own marker as
@@ -2235,6 +2236,17 @@ pub fn capture_lookup_locations(
             }
         }
         _ => {}
+    }
+    // The files Claude Code says the call changed are looked up like a file
+    // tool's targets. A list it cannot read is left to the event's own
+    // policy: its shape may change, and calling every such lookup unprovable
+    // would strip the call wherever no marker asked for it.
+    if let Some(Ok(edited)) = &extracted.edited {
+        for path in edited {
+            for candidate in readings(path, cwd)?? {
+                push(Some(candidate), syntax)?;
+            }
+        }
     }
     Some(locations)
 }
