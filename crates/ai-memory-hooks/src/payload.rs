@@ -1356,6 +1356,12 @@ fn claude_code_tool_text(raw: &serde_json::Value) -> Option<Option<String>> {
             "create" => Some(text("content")),
             _ => None,
         },
+        // The cell's new source, or what went wrong, never `original_file`
+        // and `updated_file`: the whole notebook before and after.
+        "NotebookEdit" => {
+            response.get("new_source")?.as_str()?;
+            Some(text("error").or_else(|| text("new_source")))
+        }
         _ => None,
     }
 }
