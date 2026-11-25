@@ -2256,6 +2256,52 @@ mod tests {
         }
     }
 
+    /// Cursor's `stop` reports how the agent loop ended in `status`
+    /// (`completed`, `aborted` or `error`; <https://cursor.com/docs/agent/hooks>,
+    /// stop). An aborted turn is titled as an interrupt and a failed one as a
+    /// stop failure, with no details to describe. Controls: `completed`, a
+    /// missing status, and the same status from agents that report abnormal
+    /// ends through their own events stay normal turn ends.
+    #[test]
+    fn cursor_stop_status_marks_an_aborted_or_failed_turn() {
+        let stop = |agent: &str, status: Option<&str>| {
+            let mut body = serde_json::json!({
+                "conversation_id": "c1",
+                "generation_id": "g1",
+                "hook_event_name": "stop",
+                "loop_count": 0,
+                "session_id": "c1",
+            });
+            if let Some(status) = status {
+                body["status"] = serde_json::json!(status);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        for (status, title) in [("aborted", "interrupt"), ("error", "stop failure")] {
+            let env = stop("cursor", Some(status));
+            assert_eq!(env.event, HookEvent::Stop, "{status}");
+            assert_eq!(env.title_hint.as_deref(), Some(title), "{status}");
+            assert_eq!(env.body_excerpt, None, "{status}");
+        }
+        for (agent, status) in [
+            ("cursor", Some("completed")),
+            ("cursor", None),
+            ("claude-code", Some("error")),
+            ("codex", Some("aborted")),
+        ] {
+            let env = stop(agent, status);
+            assert_eq!(env.event, HookEvent::Stop, "{agent} {status:?}");
+            assert_eq!(env.title_hint, None, "{agent} {status:?}");
+        }
+    }
+
     #[test]
     fn parses_known_events() {
         assert_eq!(HookEvent::parse("session-start"), HookEvent::SessionStart);
