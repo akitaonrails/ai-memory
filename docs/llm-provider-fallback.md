@@ -237,12 +237,17 @@ route. The server persists the pause in its data directory. New and existing
 jobs stay queued without spending attempts, and existing heuristic pages remain
 available. A working fallback can finish a job without pausing the queue.
 
-The pause ends when the route has a candidate due to retry or the server starts
-with a different consolidation route. The worker then runs the oldest due
-job. If the route is still exhausted, the worker pauses again and charges
-only that job's actual attempt against its retry limit. A paid request is never
-generated just to test recovery. Replacing a credential under the same name
-may leave the pause in effect until its deadline.
+While the server is running, the worker resumes with the oldest due job when
+the first candidate is eligible. After a restart, the worker waits for the
+latest known deadline on the route so it honors each provider's retry hint
+after the individual circuits have reset. This can delay an earlier
+candidate until the later deadline. A real queued success clears the pause.
+
+Changing the consolidation route on restart also allows the worker to resume.
+Replacing a credential under the same name may leave the pause in effect
+until its deadline. If the route is still exhausted when work resumes, the
+worker pauses again and charges only that job's actual attempt against its
+retry limit. Recovery always uses a real queued job.
 
 Example, Anthropic as primary with OpenAI taking over when the Anthropic
 balance runs out:

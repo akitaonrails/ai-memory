@@ -112,6 +112,9 @@ pub enum LlmError {
         summary: String,
         /// Time until the first candidate is eligible again.
         retry_after: Duration,
+        /// Time until all candidate cooldowns end. A caller recovering without
+        /// the individual circuits can use this to avoid retrying one early.
+        restart_retry_after: Duration,
     },
 }
 

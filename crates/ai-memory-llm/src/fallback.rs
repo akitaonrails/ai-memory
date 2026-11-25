@@ -331,10 +331,8 @@ impl FallbackLlmProvider {
         transport_unreachable: bool,
     ) -> LlmError {
         let quota_until = if failures.iter().all(|failure| failure.quota_until.is_some()) {
-            failures
-                .iter()
-                .filter_map(|failure| failure.quota_until)
-                .min()
+            let deadlines = failures.iter().filter_map(|failure| failure.quota_until);
+            deadlines.clone().min().zip(deadlines.max())
         } else {
             None
         };
@@ -345,11 +343,13 @@ impl FallbackLlmProvider {
             .join("; ");
         if transport_unreachable {
             LlmError::FallbackTransportUnreachable { attempted, summary }
-        } else if let Some(until) = quota_until {
+        } else if let Some((first, last)) = quota_until {
+            let now = Instant::now();
             LlmError::FallbackQuotaExhausted {
                 attempted,
                 summary,
-                retry_after: until.saturating_duration_since(Instant::now()),
+                retry_after: first.saturating_duration_since(now),
+                restart_retry_after: last.saturating_duration_since(now),
             }
         } else {
             LlmError::AllCandidatesFailed { attempted, summary }
@@ -1341,6 +1341,7 @@ mod tests {
             attempted,
             summary,
             retry_after,
+            restart_retry_after,
         } = &err
         else {
             panic!("expected FallbackQuotaExhausted, got {err}");
@@ -1350,6 +1351,10 @@ mod tests {
             (DEFAULT_QUOTA_COOLDOWN - Duration::from_secs(1)..=DEFAULT_QUOTA_COOLDOWN)
                 .contains(retry_after),
             "the first eligible candidate accounts for each provider's retry hint"
+        );
+        assert!(
+            (Duration::from_secs(1199)..=Duration::from_secs(1200)).contains(restart_retry_after),
+            "a restart deadline must cover the candidate with the longer retry hint"
         );
         assert!(
             summary.contains("anthropic/claude: quota-exhausted 400"),

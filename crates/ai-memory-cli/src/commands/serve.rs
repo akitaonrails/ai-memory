@@ -1112,6 +1112,7 @@ async fn run_session_consolidation_worker(
                 Ok(()) => {
                     match consolidated {
                         SessionPageConsolidation::Consolidated(outcome) => {
+                            billing_cooldown.clear(jiff::Timestamp::now().as_microsecond());
                             info!(
                                 session = %session_id,
                                 generation,
@@ -1159,16 +1160,16 @@ async fn run_session_consolidation_worker(
             },
             Err(error) => {
                 let now = jiff::Timestamp::now().as_microsecond();
-                let billing_delay = match &error {
+                let billing_delays = match &error {
                     ai_memory_consolidate::ConsolidatorError::Llm(llm) => {
-                        billing_cooldown.billing_delay(llm)
+                        billing_cooldown.billing_delays(llm)
                     }
                     _ => None,
                 };
-                if let Some(delay) = billing_delay {
+                if let Some((delay, restart_delay)) = billing_delays {
                     // Persist the pause before settling the job. A crash in
                     // between leaves the existing expiring lease to recover.
-                    billing_cooldown.pause(now, delay);
+                    billing_cooldown.pause(now, delay, restart_delay);
                     tracing::warn!(
                         cooldown_secs = delay.as_secs(),
                         "billing exhaustion paused queued session consolidation",
@@ -1198,7 +1199,7 @@ async fn run_session_consolidation_worker(
                     || attempts >= max_attempts
                 {
                     None
-                } else if billing_delay.is_some() {
+                } else if billing_delays.is_some() {
                     // Route-level pause controls when this job can run. A
                     // reconfigured route can begin draining it immediately.
                     Some(now)
@@ -5698,7 +5699,7 @@ mod tests {
         MalformedRequest,
         /// The provider is rate-limiting: a later attempt may clear it.
         RateLimited,
-        BillingExhausted,
+        BillingExhausted(Option<Duration>),
     }
 
     /// Structured-output failure fixture: counts calls (proving the prompt
@@ -5767,10 +5768,10 @@ mod tests {
                         body: "rate limited".into(),
                         retry_after: None,
                     },
-                    ConsolidationFailure::BillingExhausted => LlmError::Provider {
+                    ConsolidationFailure::BillingExhausted(retry_after) => LlmError::Provider {
                         status: 429,
                         body: r#"{"error":{"code":"insufficient_quota"}}"#.into(),
-                        retry_after: Some(Duration::from_secs(1200)),
+                        retry_after,
                     },
                 };
                 Err(error)
@@ -6893,20 +6894,25 @@ mod tests {
         )
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
-        let rejected_provider = || {
+        let longer_hint = Some(Duration::from_secs(1200));
+        let rejected_provider = |retry_after| {
             Arc::new(FailingConsolidationLlm {
-                failure: ConsolidationFailure::BillingExhausted,
+                failure: ConsolidationFailure::BillingExhausted(retry_after),
                 calls: calls.clone(),
             })
         };
         let exhausted_route = || -> Arc<dyn LlmProvider> {
             if routed {
                 Arc::new(ai_memory_llm::FallbackLlmProvider::new(vec![
-                    ai_memory_llm::Candidate::new("primary", "test", rejected_provider()),
-                    ai_memory_llm::Candidate::new("fallback", "test", rejected_provider()),
+                    ai_memory_llm::Candidate::new(
+                        "primary",
+                        "test",
+                        rejected_provider(longer_hint),
+                    ),
+                    ai_memory_llm::Candidate::new("fallback", "test", rejected_provider(None)),
                 ]))
             } else {
-                rejected_provider()
+                rejected_provider(longer_hint)
             }
         };
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -6968,6 +6974,7 @@ mod tests {
             }
         };
         let requests_per_attempt = if routed { 2 } else { 1 };
+        let before_failure = jiff::Timestamp::now().as_microsecond();
         let (cancel, worker) = start_worker(
             &store,
             exhausted_route(),
@@ -6998,11 +7005,20 @@ mod tests {
         drop(store);
 
         let store = Store::open(tmp.path()).unwrap();
-        let (cancel, worker) = start_worker(
-            &store,
-            exhausted_route(),
-            test_consolidation_cooldown(&store),
+        let reopened_cooldown = test_consolidation_cooldown(&store);
+        assert!(
+            reopened_cooldown
+                .remaining(before_failure + 900_000_000)
+                .is_some(),
+            "reopening must preserve the longer hint even at the earlier candidate's deadline"
         );
+        assert!(
+            reopened_cooldown
+                .remaining(jiff::Timestamp::now().as_microsecond() + 1_200_000_000)
+                .is_none(),
+            "the longest applicable hint still gives the persisted pause a finite deadline"
+        );
+        let (cancel, worker) = start_worker(&store, exhausted_route(), reopened_cooldown);
         let (third, fourth) = tokio::join!(
             enqueue_test_session(&store, workspace, project),
             enqueue_test_session(&store, workspace, project),
@@ -7018,8 +7034,7 @@ mod tests {
 
         // Simulate the persisted deadline passing while the worker is stopped.
         let expire = || {
-            test_consolidation_cooldown(&store)
-                .pause(jiff::Timestamp::now().as_microsecond(), Duration::ZERO);
+            test_consolidation_cooldown(&store).clear(jiff::Timestamp::now().as_microsecond());
         };
         expire();
         let (cancel, worker) = start_worker(
@@ -7042,7 +7057,7 @@ mod tests {
         };
         let recovered_route: Arc<dyn LlmProvider> = if routed {
             Arc::new(ai_memory_llm::FallbackLlmProvider::new(vec![
-                ai_memory_llm::Candidate::new("primary", "test", rejected_provider()),
+                ai_memory_llm::Candidate::new("primary", "test", rejected_provider(longer_hint)),
                 ai_memory_llm::Candidate::new(
                     "fallback",
                     "recovered",
@@ -7112,7 +7127,7 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let rejected = Arc::new(FailingConsolidationLlm {
-            failure: ConsolidationFailure::BillingExhausted,
+            failure: ConsolidationFailure::BillingExhausted(None),
             calls: calls.clone(),
         });
         let chain = Arc::new(ai_memory_llm::FallbackLlmProvider::new(vec![
@@ -7174,8 +7189,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(row(), ("pending".to_owned(), attempts));
 
-        test_consolidation_cooldown(&store)
-            .pause(jiff::Timestamp::now().as_microsecond(), Duration::ZERO);
+        test_consolidation_cooldown(&store).clear(jiff::Timestamp::now().as_microsecond());
         let page = run_worker_once(
             &store,
             wiki,
