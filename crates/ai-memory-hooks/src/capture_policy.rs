@@ -7442,6 +7442,68 @@ mod tests {
         }
     }
 
+    /// A `bashEditDiff` that does not list its files as Claude Code documents
+    /// them, or lists more than it sends, cannot show the command missed every
+    /// ignored file: metadata-only under an active policy. A command that
+    /// names an ignored path still drops, and with no policy the call is kept.
+    #[test]
+    fn claude_code_shell_call_with_an_unreadable_edit_list_keeps_only_metadata() {
+        let policy = shell_policy();
+        let too_many: Vec<String> = (0..=MAX_BASH_EDIT_DIFF_FILES)
+            .map(|n| format!("/repo/src/{n}.rs"))
+            .collect();
+        for diff in [
+            json!("docs/adr/0001.md"),
+            json!({"changedFiles": "docs/adr/0001.md"}),
+            json!({"changedFiles": [{"path": "docs/adr/0001.md"}]}),
+            json!({"files": [{"hunks": []}]}),
+            json!({"files": {"filePath": "docs/adr/0001.md"}}),
+            json!({"changedFiles": too_many}),
+        ] {
+            let raw = bash_edit_diff("make gen", diff.clone());
+            assert_eq!(
+                policy
+                    .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::MetadataOnly,
+                "{diff}"
+            );
+            let named = bash_edit_diff("cat docs/adr/0001.md", diff.clone());
+            assert_eq!(
+                policy
+                    .inspect(AgentKind::ClaudeCode, &named, "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::Drop,
+                "{diff}"
+            );
+            assert_eq!(
+                CapturePolicy::resolve(CaptureSource::Absent, "/repo", None)
+                    .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::Keep,
+                "{diff}"
+            );
+        }
+        // At the cap, with each diffed file also in `changedFiles`, the list
+        // is whole.
+        let mut whole = too_many;
+        whole.pop();
+        let raw = bash_edit_diff(
+            "make gen",
+            json!({"changedFiles": whole, "files": [{"filePath": "/repo/src/0.rs", "hunks": []}]}),
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
     /// The drop/keep tables live in the shared fixture so the generated
     /// TypeScript matcher runs the very same vectors (#961).
     /// The shared Windows-spelling vectors. Adversarial: every Git Bash,
