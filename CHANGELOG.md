@@ -67,10 +67,6 @@ version in [`docs/changelog/`](docs/changelog/):
   location plugin reloads, while ignoring uncaptured sessions and preventing
   duplicate `session-end` deliveries. (#2485)
 
-- Fixed `backup-agents` to archive Gemini CLI project skills from the
-  repository's `.gemini/skills`, which `restore-agents` already wrote back.
-  (#2472)
-
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
