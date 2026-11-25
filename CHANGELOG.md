@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code tool observations store each built-in tool's output text
+  instead of the escaped JSON of its result object: Bash and PowerShell
+  output, a Read's file text, the patch of an Edit or an overwriting Write, a
+  NotebookEdit's cell source, and Grep and Glob matches one per line.
+  Full-text search now finds words on every line of a Bash or Read result, an
+  Edit no longer stores the whole original file in place of its patch, and an
+  image or PDF read no longer stores base64 (#2480).
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
