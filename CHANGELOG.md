@@ -16,6 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
   Providers that return only JSON continue to contribute estimates.
+  ([#2498](https://github.com/akitaonrails/ai-memory/pull/2498))
 
 - Reported measured session token usage for OpenCode 2 and Antigravity CLI:
   OpenCode 2's generated plugin records measured assistant message/step token
