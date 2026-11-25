@@ -5118,6 +5118,39 @@ mod tests {
         assert_eq!(claude_result("Write", documented), "(no output captured)");
     }
 
+    /// Claude Code's NotebookEdit result carries the whole notebook before and
+    /// after the edit, `original_file` and `updated_file`, beside the cell's
+    /// `new_source` (SDK `NotebookEditOutput`). The body keeps the new source,
+    /// or the error when the edit failed.
+    #[test]
+    fn claude_code_notebook_edit_result_keeps_the_cell_source() {
+        let edit = |error: Option<&str>| {
+            let mut response = serde_json::json!({
+                "new_source": "df.describe()  # NOTEBOOK_CELL_MARKER",
+                "old_source": "df.head()",
+                "cell_id": "c3",
+                "cell_type": "code",
+                "language": "python",
+                "edit_mode": "replace",
+                "notebook_path": "/repo/analysis.ipynb",
+                "original_file": "{\"cells\": [\"SENTINEL_ORIGINAL_NOTEBOOK\"]}",
+                "updated_file": "{\"cells\": [\"SENTINEL_UPDATED_NOTEBOOK\"]}",
+            });
+            if let Some(error) = error {
+                response["error"] = serde_json::json!(error);
+            }
+            response
+        };
+        assert_eq!(
+            claude_result("NotebookEdit", edit(None)),
+            "df.describe()  # NOTEBOOK_CELL_MARKER"
+        );
+        assert_eq!(
+            claude_result("NotebookEdit", edit(Some("Cell c3 not found"))),
+            "Cell c3 not found"
+        );
+    }
+
     /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
     /// with `outcome: error` and the error text, never the tool's arguments.
     #[test]
