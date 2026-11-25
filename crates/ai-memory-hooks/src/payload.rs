@@ -5168,6 +5168,43 @@ mod tests {
         );
     }
 
+    /// Claude Code's Grep returns matching lines in `content` (content mode)
+    /// or the matching files (file list and count modes), and Glob the
+    /// matching files (SDK `GrepOutput`, `GlobOutput`). The body keeps them
+    /// one per line rather than as a JSON array.
+    #[test]
+    fn claude_code_search_results_keep_their_matches() {
+        let content = serde_json::json!({
+            "mode": "content",
+            "numFiles": 1,
+            "filenames": ["src/a.rs"],
+            "content": "src/a.rs:3:fn GREP_MATCH_MARKER() {}\nsrc/a.rs:9:GREP_MATCH_MARKER();",
+            "numLines": 2,
+        });
+        assert_eq!(
+            claude_result("Grep", content),
+            "src/a.rs:3:fn GREP_MATCH_MARKER() {}\nsrc/a.rs:9:GREP_MATCH_MARKER();"
+        );
+        let files = serde_json::json!({
+            "mode": "files_with_matches",
+            "numFiles": 2,
+            "filenames": ["src/a.rs", "src/b.rs"],
+        });
+        assert_eq!(claude_result("Grep", files), "src/a.rs\nsrc/b.rs");
+        let glob = serde_json::json!({
+            "durationMs": 4,
+            "numFiles": 2,
+            "filenames": ["src/GLOB_MARKER.rs", "src/lib.rs"],
+            "truncated": false,
+        });
+        assert_eq!(
+            claude_result("Glob", glob),
+            "src/GLOB_MARKER.rs\nsrc/lib.rs"
+        );
+        let none = serde_json::json!({"durationMs": 1, "numFiles": 0, "filenames": [], "truncated": false});
+        assert_eq!(claude_result("Glob", none), "(no output captured)");
+    }
+
     /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
     /// with `outcome: error` and the error text, never the tool's arguments.
     #[test]
