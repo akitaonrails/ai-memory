@@ -1356,6 +1356,13 @@ fn claude_code_tool_text(raw: &serde_json::Value) -> Option<Option<String>> {
             "create" => Some(text("content")),
             _ => None,
         },
+        // A content search returns its matching lines in `content`; the
+        // file list and count modes name the matching files.
+        "Grep" => {
+            let files = response.get("filenames")?.as_array()?;
+            Some(text("content").or_else(|| joined_strings(files)))
+        }
+        "Glob" => Some(joined_strings(response.get("filenames")?.as_array()?)),
         // The cell's new source, or what went wrong, never `original_file`
         // and `updated_file`: the whole notebook before and after.
         "NotebookEdit" => {
@@ -1394,6 +1401,16 @@ fn structured_patch_text(
         }
     }
     Some((!lines.is_empty()).then(|| lines.join("\n")))
+}
+
+/// The strings of a JSON array, one per line; `None` when there are none.
+fn joined_strings(items: &[serde_json::Value]) -> Option<String> {
+    let joined = items
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Cursor's `postToolUseFailure` has no `tool_output`; what went wrong is in
