@@ -457,6 +457,15 @@ pub fn discover_assets(
                 ".gemini/skills",
                 "gemini/skills",
             )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::Plugin,
+                AgentAssetScope::Global,
+                &gemini_dir.join("plugins"),
+                ".gemini/plugins",
+                "gemini/plugins",
+            )?;
         }
         if want_project {
             push_if_file(

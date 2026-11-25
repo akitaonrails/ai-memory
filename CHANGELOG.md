@@ -42,6 +42,11 @@ version in [`docs/changelog/`](docs/changelog/):
   repository's `.gemini/skills`, which `restore-agents` already wrote back.
   (#2472)
 
+### Fixed
+
+- Fixed `backup-agents` to archive Gemini CLI plugins from `~/.gemini/plugins`,
+  the second plugin root the asset matrix lists beside Antigravity's. (#2477)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
