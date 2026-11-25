@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A Cursor `stop` whose `status` is `aborted` is stored as an interrupted
+  turn end, and one whose status is `error` as a failed turn end, as Claude
+  Code's `StopFailure` and Codex's `Interrupt` already are. Cursor has no
+  separate events for them, so both were stored like a turn that completed
+  (#2481).
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
