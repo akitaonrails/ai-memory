@@ -743,6 +743,8 @@ struct EventQuery {
     q: String,
     #[serde(default = "default_event_limit")]
     limit: usize,
+    #[serde(default)]
+    before_sequence: Option<i64>,
 }
 
 const fn default_event_limit() -> usize {
@@ -1133,16 +1135,28 @@ async fn search_events(
             return scope_refusal(failure);
         }
     }
-    match state
-        .reader
-        .search_workstream_events(
-            workstream_id,
-            query.q,
-            query.limit.clamp(1, 100),
-            state.sanitizer.clone(),
-        )
-        .await
-    {
+    if query.before_sequence.is_some() && !query.q.trim().is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "before_sequence cannot be combined with a text query",
+        );
+    }
+    let limit = query.limit.clamp(1, 100);
+    let read = match query.before_sequence {
+        Some(cursor) => {
+            state
+                .reader
+                .workstream_events_before(workstream_id, cursor, limit, state.sanitizer.clone())
+                .await
+        }
+        None => {
+            state
+                .reader
+                .search_workstream_events(workstream_id, query.q, limit, state.sanitizer.clone())
+                .await
+        }
+    };
+    match read {
         Ok(mut events) => {
             for event in &mut events {
                 event.native_session_id =

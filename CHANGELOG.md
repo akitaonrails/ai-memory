@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added `workstream-search --before-sequence` and the `before_sequence` query
+  parameter on `GET /workstream/{id}/events`, so a ledger can be read backwards
+  without a text query. (#2491)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

@@ -2531,6 +2531,33 @@ pub(crate) fn search_events(
     Ok(events)
 }
 
+/// Return the page of events strictly older than `before_sequence`, newest
+/// first, without a text query.
+pub(crate) fn events_before(
+    conn: &Connection,
+    workstream_id: WorkstreamId,
+    before_sequence: i64,
+    limit: usize,
+    sanitizer: &Sanitizer,
+) -> StoreResult<Vec<WorkstreamEvent>> {
+    let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
+    let mut statement = conn.prepare(
+        "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at, \
+                source_record_id, metadata_json \
+         FROM workstream_events WHERE workstream_id = ?1 AND sequence < ?2 \
+         ORDER BY sequence DESC LIMIT ?3",
+    )?;
+    let rows = statement.query_map(
+        params![workstream_id.as_bytes(), before_sequence, limit],
+        read_event_row,
+    )?;
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(stored_event(row?, sanitizer)?);
+    }
+    Ok(events)
+}
+
 /// Drop the `title:` / `body:` / `content:` column prefixes the search
 /// surface accepts: the ledger's FTS table has only a `content` column, so a
 /// kept `title:` would fail with "no such column". Only a prefix that starts

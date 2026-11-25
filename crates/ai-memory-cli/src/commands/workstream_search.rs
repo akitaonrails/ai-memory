@@ -14,12 +14,15 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
     let endpoint = ServerEndpoint::for_checkout(config).await?;
     let path = format!("/workstream/{}/events", args.workstream_id);
     let limit = args.limit.to_string();
-    let mut events: Vec<WorkstreamEvent> = get_json(
-        &endpoint,
-        &path,
-        &[("q", args.query.as_str()), ("limit", limit.as_str())],
-    )
-    .await?;
+    if args.before_sequence.is_some() && !args.query.trim().is_empty() {
+        anyhow::bail!("before_sequence cannot be combined with a text query");
+    }
+    let before = args.before_sequence.map(|cursor| cursor.to_string());
+    let mut query: Vec<(&str, &str)> = vec![("q", args.query.as_str()), ("limit", limit.as_str())];
+    if let Some(before) = &before {
+        query.push(("before_sequence", before.as_str()));
+    }
+    let mut events: Vec<WorkstreamEvent> = get_json(&endpoint, &path, &query).await?;
     let sanitizer = Sanitizer::new(&config.sanitize)?;
     for event in &mut events {
         event.native_session_id =
