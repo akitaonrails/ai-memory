@@ -29,40 +29,22 @@ version in [`docs/changelog/`](docs/changelog/):
   `install-skills` and `install-hooks` write to. A backup no longer archives
   the default `~/.grok` or `~/.kiro` in their place, and a restore writes the
   entries back under the destination's home. (#2467)
-
-### Fixed
-
 - Fixed `backup-agents` to archive OpenCode global skills from
   `~/.config/opencode/skills`, which `restore-agents` already restored to the
   OpenCode config root. (#2469)
-
-### Fixed
-
 - Fixed `backup-agents` to archive Gemini CLI project skills from the
   repository's `.gemini/skills`, which `restore-agents` already wrote back.
   (#2472)
-
-### Fixed
-
 - Fixed `backup-agents` to archive Gemini CLI plugins from `~/.gemini/plugins`,
   the second plugin root the asset matrix lists beside Antigravity's. (#2477)
-
-### Fixed
-
 - Kept spooled hook events queued instead of charging a retry when a request
   deadline shorter than the 2 s connect budget expires while still connecting.
   (#2465)
-
-### Fixed
-
 - A Cursor `stop` whose `status` is `aborted` is stored as an interrupted
   turn end, and one whose status is `error` as a failed turn end, as Claude
   Code's `StopFailure` and Codex's `Interrupt` already are. Cursor has no
   separate events for them, so both were stored like a turn that completed
   (#2481).
-
-### Fixed
-
 - Claude Code tool observations store each built-in tool's output text
   instead of the escaped JSON of its result object: Bash and PowerShell
   output, a Read's file text, the patch of an Edit or an overwriting Write, a
@@ -70,9 +52,6 @@ version in [`docs/changelog/`](docs/changelog/):
   Full-text search now finds words on every line of a Bash or Read result, an
   Edit no longer stores the whole original file in place of its patch, and an
   image or PDF read no longer stores base64 (#2480).
-
-### Fixed
-
 - `[capture] ignore_paths` now holds for files a Claude Code shell command
   changed without naming them. Claude Code 2.1.269 and later lists those files
   and their diffs in `tool_response.bashEditDiff`, so a `make gen` that
@@ -80,9 +59,6 @@ version in [`docs/changelog/`](docs/changelog/):
   changed an ignored file is now dropped, in its own checkout or another one,
   and under an active policy a list that does not fit the documented shape
   keeps only metadata (#2479).
-
-### Fixed
-
 - OpenCode 2 plugin now persists lightweight per-session ownership markers on
   disk so `session.deleted` still emits `session-end` (preserving subagent
   `agent_id`, location ownership, and `session.moved` rebinding) after the
