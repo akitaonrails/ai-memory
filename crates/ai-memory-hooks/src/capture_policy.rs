@@ -7516,6 +7516,45 @@ mod tests {
         );
     }
 
+    /// A file a Claude Code shell call changed may sit in another checkout,
+    /// whose own `ignore_paths` then apply, so the lookup names it like a
+    /// file tool's target. Controls: another agent's payload, and a list
+    /// that does not fit Claude Code's documented shape, name only the
+    /// command's own locations.
+    #[test]
+    fn capture_lookup_locations_name_the_files_a_claude_code_call_changed() {
+        let raw = bash_edit_diff(
+            "make gen",
+            json!({
+                "changedFiles": ["/work/a/secrets.env", "/work/b/src/gen.rs"],
+                "files": [{"filePath": "/work/c/notes.md", "hunks": []}],
+            }),
+        );
+        let locations = |agent, raw: &Value| {
+            location_paths(capture_lookup_locations(agent, raw, "/work/b", None))
+        };
+        assert_eq!(
+            locations(AgentKind::ClaudeCode, &raw),
+            Some(vec![
+                "/work/b".to_owned(),
+                "/work/a/secrets.env".to_owned(),
+                "/work/b/src/gen.rs".to_owned(),
+                "/work/c/notes.md".to_owned(),
+            ])
+        );
+        assert_eq!(
+            locations(AgentKind::Codex, &raw),
+            Some(vec!["/work/b".to_owned()])
+        );
+        assert_eq!(
+            locations(
+                AgentKind::ClaudeCode,
+                &bash_edit_diff("make gen", json!({"changedFiles": [7]}))
+            ),
+            Some(vec!["/work/b".to_owned()])
+        );
+    }
+
     /// The drop/keep tables live in the shared fixture so the generated
     /// TypeScript matcher runs the very same vectors (#961).
     /// The shared Windows-spelling vectors. Adversarial: every Git Bash,
