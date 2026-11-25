@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `[capture] ignore_paths` now holds for files a Claude Code shell command
+  changed without naming them. Claude Code 2.1.269 and later lists those files
+  and their diffs in `tool_response.bashEditDiff`, so a `make gen` that
+  rewrote an ignored file stored the file's old and new lines. A call that
+  changed an ignored file is now dropped, in its own checkout or another one,
+  and under an active policy a list that does not fit the documented shape
+  keeps only metadata (#2479).
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
