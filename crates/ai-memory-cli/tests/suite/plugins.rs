@@ -368,6 +368,43 @@ mod launcher {
         assert_eq!(sb.spooled().len(), 1);
     }
 
+    /// Front door 1 (adversarial): a Bash call whose command names no path
+    /// but which rewrote an ignored file, as Claude Code 2.1.269+ reports in
+    /// `tool_response.bashEditDiff`, never reaches the spool with that file's
+    /// diff. Control: the same call rewriting a public file is captured.
+    #[test]
+    fn ignore_paths_hold_for_a_file_a_bash_call_changed() {
+        let sb = Sandbox::new();
+        sb.marker("[capture]\nignore_paths = [\"secret/**\"]\n");
+        let bash = |file: &str| {
+            let path = sb.repo.join(file);
+            json!({
+                "session_id": "plugin-s", "cwd": sb.repo, "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "make gen"},
+                "tool_response": {
+                    "stdout": "generated\n", "stderr": "", "interrupted": false,
+                    "bashEditDiff": {
+                        "changedFiles": [path],
+                        "files": [{"filePath": path, "hunks": [{
+                            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+                            "lines": ["-OLD_LINE_SENTINEL", "+NEW_LINE_SENTINEL"],
+                        }]}],
+                        "moreFiles": 0,
+                    },
+                },
+            })
+        };
+        sb.launch("post-tool-use", &bash("secret/token.txt"), &[]);
+        assert!(
+            sb.spooled().is_empty(),
+            "an ignored file's diff reached the spool: {:?}",
+            sb.spooled()
+        );
+        sb.launch("post-tool-use", &bash("src/gen.rs"), &[]);
+        assert_eq!(sb.spooled().len(), 1);
+    }
+
     /// Front door 2 (adversarial): under allowlist capture mode a checkout
     /// without a marker emits nothing through the plugin, prompts included.
     /// Control: the same event in a marked checkout is captured.

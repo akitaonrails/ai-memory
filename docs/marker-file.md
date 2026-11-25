@@ -830,6 +830,19 @@ generated integrations match file-tool and shell paths without regard to case
 decomposed accent like the composed letter, as its filesystem does; other POSIX
 hosts compare case-sensitively, and Windows paths always ignore ASCII case.
 
+Claude Code 2.1.269 and later can also report the files a `Bash` command
+changed, in `tool_response.bashEditDiff` (its `changedFiles` and the
+`filePath` of each diff; see the Bash tool in
+[Claude Code's hooks reference](https://code.claude.com/docs/en/hooks)).
+Those paths are matched like file-tool paths, so a command that names no
+ignored path but rewrote one (`make gen`, `npm run codegen`) is **dropped**,
+with its output and the diff of the ignored file. A list that is not in that
+shape, or that names more than the 200 files Claude Code sends, makes the call
+**metadata-only** under an active policy. Claude Code writes the list only in
+some permission modes or with its `bashEditDiffEnabled` setting, leaves out
+files Git ignores, and calls it best effort, so a change it does not list is
+not matched.
+
 In a Windows session (the event's `cwd` is a drive or UNC path), a file-tool
 path, shell argument or `workdir` is read as the file Windows opens, so other
 spellings of an ignored file match its pattern too: Git Bash, MSYS2 and Cygwin
@@ -869,8 +882,9 @@ after leading whitespace as Codex reads them), every directory, file and
 path-like glob argument of a search/list tool (Grep, Glob, LS, `grep_search`,
 `glob`, `list_directory`, `search_file_content`, Hermes `search_files` with its
 `file_glob` filter, and the other agents' equivalents; a grep `pattern` is a
-regular expression and is not read), and every shell argument that spells a
-path (one with a separator, after `~/` expansion) plus the tool's `workdir`, the native hook and the
+regular expression and is not read), every shell argument that spells a
+path (one with a separator, after `~/` expansion) plus the tool's `workdir`,
+and every file a Claude Code shell call lists as changed, the native hook and the
 generated integrations find the marker that governs that location, by the
 same lexical walk as the event's own, and when it is another checkout's (or the
 event's directory has none) apply that marker's policy as well: `cat
