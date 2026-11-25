@@ -530,6 +530,108 @@ fn gemini_assets_follow_gemini_cli_home_on_backup_and_restore() {
     assert!(!restored_home.path().join(".gemini").exists());
 }
 
+#[test]
+fn grok_assets_follow_grok_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let grok_home = home.path().join("active Grok home");
+    let fixtures = [
+        ("config.toml", "model = \"grok-code\"\n"),
+        ("skills/example/SKILL.md", "# Example Grok skill"),
+    ];
+    for (relative, body) in fixtures {
+        let path = grok_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_skill = home.path().join(".grok/skills/stale/SKILL.md");
+    fs::create_dir_all(inactive_skill.parent().unwrap()).unwrap();
+    fs::write(inactive_skill, "# Stale skill").unwrap();
+    let project_config = "model = \"grok-project\"\n";
+    let project_config_path = project.path().join(".grok/config.toml");
+    fs::create_dir_all(project_config_path.parent().unwrap()).unwrap();
+    fs::write(&project_config_path, project_config).unwrap();
+
+    let archive = project.path().join("grok-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("GROK_HOME", &grok_home)
+        .args(backup_agents_args(&archive, "grok"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Grok home");
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .env("GROK_HOME", &destination)
+        .args(restore_agents_args(&archive, "grok"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(restored_project.path().join(".grok/config.toml")).unwrap(),
+        project_config,
+        "a project-scoped Grok config stays under the project"
+    );
+    assert!(!restored_home.path().join(".grok").exists());
+    assert!(!destination.join("skills/stale").exists());
+}
+
+#[test]
+fn kiro_cli_assets_follow_kiro_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let kiro_home = home.path().join("active Kiro home");
+    let fixtures = [
+        ("settings/mcp.json", r#"{"mcpServers":{}}"#),
+        ("agents/example.json", r#"{"name":"example"}"#),
+    ];
+    for (relative, body) in fixtures {
+        let path = kiro_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_agent = home.path().join(".kiro/agents/stale.json");
+    fs::create_dir_all(inactive_agent.parent().unwrap()).unwrap();
+    fs::write(inactive_agent, r#"{"name":"stale"}"#).unwrap();
+
+    let archive = project.path().join("kiro-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("KIRO_HOME", &kiro_home)
+        .args(backup_agents_args(&archive, "kiro-cli"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Kiro home");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("KIRO_HOME", &destination)
+        .args(restore_agents_args(&archive, "kiro-cli"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert!(!restored_home.path().join(".kiro").exists());
+    assert!(!destination.join("agents/stale.json").exists());
+}
+
 /// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default
 /// `~/.copilot/skills`) and repository skills from `.github/skills`, the
 /// roots `install-skills --agent copilot-cli` writes:
@@ -1726,6 +1828,48 @@ fn restore_agents_rejects_a_symlinked_destination_parent() {
         assert!(!restore.status.success());
         assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
         assert!(!outside.path().join(name).exists());
+    }
+}
+
+/// A relocated Grok or Kiro home is the base the symlink check starts from:
+/// a symlinked directory inside `GROK_HOME` or `KIRO_HOME` still refuses the
+/// restore, and nothing reaches the directory it points to.
+#[cfg(unix)]
+#[test]
+fn restore_agents_rejects_a_symlinked_parent_inside_a_relocated_home() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = cli_test_lock();
+    for (agent, variable, dir, linked, below) in [
+        ("grok", "GROK_HOME", ".grok", "skills", "demo/SKILL.md"),
+        ("kiro-cli", "KIRO_HOME", ".kiro", "agents", "demo.json"),
+    ] {
+        let source_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let asset = source_home.path().join(dir).join(linked).join(below);
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        fs::write(&asset, "{}").unwrap();
+        let archive = project.path().join("backup.tar.gz");
+        let backup = command_with_env(source_home.path(), project.path())
+            .args(backup_agents_args(&archive, agent))
+            .output()
+            .unwrap();
+        assert_success(&backup, "backup");
+
+        let restore_home = tempfile::tempdir().unwrap();
+        let relocated = restore_home.path().join("relocated home");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(&relocated).unwrap();
+        symlink(outside.path(), relocated.join(linked)).unwrap();
+        let restore = command_with_env(restore_home.path(), project.path())
+            .env(variable, &relocated)
+            .args(restore_agents_args(&archive, agent))
+            .output()
+            .unwrap();
+
+        assert!(!restore.status.success());
+        assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
+        assert!(!outside.path().join(below).exists());
     }
 }
 
