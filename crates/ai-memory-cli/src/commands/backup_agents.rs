@@ -722,7 +722,8 @@ pub fn discover_assets(
     // 7. Grok
     if filter_agent(AgentKind::Grok) {
         if want_global {
-            let grok_dir = home.join(".grok");
+            let grok_dir =
+                agent_config_home(env.var_os("GROK_HOME")).unwrap_or_else(|| home.join(".grok"));
             push_if_file(
                 &mut assets,
                 AgentKind::Grok,
@@ -766,7 +767,8 @@ pub fn discover_assets(
 
     // 8. Kiro CLI
     if filter_agent(AgentKind::KiroCli) && want_global {
-        let kiro_dir = home.join(".kiro");
+        let kiro_dir =
+            agent_config_home(env.var_os("KIRO_HOME")).unwrap_or_else(|| home.join(".kiro"));
         push_if_file(
             &mut assets,
             AgentKind::KiroCli,

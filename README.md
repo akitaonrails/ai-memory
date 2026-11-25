@@ -664,6 +664,8 @@ readable wiki pages; the next session starts with a handoff.
   after reviewing the active skills, plugins, instructions, and destinations.
   Set `GEMINI_CLI_HOME` when backing up or restoring a relocated Gemini CLI
   profile so each command uses that home for global settings and skills.
+  `GROK_HOME` and `KIRO_HOME` do the same for Grok's global `config.toml` and
+  skills and for Kiro CLI's `settings/mcp.json` and agent configs.
 
 Search modes, entities, feedback, briefings, and the web API are covered in [`docs/usage.md`](docs/usage.md) and
 [`docs/use-cases.md`](docs/use-cases.md).

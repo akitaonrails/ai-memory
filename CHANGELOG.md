@@ -21,6 +21,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `cap + 64 KiB` scrub window for multi-MiB tool responses.
   (GHSA-qxwf-7hw8-qw28)
 
+### Fixed
+
+- Fixed `backup-agents` and `restore-agents` to honor `GROK_HOME` for Grok's
+  global `config.toml` and skills and `KIRO_HOME` for Kiro CLI's
+  `settings/mcp.json` and agent configs, the homes `install-mcp`,
+  `install-skills` and `install-hooks` write to. A backup no longer archives
+  the default `~/.grok` or `~/.kiro` in their place, and a restore writes the
+  entries back under the destination's home. (#2467)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
