@@ -35,6 +35,62 @@ version in [`docs/changelog/`](docs/changelog/):
   `O_NOFOLLOW | O_NONBLOCK` opens, and are never read from repository
   `.ai-memory.toml` files or hook payloads. (#2453)
 
+## [3.6.2] - 2026-11-25
+
+### Security
+
+- Bypassed the `cap + 64 KiB` pre-scrub prefix window in hook `durable_body`
+  whenever `[sanitize].extra_patterns` is configured, so custom regexes that
+  depend on context past the overlap window (such as multi-line delimited
+  blocks or end-anchored `$` patterns) still redact secrets inside stored hook
+  bodies before truncation. Built-in-only deployments keep the bounded
+  `cap + 64 KiB` scrub window for multi-MiB tool responses.
+  (GHSA-qxwf-7hw8-qw28)
+
+### Fixed
+
+- Fixed `backup-agents` and `restore-agents` to honor `GROK_HOME` for Grok's
+  global `config.toml` and skills and `KIRO_HOME` for Kiro CLI's
+  `settings/mcp.json` and agent configs, the homes `install-mcp`,
+  `install-skills` and `install-hooks` write to. A backup no longer archives
+  the default `~/.grok` or `~/.kiro` in their place, and a restore writes the
+  entries back under the destination's home. (#2467)
+- Fixed `backup-agents` to archive OpenCode global skills from
+  `~/.config/opencode/skills`, which `restore-agents` already restored to the
+  OpenCode config root. (#2469)
+- Fixed `backup-agents` to archive Gemini CLI project skills from the
+  repository's `.gemini/skills`, which `restore-agents` already wrote back.
+  (#2472)
+- Fixed `backup-agents` to archive Gemini CLI plugins from `~/.gemini/plugins`,
+  the second plugin root the asset matrix lists beside Antigravity's. (#2477)
+- Kept spooled hook events queued instead of charging a retry when a request
+  deadline shorter than the 2 s connect budget expires while still connecting.
+  (#2465)
+- A Cursor `stop` whose `status` is `aborted` is stored as an interrupted
+  turn end, and one whose status is `error` as a failed turn end, as Claude
+  Code's `StopFailure` and Codex's `Interrupt` already are. Cursor has no
+  separate events for them, so both were stored like a turn that completed
+  (#2481).
+- Claude Code tool observations store each built-in tool's output text
+  instead of the escaped JSON of its result object: Bash and PowerShell
+  output, a Read's file text, the patch of an Edit or an overwriting Write, a
+  NotebookEdit's cell source, and Grep and Glob matches one per line.
+  Full-text search now finds words on every line of a Bash or Read result, an
+  Edit no longer stores the whole original file in place of its patch, and an
+  image or PDF read no longer stores base64 (#2480).
+- `[capture] ignore_paths` now holds for files a Claude Code shell command
+  changed without naming them. Claude Code 2.1.269 and later lists those files
+  and their diffs in `tool_response.bashEditDiff`, so a `make gen` that
+  rewrote an ignored file stored the file's old and new lines. A call that
+  changed an ignored file is now dropped, in its own checkout or another one,
+  and under an active policy a list that does not fit the documented shape
+  keeps only metadata (#2479).
+- OpenCode 2 plugin now persists lightweight per-session ownership markers on
+  disk so `session.deleted` still emits `session-end` (preserving subagent
+  `agent_id`, location ownership, and `session.moved` rebinding) after the
+  location plugin reloads, while ignoring uncaptured sessions and preventing
+  duplicate `session-end` deliveries. (#2485)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
@@ -6431,7 +6487,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.2...HEAD
+[3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
 [3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
 [3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
 [3.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.2

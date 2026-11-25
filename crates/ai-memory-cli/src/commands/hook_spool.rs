@@ -28,7 +28,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
-use super::hook_capture::{BatchOutcome, PostOutcome, build_client, post_batch, post_hook};
+use super::hook_capture::{
+    BatchOutcome, CONNECT_TIMEOUT, PostOutcome, build_client, build_client_with_connect_timeout,
+    post_batch, post_batch_with_connect_timeout, post_hook_with_connect_timeout,
+};
 
 /// Default number of failed drain passes before dropping an event — bounds
 /// retries of an event a server keeps refusing or erroring on. An
@@ -1467,6 +1470,27 @@ pub async fn drain_with_live_token(
     live_token: Option<&str>,
     max_attempts: MaxAttempts,
 ) -> DrainResult {
+    drain_with_live_token_and_connect_timeout(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        live_token,
+        max_attempts,
+        CONNECT_TIMEOUT,
+    )
+    .await
+}
+
+async fn drain_with_live_token_and_connect_timeout(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    live_token: Option<&str>,
+    max_attempts: MaxAttempts,
+    connect_timeout: Duration,
+) -> DrainResult {
     let recovery = match recover_stranded_temp_entries(spool, now_ms()) {
         Ok(recovery) => recovery,
         Err(error) => {
@@ -1523,7 +1547,7 @@ pub async fn drain_with_live_token(
     }
     files.sort();
 
-    let client = build_client();
+    let client = build_client_with_connect_timeout(connect_timeout);
     let started = Instant::now();
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut profile_tokens = ProfileTokens::new(data_dir);
@@ -1660,7 +1684,16 @@ pub async fn drain_with_live_token(
             };
             let batch_timeout =
                 batch_request_timeout(per_event_timeout, remaining_budget, chunk.len());
-            match post_batch(&client, &base, &payload, bearer.as_deref(), batch_timeout).await {
+            match post_batch_with_connect_timeout(
+                &client,
+                &base,
+                &payload,
+                bearer.as_deref(),
+                batch_timeout,
+                connect_timeout,
+            )
+            .await
+            {
                 BatchOutcome::Detailed {
                     outcomes,
                     failed_index,
@@ -1758,12 +1791,13 @@ pub async fn drain_with_live_token(
                         }
                         let item_bearer =
                             entry_bearer(entry, &client, data_dir, &mut oidc_cache).await;
-                        match post_hook(
+                        match post_hook_with_connect_timeout(
                             &client,
                             &entry.url,
                             &entry.body,
                             item_bearer.as_deref(),
                             per_event_timeout,
+                            connect_timeout,
                         )
                         .await
                         {
@@ -1806,12 +1840,13 @@ pub async fn drain_with_live_token(
                                 );
                                 let retried = match retry {
                                     Some(token) => Some(
-                                        post_hook(
+                                        post_hook_with_connect_timeout(
                                             &client,
                                             &entry.url,
                                             &entry.body,
                                             Some(&token),
                                             per_event_timeout,
+                                            connect_timeout,
                                         )
                                         .await,
                                     ),
@@ -1870,12 +1905,13 @@ pub async fn drain_with_live_token(
                     // keeps today's charging semantics for the entry tried.
                     let mut reroot_answered = false;
                     if let Some(rerooted) = retry {
-                        match post_batch(
+                        match post_batch_with_connect_timeout(
                             &client,
                             &rerooted,
                             &payload,
                             bearer.as_deref(),
                             batch_timeout,
+                            connect_timeout,
                         )
                         .await
                         {
@@ -1969,8 +2005,15 @@ pub async fn drain_with_live_token(
                     );
                     let mut credential_refused = true;
                     if let Some(token) = retry {
-                        match post_batch(&client, &base, &payload, Some(&token), batch_timeout)
-                            .await
+                        match post_batch_with_connect_timeout(
+                            &client,
+                            &base,
+                            &payload,
+                            Some(&token),
+                            batch_timeout,
+                            connect_timeout,
+                        )
+                        .await
                         {
                             BatchOutcome::Detailed { outcomes, .. } => {
                                 settle_retried_detailed(&chunk, &outcomes, &mut result);
@@ -2048,12 +2091,13 @@ pub async fn drain_with_live_token(
         } else {
             // Per-event fallback (server without /hook/batch). Mirrors the
             // original drain's per-entry semantics exactly.
-            match post_hook(
+            match post_hook_with_connect_timeout(
                 &client,
                 &entry.url,
                 &entry.body,
                 bearer.as_deref(),
                 per_event_timeout,
+                connect_timeout,
             )
             .await
             {
@@ -2092,12 +2136,13 @@ pub async fn drain_with_live_token(
                     );
                     let retried = match retry {
                         Some(token) => Some(
-                            post_hook(
+                            post_hook_with_connect_timeout(
                                 &client,
                                 &entry.url,
                                 &entry.body,
                                 Some(&token),
                                 per_event_timeout,
+                                connect_timeout,
                             )
                             .await,
                         ),
@@ -4018,9 +4063,14 @@ mod tests {
 
         // #2452: a server that accepts TCP + HTTP request and sleeps past
         // `per_event_timeout` on a poison entry must charge `attempts`, drop
-        // the poison entry at `MAX_ATTEMPTS`, and then drain subsequent
-        // entries — while a connection-refused endpoint still leaves
-        // `attempts == 0` (#493).
+        // the poison entry at the limit, and then drain subsequent entries —
+        // while a connection-refused endpoint still leaves `attempts == 0`
+        // (#493). Inject a short connect timeout so the batch deadline outlasts
+        // it (#2465) while keeping the single-endpoint 2-item batch test fast.
+        const LIMIT: u32 = 2;
+        let connect_timeout = Duration::from_millis(50);
+        let per_event_timeout = Duration::from_millis(60);
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let slow_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4029,8 +4079,8 @@ mod tests {
                     let buf = read_test_http_request(&mut stream).await;
                     let req = String::from_utf8_lossy(&buf);
                     if req.contains("event=poison") {
-                        // Accept and hold past the client's request timeout.
-                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        // Accept and hold past the client's 2-item batch timeout (120ms).
+                        tokio::time::sleep(Duration::from_millis(400)).await;
                         let _ = stream
                             .write_all(
                                 b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"accepted\":1}",
@@ -4060,34 +4110,39 @@ mod tests {
             format!("http://{slow_addr}/hook?event=healthy"),
         );
 
-        for pass in 1..=MAX_ATTEMPTS {
-            let r = drain_with_max_attempts(
+        for pass in 1..=LIMIT {
+            let r = drain_with_live_token_and_connect_timeout(
                 &spool,
                 tmp.path(),
                 Duration::from_secs(2),
-                Duration::from_millis(80),
-                MaxAttempts::new(MAX_ATTEMPTS),
+                per_event_timeout,
+                None,
+                MaxAttempts::new(LIMIT),
+                connect_timeout,
             )
             .await;
             assert_eq!(
                 r.dropped,
-                usize::from(pass == MAX_ATTEMPTS),
-                "poison entry must be dropped exactly at MAX_ATTEMPTS (pass {pass})"
+                usize::from(pass == LIMIT),
+                "poison entry must be dropped exactly at the limit (pass {pass})"
             );
-            if pass < MAX_ATTEMPTS {
+            if pass < LIMIT {
                 // Only the head poison entry is charged; the trailing healthy
-                // entry stays at 0 attempts.
+                // entry in the same 2-item batch stays at 0 attempts.
                 assert_eq!(sorted_attempts(&spool), vec![pass, 0]);
             }
         }
 
-        // Next pass drains the healthy entry now that the poison head is gone.
-        let final_pass = drain_with_max_attempts(
+        // Next pass drains the healthy entry from the same endpoint now that
+        // the poison head is gone.
+        let final_pass = drain_with_live_token_and_connect_timeout(
             &spool,
             tmp.path(),
             Duration::from_secs(2),
             Duration::from_millis(500),
+            None,
             MaxAttempts::new(MAX_ATTEMPTS),
+            connect_timeout,
         )
         .await;
         assert_eq!(final_pass.sent, 1);
@@ -4104,12 +4159,14 @@ mod tests {
             format!("http://{dead_addr}/hook?event=outage"),
         );
         for _ in 0..(MAX_ATTEMPTS + 1) {
-            let r = drain_with_max_attempts(
+            let r = drain_with_live_token_and_connect_timeout(
                 &spool,
                 tmp.path(),
                 Duration::from_secs(2),
                 Duration::from_millis(100),
+                None,
                 MaxAttempts::new(MAX_ATTEMPTS),
+                connect_timeout,
             )
             .await;
             assert_eq!(r.dropped, 0);

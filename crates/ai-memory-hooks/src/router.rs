@@ -5448,32 +5448,39 @@ fn is_subagent_compaction(env: &HookEnvelope) -> bool {
 }
 
 /// Extra bytes past `durable_body_cap(event)` included in the prefix passed to
-/// [`Sanitizer::scrub`] (#2452).
+/// [`Sanitizer::scrub`] when `[sanitize].extra_patterns` is empty (#2452).
 ///
-/// Any secret straddling the durable-body cap (API keys, JWTs, bearer tokens,
-/// env-var assignments, complete PEM/PGP private-key blocks, and unterminated
-/// PEM blocks) completes well inside 64 KiB past the cut, while multi-MiB tool
-/// outputs no longer run every sanitizer regex and shadow-view pass over
-/// megabytes that `truncate_utf8_bytes` would immediately discard.
+/// Any built-in secret straddling the durable-body cap (API keys, JWTs, bearer
+/// tokens, env-var assignments, complete PEM/PGP private-key blocks, and
+/// unterminated PEM blocks) completes well inside 64 KiB past the cut, while
+/// multi-MiB tool outputs no longer run every built-in sanitizer regex and
+/// shadow-view pass over megabytes that `truncate_utf8_bytes` would
+/// immediately discard. When `[sanitize].extra_patterns` is non-empty,
+/// `durable_body` bypasses this pre-slice and scrubs the full excerpt so
+/// custom patterns depending on context past `cap + 64 KiB` still match.
 const DURABLE_BODY_SCRUB_OVERLAP_BYTES: usize = 64 * 1024;
 
-/// Durable body for a hook observation: scrub a bounded UTF-8 prefix of the
-/// excerpt (`cap + DURABLE_BODY_SCRUB_OVERLAP_BYTES`) first, then apply the
-/// per-event ceiling to the redacted text.
+/// Durable body for a hook observation: scrub first, then apply the per-event
+/// ceiling to the redacted text.
 ///
 /// The cap used to run inside excerpt extraction in `payload`, before the
 /// sanitizer ever saw the text — a secret straddling the cutoff was cut in
 /// half, leaving a prefix too short to match a pattern, stored in clear text
-/// (#1114). Scrubbing `cap + 64 KiB` preserves full straddling-secret
-/// redaction (including PEM private keys) without spending seconds scanning
-/// multi-MiB tool responses that are immediately truncated to `cap` (#2452).
+/// (#1114). When `[sanitize].extra_patterns` is empty, scrubbing a bounded
+/// UTF-8 prefix (`cap + DURABLE_BODY_SCRUB_OVERLAP_BYTES`) preserves full
+/// straddling-secret redaction for all built-in rules (including PEM private
+/// keys) without spending seconds scanning multi-MiB tool responses that are
+/// immediately truncated to `cap` (#2452). When operator `extra_patterns` are
+/// configured (`sanitizer.has_extra_patterns()`), the bounded pre-slice is
+/// bypassed and the full excerpt is scrubbed so multi-line delimited blocks or
+/// end-anchored (`$`) custom rules cannot miss context past `cap + 64 KiB`.
 fn durable_body(event: HookEvent, excerpt: Option<&str>, sanitizer: &Sanitizer) -> String {
     let Some(excerpt) = excerpt else {
         return String::new();
     };
     let cap = durable_body_cap(event);
     let window_limit = cap.saturating_add(DURABLE_BODY_SCRUB_OVERLAP_BYTES);
-    let window = if excerpt.len() <= window_limit {
+    let window = if excerpt.len() <= window_limit || sanitizer.has_extra_patterns() {
         excerpt
     } else {
         &excerpt[..excerpt.floor_char_boundary(window_limit)]
@@ -28797,6 +28804,153 @@ pub(crate) mod tests {
                 body.len()
             );
         }
+    }
+
+    /// Regression for GHSA-qxwf-7hw8-qw28: when `[sanitize].extra_patterns` is
+    /// configured, `durable_body` must bypass the `cap + 64 KiB` pre-slice so a
+    /// delimited custom pattern whose closing token sits past the overlap
+    /// window still redacts the secret inside the stored body.
+    #[tokio::test]
+    async fn extra_pattern_spanning_beyond_scrub_overlap_window_redacts_durable_body() {
+        let sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"(?s)BEGIN_CUSTOM_SECRET.*?END_CUSTOM_SECRET".to_string()],
+            allowlist: vec![],
+        })
+        .unwrap();
+        let padding = "p".repeat(DURABLE_BODY_SCRUB_OVERLAP_BYTES + 8 * 1024);
+        let payload = format!(
+            "prefix BEGIN_CUSTOM_SECRET\nSENSITIVE_CUSTOM_PAYLOAD_MARKER\n{padding}\nEND_CUSTOM_SECRET\ntrailing"
+        );
+
+        let direct = durable_body(HookEvent::PostToolUse, Some(&payload), &sanitizer);
+        assert!(
+            !direct.contains("BEGIN_CUSTOM_SECRET")
+                && !direct.contains("SENSITIVE_CUSTOM_PAYLOAD_MARKER"),
+            "direct durable_body leaked custom secret: {direct:?}"
+        );
+        assert!(
+            direct.contains("[REDACTED:custom]"),
+            "direct durable_body missing custom redaction marker: {direct:?}"
+        );
+        assert!(
+            direct.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "direct durable_body exceeded 2 KB cap: len={}",
+            direct.len()
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = sanitizer;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-ghsa-qxwf-delimited",
+                "tool_response": payload,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation recorded")
+            .body
+            .clone();
+        assert!(
+            !body.contains("BEGIN_CUSTOM_SECRET")
+                && !body.contains("SENSITIVE_CUSTOM_PAYLOAD_MARKER"),
+            "stored body leaked custom secret: {body:?}"
+        );
+        assert!(
+            body.contains("[REDACTED:custom]"),
+            "stored body missing custom redaction marker: {body:?}"
+        );
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "stored body exceeded 2 KB cap: len={}",
+            body.len()
+        );
+    }
+
+    /// Regression for GHSA-qxwf-7hw8-qw28: an end-anchored (`$`) operator
+    /// pattern whose match ends past `cap + 64 KiB` must still redact the
+    /// sensitive prefix stored in `durable_body`.
+    #[tokio::test]
+    async fn extra_pattern_end_anchored_rule_redacts_beyond_scrub_overlap_window() {
+        let sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"(?s)ANCHORED_SECRET_START.*END_MARKER$".to_string()],
+            allowlist: vec![],
+        })
+        .unwrap();
+        let padding = "q".repeat(DURABLE_BODY_SCRUB_OVERLAP_BYTES + 8 * 1024);
+        let payload =
+            format!("prefix ANCHORED_SECRET_START SENSITIVE_ANCHORED_TOKEN {padding} END_MARKER");
+
+        let direct = durable_body(HookEvent::PostToolUse, Some(&payload), &sanitizer);
+        assert!(
+            !direct.contains("ANCHORED_SECRET_START")
+                && !direct.contains("SENSITIVE_ANCHORED_TOKEN"),
+            "direct durable_body leaked end-anchored secret: {direct:?}"
+        );
+        assert!(
+            direct.contains("[REDACTED:custom]"),
+            "direct durable_body missing custom redaction marker: {direct:?}"
+        );
+        assert!(
+            direct.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "direct durable_body exceeded 2 KB cap: len={}",
+            direct.len()
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = sanitizer;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-ghsa-qxwf-anchored",
+                "tool_response": payload,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation recorded")
+            .body
+            .clone();
+        assert!(
+            !body.contains("ANCHORED_SECRET_START") && !body.contains("SENSITIVE_ANCHORED_TOKEN"),
+            "stored body leaked end-anchored secret: {body:?}"
+        );
+        assert!(
+            body.contains("[REDACTED:custom]"),
+            "stored body missing custom redaction marker: {body:?}"
+        );
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "stored body exceeded 2 KB cap: len={}",
+            body.len()
+        );
     }
 
     #[test]

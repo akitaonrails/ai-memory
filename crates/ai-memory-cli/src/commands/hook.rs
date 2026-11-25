@@ -6076,6 +6076,70 @@ mod tests {
         }
     }
 
+    /// Adversarial: a Claude Code shell call made from checkout B whose
+    /// command line names no path, but which changed a file checkout A
+    /// ignores (`tool_response.bashEditDiff`), answers to A's `ignore_paths`
+    /// like a file tool's target. Controls: the same call changing A's public
+    /// file is captured whole, and so is one whose list does not fit Claude
+    /// Code's documented shape, since B ignores nothing.
+    #[tokio::test]
+    async fn another_checkouts_exclusions_hold_for_a_file_a_claude_code_call_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(b.join(".ai-memory.toml"), "project = \"b\"\n").unwrap();
+        let event = |changed: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "edited",
+                "cwd": b,
+                "tool_name": "Bash",
+                "tool_input": {"command": "make gen"},
+                "tool_response": {
+                    "stdout": "SENTINEL_MUST_NOT_BE_SPOOLED",
+                    "stderr": "",
+                    "interrupted": false,
+                    "bashEditDiff": {"changedFiles": [changed], "files": [], "moreFiles": 0},
+                },
+            })
+        };
+        let secret = event(serde_json::json!(a.join("secrets.env")));
+        assert!(
+            spool_one(
+                &tmp.path().join("data-secret"),
+                "claude-code",
+                None,
+                &secret
+            )
+            .await
+            .is_empty(),
+            "A's exclusion must drop the event"
+        );
+        for (name, changed) in [
+            ("public", serde_json::json!(a.join("public.md"))),
+            (
+                "unreadable",
+                serde_json::json!({"path": a.join("secrets.env")}),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{name}"));
+            let entries = spool_one(&data_dir, "claude-code", None, &event(changed)).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}: {}",
+                entries[0].body
+            );
+        }
+    }
+
     /// Adversarial: checkout A's `ignore_paths` also hold for a call from a
     /// sibling checkout or an unmarked parent that reaches A through glob
     /// syntax in a directory segment, through a search/list tool's path or
