@@ -1,6 +1,9 @@
 //! A `tool_response` object with no `text` / `content` field is stored as
 //! compact JSON (`payload::value_to_text`), so its quotes and line breaks reach
 //! the sanitizer as `\"` and `\n`; the rules must redact through them (#1963).
+//! Claude Code's built-in results are read as the text they carry instead, so
+//! the shell results here come from Command Code, which sends the same
+//! `tool_response` object and still takes the stringify branch.
 
 use ai_memory_core::{OBSERVATION_BODY_MAX_BYTES, ObservationKind, SessionId};
 use axum::body::Body;
@@ -61,20 +64,20 @@ async fn every_object_shaped_tool_result_is_redacted_in_the_stored_tool_body() {
     let state = make_state(&tmp).await;
     for (label, agent, tool_response, survivor) in [
         (
-            "json file in a claude code bash result",
-            "claude-code",
+            "json file in a command code bash result",
+            "command-code",
             serde_json::json!({"stdout": format!("{{\"db_password\": \"{SECRET}\"}}\n"), "stderr": "", "interrupted": false}),
             r#""interrupted":false"#,
         ),
         (
-            "compact json file in a claude code bash result",
-            "claude-code",
+            "compact json file in a command code bash result",
+            "command-code",
             serde_json::json!({"stdout": format!("{{\"SESSION_SECRET\":\"{SECRET}\"}}"), "stderr": "", "interrupted": false}),
             r#""interrupted":false"#,
         ),
         (
-            "a .env past its first line in a claude code bash result",
-            "claude-code",
+            "a .env past its first line in a command code bash result",
+            "command-code",
             serde_json::json!({"stdout": format!("DB_HOST=x\nSTRIPE_SECRET={SECRET}\nPORT=5432\n"), "stderr": "", "interrupted": false}),
             r#"\nPORT=5432\n","stderr":"","interrupted":false"#,
         ),
@@ -125,16 +128,30 @@ async fn a_printed_spool_entry_does_not_store_the_root_bearer() {
         "stderr": "",
         "interrupted": false,
     });
-    let body = stored_tool_body(&state, "claude-code", tool_response).await;
-    assert!(
-        !body.contains(&token) && body.contains("[REDACTED:"),
-        "root bearer stored verbatim: {body:?}"
-    );
-    assert!(
-        body.contains(r#"\"url\":\"http://127.0.0.1:0/hook"#)
-            && body.contains(r#""interrupted":false"#),
-        "redaction swallowed the rest of the entry: {body:?}"
-    );
+    for (agent, survivors) in [
+        // Claude Code's Bash result is stored as the text it printed.
+        ("claude-code", &[r#""url":"http://127.0.0.1:0/hook"#][..]),
+        // Command Code's same object is stored as compact JSON.
+        (
+            "command-code",
+            &[
+                r#"\"url\":\"http://127.0.0.1:0/hook"#,
+                r#""interrupted":false"#,
+            ][..],
+        ),
+    ] {
+        let body = stored_tool_body(&state, agent, tool_response.clone()).await;
+        assert!(
+            !body.contains(&token) && body.contains("[REDACTED:"),
+            "{agent}: root bearer stored verbatim: {body:?}"
+        );
+        for survivor in survivors {
+            assert!(
+                body.contains(survivor),
+                "{agent}: redaction swallowed the rest of the entry: {body:?}"
+            );
+        }
+    }
 }
 
 /// A result with no secret is stored as it arrived.
@@ -148,10 +165,41 @@ async fn an_object_shaped_tool_result_without_a_secret_is_stored_whole() {
         "interrupted": false,
     });
     let expected = serde_json::to_string(&tool_response).unwrap();
-    let body = stored_tool_body(&state, "claude-code", tool_response).await;
+    let body = stored_tool_body(&state, "command-code", tool_response).await;
     assert!(
         body.ends_with(&expected),
         "harmless result must be stored whole: {body:?}"
+    );
+}
+
+/// Claude Code's Bash result is stored as the text it printed, so a secret in
+/// it is redacted as plain text and the lines after it keep their real line
+/// breaks. Control: a harmless result is stored as printed.
+#[tokio::test]
+async fn a_claude_code_bash_result_is_redacted_as_the_text_it_carries() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let printed =
+        |stdout: String| serde_json::json!({"stdout": stdout, "stderr": "", "interrupted": false});
+    let body = stored_tool_body(
+        &state,
+        "claude-code",
+        printed(format!("DB_HOST=x\nSTRIPE_SECRET={SECRET}\nPORT=5432\n")),
+    )
+    .await;
+    assert!(
+        !body.contains(SECRET) && body.contains("[REDACTED:"),
+        "secret stored verbatim: {body:?}"
+    );
+    assert!(body.contains("---\nDB_HOST=x\n"), "{body:?}");
+    assert!(body.contains("\nPORT=5432"), "{body:?}");
+    assert!(!body.contains("\"stdout\""), "{body:?}");
+
+    let harmless = "{\"name\": \"something-long-value\"}\nsecond line";
+    let body = stored_tool_body(&state, "claude-code", printed(harmless.to_owned())).await;
+    assert!(
+        body.ends_with(&format!("---\n{harmless}")),
+        "harmless result must be stored as printed: {body:?}"
     );
 }
 

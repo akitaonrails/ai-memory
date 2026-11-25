@@ -61,6 +61,13 @@ The active `config.toml` includes hook definitions and provider settings.
 The default redaction scrubs recognized credentials while preserving valid
 TOML. The separate Kimi Code `credentials/` directory stays outside the archive.
 
+Grok files listed under `~/.grok` use `GROK_HOME` when set, and Kiro CLI
+files listed under `~/.kiro` use `KIRO_HOME`, the same homes `install-mcp`,
+`install-skills` and `install-hooks` write to. Archives keep portable
+`.grok/` and `.kiro/` paths, so global entries restore into the receiving
+machine's Grok or Kiro home. Project-scoped `.grok/` entries stay under the
+project.
+
 ---
 
 ## 3. Architecture & CLI Design

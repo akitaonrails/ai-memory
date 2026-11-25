@@ -4784,7 +4784,7 @@ fn build_opencode2_plugin(
     // The shared prelude already imports `spawn` and bakes `NATIVE_HOOK` /
     // `NATIVE_PROJECT_STRATEGY` (#2122); V2 only adds its own `ingest_key`
     // dedup source and the assistant-capture opt-in.
-    rebuilt.push_str("import { randomBytes } from \"node:crypto\";\n");
+    rebuilt.push_str("import { createHash, randomBytes } from \"node:crypto\";\n");
     rebuilt.push_str("const AiMemoryOpencode2: Plugin.Plugin = {\n  id: \"ai-memory-opencode2\",\n  setup: async (ctx) => {\n");
     rebuilt.push_str(&format!("const CAPTURE_ASSISTANT = {capture_assistant};\n"));
     // A module is shared by location graphs; queues and session ownership are not.
@@ -4837,9 +4837,91 @@ const OPENCODE2_BINDING: &str = r#"
     // lookup into a request (and a server worker) per model call.
     const handoffFailures = new Map<SessionID, number>();
     const HANDOFF_MAX_ATTEMPTS = 3;
+    const SESSION_MARKER_CAP = 512;
     // Stops listening on unload. Deliveries keep `hookAbort` until the queued
     // events have had their drain budget.
     const unload = new AbortController();
+
+    function sessionMarkersDir(): string {
+      return join(dirname(hookSpoolDir()), "opencode2-sessions");
+    }
+
+    function sessionMarkerPath(id: SessionID): string {
+      const digest = createHash("sha256").update(id).digest("hex");
+      return join(sessionMarkersDir(), `${digest}.json`);
+    }
+
+    function isSessionCaptured(id: SessionID, cwd: string): boolean {
+      const probe = new URL(`${SERVER}/hook`);
+      if (!applyMarkerParams(probe, cwd)) return false;
+      const policy = capturePolicy({ sessionID: id, cwd }, cwd, "session-start");
+      return policy.disposition !== "drop" || Boolean(policy.serverRoutedProfile && NATIVE_HOOK);
+    }
+
+    function pruneSessionMarkers(dir: string): void {
+      try {
+        const files = readdirSync(dir).filter((name) => name.endsWith(".json"));
+        if (files.length <= SESSION_MARKER_CAP) return;
+        const dated = files.map((name) => {
+          const full = join(dir, name);
+          try {
+            return { full, mtimeMs: statSync(full).mtimeMs };
+          } catch (_e) {
+            return { full, mtimeMs: 0 };
+          }
+        });
+        dated.sort((a, b) => a.mtimeMs - b.mtimeMs);
+        const excess = dated.length - SESSION_MARKER_CAP;
+        for (let i = 0; i < excess; i++) {
+          try { unlinkSync(dated[i].full); } catch (_e) {}
+        }
+      } catch (_e) {
+        // Best-effort pruning.
+      }
+    }
+
+    function writeSessionMarker(id: SessionID, cwd: string, parentID?: string): void {
+      if (!isSessionCaptured(id, cwd)) return;
+      try {
+        const dir = sessionMarkersDir();
+        makePrivateSpoolDir(dir);
+        const target = sessionMarkerPath(id);
+        const tmp = `${target}.${spoolSeqPrefix}${randomBytes(6).toString("hex")}.tmp`;
+        const marker: { cwd: string; parentID?: string } = { cwd };
+        if (typeof parentID === "string" && parentID) marker.parentID = parentID;
+        writeFileSync(tmp, JSON.stringify(marker), { mode: 0o600 });
+        try {
+          renameSync(tmp, target);
+        } catch (e) {
+          try { unlinkSync(tmp); } catch (_e) {}
+          throw e;
+        }
+        pruneSessionMarkers(dir);
+      } catch (_e) {
+        // Best-effort persistence; never block the agent.
+      }
+    }
+
+    function readSessionMarker(id: SessionID): { cwd: string; parentID?: string } | undefined {
+      try {
+        const parsed = JSON.parse(readMarkerText(sessionMarkerPath(id), "utf8"));
+        if (!parsed || typeof parsed.cwd !== "string" || !parsed.cwd) return undefined;
+        return typeof parsed.parentID === "string" && parsed.parentID
+          ? { cwd: parsed.cwd, parentID: parsed.parentID }
+          : { cwd: parsed.cwd };
+      } catch (_e) {
+        return undefined;
+      }
+    }
+
+    function removeSessionMarker(id: SessionID): boolean {
+      try {
+        unlinkSync(sessionMarkerPath(id));
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    }
 
     async function sessionInfo(id: SessionID): Promise<SessionInfo> {
       let pending = sessions.get(id);
@@ -4877,7 +4959,11 @@ const OPENCODE2_BINDING: &str = r#"
         sessions.delete(id);
         return undefined;
       }
+      const isNew = !startedSessions.has(id);
       startSession(id, session.location.directory, { title: session.title, ...subagentMarker(session) });
+      if (isNew) {
+        writeSessionMarker(id, session.location.directory, session.parentID);
+      }
       return session;
     }
 
@@ -4946,24 +5032,49 @@ const OPENCODE2_BINDING: &str = r#"
               await postStop(event.data.sessionID);
             } else if (event.type === "session.deleted") {
               const id = event.data.sessionID;
-              const session = await sessions.get(id)?.catch(() => undefined);
-              endSession(id, directory, undefined, subagentMarker(session));
-              forgetSession(id);
+              const eventDir = (event as { location?: { directory?: string } }).location?.directory;
+              if (eventDir && eventDir !== directory) continue;
+              if (startedSessions.has(id)) {
+                removeSessionMarker(id);
+                const session = await sessions.get(id)?.catch(() => undefined);
+                endSession(id, directory, undefined, subagentMarker(session));
+                forgetSession(id);
+              } else {
+                const marker = readSessionMarker(id);
+                if (marker && marker.cwd === directory && removeSessionMarker(id)) {
+                  postHook("session-end", {
+                    sessionID: id,
+                    cwd: marker.cwd,
+                    ...(marker.parentID ? { agent_id: marker.parentID } : {}),
+                  });
+                  forgetSession(id);
+                }
+              }
             } else if (event.type === "session.moved") {
               const id = event.data.sessionID;
+              const nextCwd = event.data.location.directory;
               const previousCwd = sessionCwds.get(id);
               const previous = await sessions.get(id)?.catch(() => undefined);
+              const persisted = readSessionMarker(id);
               // Only the old owner emits the explicit transition. Replayed
               // moves keep their ingest key, and stale ordinary events cannot
               // silently rebind a live session in the store.
-              if (previousCwd === directory && event.data.location.directory !== previousCwd) {
+              if (previousCwd === directory && nextCwd !== previousCwd) {
                 postHook("session-start", {
                   sessionID: id,
-                  cwd: event.data.location.directory,
+                  cwd: nextCwd,
                   session_moved: true,
                   session_moved_from_cwd: previousCwd,
                   ...subagentMarker(previous),
                 });
+              }
+              if (previousCwd === directory || persisted?.cwd === directory || (persisted && nextCwd === directory)) {
+                const parentID = previous?.parentID ?? persisted?.parentID;
+                if (nextCwd && isSessionCaptured(id, nextCwd)) {
+                  writeSessionMarker(id, nextCwd, parentID);
+                } else {
+                  removeSessionMarker(id);
+                }
               }
               forgetSession(id);
               startedSessions.delete(id);
@@ -15555,7 +15666,7 @@ model = "gpt-5"
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success() && stdout.matches("PASS:").count() == 3,
+            output.status.success() && stdout.matches("PASS:").count() == 4,
             "opencode2 host fixture failed ({})\nstdout:\n{stdout}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stderr),
