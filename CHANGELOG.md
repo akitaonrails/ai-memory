@@ -64,6 +64,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Completed the English and Brazilian Portuguese help and installer
   diagnostics for Antigravity CLI status line setup. (#2486)
+- Fixed Windows command rendering for the Antigravity CLI status line token
+  observer by using the same path rendering as its lifecycle hooks. (#2486)
 
 ## [3.6.3] - 2026-11-26
 

@@ -1560,6 +1560,11 @@ antigravity-cli` wires five of its
   `Stop`, so the checkpoint includes them. A cancelled, failed or
   budget-limited loop is not a checkpoint.
 
+Global CLI installs also configure the `statusLine` token observer in
+`~/.gemini/antigravity-cli/settings.json`. Antigravity launches the observer
+through `cmd.exe` on Windows and `sh` on macOS and Linux. The observer uses
+the same shell for an existing status line command.
+
 The transcript is read only when `transcriptPath` names the conversation's own
 `~/.gemini/<app>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
 (or the `transcript_full.jsonl` beside it, which the CLI reports), with
