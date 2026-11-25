@@ -5024,6 +5024,42 @@ mod tests {
         assert!(claude_result("Read", notebook).contains("MARKER_NOTEBOOK"));
     }
 
+    /// Claude Code's Edit result carries `originalFile`, the whole file before
+    /// the edit, beside `structuredPatch` (SDK `FileEditOutput`). The body
+    /// keeps the patch as unified diff text, never the original file, which
+    /// filled the excerpt ahead of the change.
+    #[test]
+    fn claude_code_edit_result_keeps_its_patch_not_the_original_file() {
+        let edit = |patch: serde_json::Value| {
+            serde_json::json!({
+                "filePath": "/repo/src/lib.rs",
+                "oldString": "fn old() {}",
+                "newString": "fn EDIT_PATCH_MARKER() {}",
+                "originalFile": "SENTINEL_ORIGINAL_FILE\n".repeat(200),
+                "structuredPatch": patch,
+                "userModified": false,
+                "replaceAll": false,
+                "gitDiff": {"filename": "src/lib.rs", "status": "modified", "additions": 1,
+                    "deletions": 1, "changes": 2, "patch": "SENTINEL_GIT_DIFF"},
+            })
+        };
+        let patch = serde_json::json!([
+            {"oldStart": 3, "oldLines": 1, "newStart": 3, "newLines": 1,
+             "lines": ["-fn old() {}", "+fn EDIT_PATCH_MARKER() {}"]},
+            {"oldStart": 9, "oldLines": 2, "newStart": 9, "newLines": 1,
+             "lines": [" keep();", "-drop();"]},
+        ]);
+        assert_eq!(
+            claude_result("Edit", edit(patch)),
+            "@@ -3,1 +3,1 @@\n-fn old() {}\n+fn EDIT_PATCH_MARKER() {}\n\
+             @@ -9,2 +9,1 @@\n keep();\n-drop();"
+        );
+        assert_eq!(
+            claude_result("Edit", edit(serde_json::json!([]))),
+            "(no output captured)"
+        );
+    }
+
     /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
     /// with `outcome: error` and the error text, never the tool's arguments.
     #[test]
