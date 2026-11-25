@@ -5070,6 +5070,48 @@ mod tests {
         );
     }
 
+    /// Claude Code's Write result has `type` `create` or `update`, the new
+    /// `content`, and for an overwrite `originalFile` and `structuredPatch`
+    /// (SDK `FileWriteOutput`). A new file keeps what was written; an
+    /// overwrite keeps its patch, or the content when Claude Code took no
+    /// diff; never the original file. The hooks reference's own example,
+    /// `{filePath, type}`, stores no output.
+    #[test]
+    fn claude_code_write_result_keeps_what_was_written() {
+        let create = serde_json::json!({
+            "type": "create",
+            "filePath": "/repo/NOTES.md",
+            "content": "# Notes\nWRITE_NEW_FILE_MARKER\n",
+            "structuredPatch": [],
+            "originalFile": null,
+        });
+        assert_eq!(
+            claude_result("Write", create),
+            "# Notes\nWRITE_NEW_FILE_MARKER\n"
+        );
+        let update = |patch: serde_json::Value| {
+            serde_json::json!({
+                "type": "update",
+                "filePath": "/repo/NOTES.md",
+                "content": "MARKER_WHOLE_NEW_FILE\n",
+                "structuredPatch": patch,
+                "originalFile": "SENTINEL_ORIGINAL_FILE\n",
+            })
+        };
+        let patch = serde_json::json!([{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+            "lines": ["-old line", "+WRITE_PATCH_MARKER"]}]);
+        assert_eq!(
+            claude_result("Write", update(patch)),
+            "@@ -1,1 +1,1 @@\n-old line\n+WRITE_PATCH_MARKER"
+        );
+        assert_eq!(
+            claude_result("Write", update(serde_json::json!([]))),
+            "MARKER_WHOLE_NEW_FILE\n"
+        );
+        let documented = serde_json::json!({"filePath": "/path/to/file.txt", "type": "create"});
+        assert_eq!(claude_result("Write", documented), "(no output captured)");
+    }
+
     /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
     /// with `outcome: error` and the error text, never the tool's arguments.
     #[test]
