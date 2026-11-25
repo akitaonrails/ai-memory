@@ -632,6 +632,40 @@ fn kiro_cli_assets_follow_kiro_home_on_backup_and_restore() {
     assert!(!destination.join("agents/stale.json").exists());
 }
 
+/// Gemini CLI reads project skills from `.gemini/skills` inside the repository,
+/// alongside the user-level `~/.gemini/skills` the installer writes.
+#[test]
+fn gemini_project_skills_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let skill = ".gemini/skills/example/SKILL.md";
+    let body = "# Example Gemini project skill";
+    let source = project.path().join(skill);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, body).unwrap();
+
+    let archive = project.path().join("gemini-project.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(restored_project.path().join(skill)).unwrap(),
+        body
+    );
+    assert!(!restored_home.path().join(".gemini").exists());
+}
+
 /// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default
 /// `~/.copilot/skills`) and repository skills from `.github/skills`, the
 /// roots `install-skills --agent copilot-cli` writes:
