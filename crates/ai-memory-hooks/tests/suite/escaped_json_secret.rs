@@ -1,6 +1,9 @@
 //! A `tool_response` object with no `text` / `content` field is stored as
 //! compact JSON (`payload::value_to_text`), so its quotes and line breaks reach
 //! the sanitizer as `\"` and `\n`; the rules must redact through them (#1963).
+//! Claude Code's built-in results are read as the text they carry instead, so
+//! the shell results here come from Command Code, which sends the same
+//! `tool_response` object and still takes the stringify branch.
 
 use ai_memory_core::{OBSERVATION_BODY_MAX_BYTES, ObservationKind, SessionId};
 use axum::body::Body;
@@ -125,16 +128,30 @@ async fn a_printed_spool_entry_does_not_store_the_root_bearer() {
         "stderr": "",
         "interrupted": false,
     });
-    let body = stored_tool_body(&state, "claude-code", tool_response).await;
-    assert!(
-        !body.contains(&token) && body.contains("[REDACTED:"),
-        "root bearer stored verbatim: {body:?}"
-    );
-    assert!(
-        body.contains(r#"\"url\":\"http://127.0.0.1:0/hook"#)
-            && body.contains(r#""interrupted":false"#),
-        "redaction swallowed the rest of the entry: {body:?}"
-    );
+    for (agent, survivors) in [
+        // Claude Code's Bash result is stored as the text it printed.
+        ("claude-code", &[r#""url":"http://127.0.0.1:0/hook"#][..]),
+        // Command Code's same object is stored as compact JSON.
+        (
+            "command-code",
+            &[
+                r#"\"url\":\"http://127.0.0.1:0/hook"#,
+                r#""interrupted":false"#,
+            ][..],
+        ),
+    ] {
+        let body = stored_tool_body(&state, agent, tool_response.clone()).await;
+        assert!(
+            !body.contains(&token) && body.contains("[REDACTED:"),
+            "{agent}: root bearer stored verbatim: {body:?}"
+        );
+        for survivor in survivors {
+            assert!(
+                body.contains(survivor),
+                "{agent}: redaction swallowed the rest of the entry: {body:?}"
+            );
+        }
+    }
 }
 
 /// A result with no secret is stored as it arrived.

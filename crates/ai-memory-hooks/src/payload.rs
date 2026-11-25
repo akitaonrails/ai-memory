@@ -1272,6 +1272,10 @@ fn safe_tool_body(
                 raw.pointer("/tool_response/output")
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/tool_response/error").and_then(value_to_text))
+            } else if agent == AgentKind::ClaudeCode
+                && let Some(text) = claude_code_tool_text(raw)
+            {
+                text
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -1282,6 +1286,48 @@ fn safe_tool_body(
             summary.push_str(TOOL_BODY_SEPARATOR);
             summary.push_str(&result);
             Some(summary)
+        }
+        _ => None,
+    }
+}
+
+/// The text of a Claude Code built-in tool's PostToolUse result.
+///
+/// Claude Code passes the tool's structured output object as `tool_response`,
+/// not the text the model reads (PostToolUse input in
+/// <https://code.claude.com/docs/en/hooks>; the per-tool shapes are the Agent
+/// SDK's tool output types, <https://code.claude.com/docs/en/agent-sdk/typescript>).
+/// Flattened whole, that object was stored as escaped JSON, with whatever the
+/// tool adds for display, and full-text search could not split its lines.
+/// Each tool's output field is read instead. `None` for any other tool or
+/// shape, such as a failed call's error string or fields the SDK does not
+/// document, which keep the generic reading; `Some(None)` for a result with
+/// no text to keep.
+fn claude_code_tool_text(raw: &serde_json::Value) -> Option<Option<String>> {
+    let response = raw.get("tool_response")?.as_object()?;
+    let text = |key: &str| {
+        response
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    match raw.get("tool_name")?.as_str()? {
+        // `stdout` carries the command's output, stdout and stderr merged,
+        // and `stderr` the notices the tool itself adds. `isImage` marks an
+        // image printed as data; `bashEditDiff` and `gitOperation` describe
+        // the command's effects for display.
+        "Bash" | "PowerShell" => {
+            response.get("stdout")?.as_str()?;
+            if response.get("isImage") == Some(&serde_json::Value::Bool(true)) {
+                return Some(None);
+            }
+            let output = [text("stdout"), text("stderr")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some((!output.is_empty()).then_some(output))
         }
         _ => None,
     }
