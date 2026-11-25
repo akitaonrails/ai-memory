@@ -6200,12 +6200,18 @@ async fn process_authorized(
         && !body_is_subagent(env.agent, &env.raw);
     if matches!(env.event, HookEvent::SessionEnd)
         || turn_checkpoint
-        || (env.agent == AgentKind::Pi && env.event == HookEvent::Stop)
+        || (env.event == HookEvent::Stop
+            && matches!(
+                env.agent,
+                AgentKind::Pi | AgentKind::OpenCode | AgentKind::AntigravityCli
+            ))
     {
         // Cumulative snapshots are independent of summary/handoff creation.
-        // Pi reports at agent_end too, while the session is still open.
-        // Admission above already pins the session identity and scope; maxima
-        // in the writer make repeated or out-of-order reports idempotent.
+        // Pi, OpenCode and Antigravity CLI report at Stop too, while the
+        // session is still open (including managed runs and non-checkpoint
+        // stops). Admission above already pins the session identity and scope;
+        // maxima in the writer make repeated or out-of-order reports
+        // idempotent.
         if let Some(usage) = parse_reported_session_usage(&env.raw, session_id)
             && let Err(e) = state.writer.upsert_session_usage(usage).await
         {
@@ -6621,10 +6627,11 @@ const MAX_REPORTED_SESSION_TOKENS: u64 = 1_000_000_000;
 const MAX_REPORTED_MODEL_BYTES: usize = 64;
 
 /// Parse the optional `_ai_memory_usage` snapshot from a native session-end
-/// hook or a Pi stop/session-end (see `ai-memory-cli`). Every field is
-/// optional and defaults to 0/`None` — a malformed number, an object with no
-/// usable fields at all, or the key's absence all read as "nothing to
-/// record" (`None`), never as a zeroed report that would clobber a real one.
+/// hook or a Pi/OpenCode/Antigravity CLI stop/session-end (see `ai-memory-cli`).
+/// Every field is optional and defaults to 0/`None` — a malformed number, an
+/// object with no usable fields at all, or the key's absence all read as
+/// "nothing to record" (`None`), never as a zeroed report that would clobber a
+/// real one.
 fn parse_reported_session_usage(
     raw: &serde_json::Value,
     session_id: SessionId,
@@ -31386,6 +31393,212 @@ pub(crate) mod tests {
             session.ended_at.is_none(),
             "a Pi stop must not end the session"
         );
+    }
+
+    #[tokio::test]
+    async fn opencode_and_antigravity_stop_and_session_end_persist_usage_idempotently() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let read_usage = |sid: SessionId| {
+            let state = state.clone();
+            async move {
+                state
+                    .reader
+                    .session_summary_scoped(
+                        state.workspace_id,
+                        state.project_id,
+                        sid,
+                        ai_memory_core::OwnerFilter::Any,
+                    )
+                    .await
+                    .unwrap()
+                    .and_then(|summary| summary.usage)
+            }
+        };
+
+        // 1. OpenCode non-checkpoint Stop (managed run + subagent) persists
+        //    cumulative `_ai_memory_usage` idempotently without ending session.
+        let opencode_stop = |session: &str, input: u64, output: u64, managed: bool| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some("opencode2".into()),
+                    managed_run: managed.then(|| ManagedRunId::new().to_string()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "sessionID": session,
+                    "turn_checkpoint": false,
+                    "agent_id": "parent-session",
+                    "_ai_memory_usage": {
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "cache_read_tokens": 25,
+                        "cache_write_tokens": 10,
+                        "model": "claude-sonnet-4"
+                    }
+                }),
+            )
+        };
+        process(
+            &state,
+            opencode_stop("oc-managed", 120, 40, true),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        // Replay with identical or smaller values must not inflate or lower totals.
+        process(
+            &state,
+            opencode_stop("oc-managed", 80, 10, true),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let oc_sid = SessionId::from_native("oc-managed");
+        let oc_usage = read_usage(oc_sid)
+            .await
+            .expect("OpenCode managed Stop must persist usage");
+        assert_eq!(oc_usage.input_tokens, 120);
+        assert_eq!(oc_usage.output_tokens, 40);
+        assert_eq!(oc_usage.cache_read_tokens, 25);
+        assert_eq!(oc_usage.cache_write_tokens, 10);
+        assert_eq!(oc_usage.model.as_deref(), Some("claude-sonnet-4"));
+        let oc_session = state
+            .reader
+            .session_summary_scoped(
+                state.workspace_id,
+                state.project_id,
+                oc_sid,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            oc_session.ended_at.is_none(),
+            "an OpenCode Stop must not end the session"
+        );
+
+        // SessionEnd with higher counters updates monotonically.
+        let oc_end = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-end".into(),
+                agent: Some("opencode2".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "oc-managed",
+                "agent_id": "parent-session",
+                "_ai_memory_usage": {
+                    "input_tokens": 200,
+                    "output_tokens": 75,
+                    "cache_read_tokens": 25,
+                    "cache_write_tokens": 10,
+                    "model": "claude-sonnet-4"
+                }
+            }),
+        );
+        process(&state, oc_end, None, Vec::new()).await.unwrap();
+        let oc_usage_after = read_usage(oc_sid).await.unwrap();
+        assert_eq!(oc_usage_after.input_tokens, 200);
+        assert_eq!(oc_usage_after.output_tokens, 75);
+
+        // 2. OpenCode `_ai_memory_usage_calls` deduplicates by call_id on Stop.
+        let oc_calls_stop = |input: u64, output: u64| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some("opencode2".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "sessionID": "oc-calls",
+                    "turn_checkpoint": true,
+                    "_ai_memory_usage_calls": [{
+                        "call_id": "msg_001",
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "cache_write_tokens": 5,
+                        "cache_read_tokens": 30,
+                        "model": "claude-sonnet-4"
+                    }]
+                }),
+            )
+        };
+        process(&state, oc_calls_stop(100, 20), None, Vec::new())
+            .await
+            .unwrap();
+        process(&state, oc_calls_stop(100, 50), None, Vec::new())
+            .await
+            .unwrap();
+        let oc_calls_usage = read_usage(SessionId::from_native("oc-calls"))
+            .await
+            .expect("OpenCode usage calls must roll up into session_usage");
+        assert_eq!(oc_calls_usage.input_tokens, 100);
+        assert_eq!(oc_calls_usage.output_tokens, 50);
+        assert_eq!(oc_calls_usage.cache_read_tokens, 30);
+        assert_eq!(oc_calls_usage.cache_write_tokens, 5);
+
+        // 3. Antigravity CLI non-checkpoint Stop (e.g. fullyIdle=false or
+        //    managed run) and SessionEnd persist `_ai_memory_usage` idempotently.
+        let agy_stop = |input: u64, output: u64| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some("antigravity-cli".into()),
+                    managed_run: Some(ManagedRunId::new().to_string()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "conversationId": "agy-conv-1",
+                    "fullyIdle": false,
+                    "terminationReason": "CANCELLED",
+                    "_ai_memory_usage": {
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "cache_write_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "model": "Gemini 3.8 Flash"
+                    }
+                }),
+            )
+        };
+        process(&state, agy_stop(500, 150), None, Vec::new())
+            .await
+            .unwrap();
+        process(&state, agy_stop(400, 100), None, Vec::new())
+            .await
+            .unwrap();
+        let agy_sid = SessionId::from_native("agy-conv-1");
+        let agy_usage = read_usage(agy_sid)
+            .await
+            .expect("Antigravity non-checkpoint Stop must persist usage");
+        assert_eq!(agy_usage.input_tokens, 500);
+        assert_eq!(agy_usage.output_tokens, 150);
+        assert_eq!(agy_usage.model.as_deref(), Some("Gemini 3.8 Flash"));
+
+        let agy_end = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-end".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "agy-conv-1",
+                "_ai_memory_usage": {
+                    "input_tokens": 750,
+                    "output_tokens": 225,
+                    "model": "Gemini 3.8 Flash"
+                }
+            }),
+        );
+        process(&state, agy_end, None, Vec::new()).await.unwrap();
+        let agy_usage_after = read_usage(agy_sid).await.unwrap();
+        assert_eq!(agy_usage_after.input_tokens, 750);
+        assert_eq!(agy_usage_after.output_tokens, 225);
     }
 
     /// Token-cost visibility: the native hook splices this object

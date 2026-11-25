@@ -170,6 +170,7 @@ fn compute_session_usage(
     agent_kind: AgentKind,
     json: &serde_json::Value,
     session_id: Option<&str>,
+    data_dir: &Path,
 ) -> Option<super::session_usage::SessionUsage> {
     match agent_kind {
         AgentKind::ClaudeCode => {
@@ -185,6 +186,10 @@ fn compute_session_usage(
                 .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
             let rollout = super::session_usage::locate_codex_rollout(&codex_home, session_id)?;
             super::session_usage::extract_codex_usage(&rollout)
+        }
+        AgentKind::AntigravityCli => {
+            let session_id = session_id?;
+            super::session_usage::read_antigravity_usage(data_dir, session_id)
         }
         _ => None,
     }
@@ -310,6 +315,7 @@ fn compute_backfill_usage(
     agent_kind: AgentKind,
     old_session_id: &str,
     old_cwd: Option<&str>,
+    data_dir: &Path,
 ) -> Option<super::session_usage::SessionUsage> {
     match agent_kind {
         AgentKind::ClaudeCode => {
@@ -330,6 +336,9 @@ fn compute_backfill_usage(
                 .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
             let rollout = super::session_usage::locate_codex_rollout(&codex_home, old_session_id)?;
             super::session_usage::extract_codex_usage(&rollout)
+        }
+        AgentKind::AntigravityCli => {
+            super::session_usage::read_antigravity_usage(data_dir, old_session_id)
         }
         _ => None,
     }
@@ -355,6 +364,7 @@ fn dispatch_backfill_close(
         candidate.agent_kind,
         &candidate.session_id,
         candidate.cwd.as_deref(),
+        dd,
     );
     let mut body = serde_json::json!({});
     if let Some(usage) = &usage {
@@ -1686,6 +1696,24 @@ fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) ->
 /// `data_dir` is the resolved global `--data-dir` (if any); used to locate the
 /// spool and the stored OIDC token.
 pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()> {
+    if AgentKind::from_wire(&args.agent) == AgentKind::AntigravityCli && args.event == "statusline"
+    {
+        let mut stdin_bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut stdin_bytes).ok();
+        let runtime_env = RuntimeEnv::from_process();
+        let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+        let code = run_antigravity_statusline(
+            &dd,
+            args.chain_command_b64.as_deref(),
+            &stdin_bytes,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     let mut payload = String::new();
     std::io::stdin().read_to_string(&mut payload).ok();
     let mut stdout = std::io::stdout();
@@ -1697,6 +1725,73 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
         spawn_background_drainer,
     )
     .await
+}
+
+/// Observe an Antigravity CLI `statusLine` payload on stdin, update the
+/// bounded per-session usage snapshot under `<data_dir>/antigravity-usage/`,
+/// and optionally chain a pre-existing user `statusLine` command with the exact
+/// stdin bytes, forwarding its stdout, stderr and exit code untouched.
+fn run_antigravity_statusline<O, E>(
+    data_dir: &Path,
+    chain_command_b64: Option<&str>,
+    stdin_bytes: &[u8],
+    stdout: &mut O,
+    stderr: &mut E,
+) -> i32
+where
+    O: std::io::Write,
+    E: std::io::Write,
+{
+    let json_slice = stdin_bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(stdin_bytes);
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(json_slice) {
+        let _ = super::session_usage::record_antigravity_statusline_usage(data_dir, &value);
+    }
+    let Some(encoded) = chain_command_b64.filter(|s| !s.trim().is_empty()) else {
+        return 0;
+    };
+    use base64::Engine as _;
+    let Ok(decoded_bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
+        return 0;
+    };
+    let Ok(command) = String::from_utf8(decoded_bytes) else {
+        return 0;
+    };
+    let command = command.trim();
+    if command.is_empty() {
+        return 0;
+    }
+    #[cfg(windows)]
+    let mut child_cmd = {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut child_cmd = {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    };
+    let Ok(mut child) = child_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return 127;
+    };
+    if let Some(mut child_stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = child_stdin.write_all(stdin_bytes);
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return 1;
+    };
+    let _ = stdout.write_all(&output.stdout);
+    let _ = stderr.write_all(&output.stderr);
+    output.status.code().unwrap_or(1)
 }
 
 /// [`run`] with the payload and output sink injected, so tests drive the hook
@@ -2249,16 +2344,16 @@ where
         }
     }
 
-    // Token-usage visibility (docs: token-cost tracking): only at
-    // session-end, which fires once per session — never on the frequent
-    // `stop`/`post-tool-use` path — so the bounded transcript read this
-    // performs (a full linear scan for Claude Code, a bounded tail read for
-    // Codex) never touches the hot path. Spliced the same way
-    // `_ai_memory_capture` is above, so it rides the existing session-end
+    // Token-usage visibility (docs: token-cost tracking): at session-end for
+    // transcript-based agents (Claude Code, Codex) and at both stop and
+    // session-end for Antigravity CLI (which reads the small cached statusLine
+    // snapshot, since Antigravity has no conversation-end event). Spliced the
+    // same way `_ai_memory_capture` is above, so it rides the existing
     // POST/spool/retry path with no new wire format.
-    if args.event == "session-end"
+    if (args.event == "session-end"
+        || (agent_kind == AgentKind::AntigravityCli && args.event == "stop"))
         && let Some(usage) =
-            compute_session_usage(agent_kind, &json, canonical_session_id.as_deref())
+            compute_session_usage(agent_kind, &json, canonical_session_id.as_deref(), &dd)
         && let Some(object) = json.as_object_mut()
     {
         object.insert(
@@ -3758,12 +3853,20 @@ mod tests {
 
     #[test]
     fn compute_backfill_usage_unsupported_agent_is_none() {
-        assert!(compute_backfill_usage(AgentKind::Cursor, "some-session", Some("/proj")).is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            compute_backfill_usage(AgentKind::Cursor, "some-session", Some("/proj"), tmp.path())
+                .is_none()
+        );
     }
 
     #[test]
     fn compute_backfill_usage_claude_code_without_cwd_is_none() {
-        assert!(compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None).is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None, tmp.path())
+                .is_none()
+        );
     }
 
     /// #2031: Claude Code subagent responses ride only on the main
@@ -3878,6 +3981,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         }
     }
@@ -5080,6 +5184,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         };
 
@@ -5124,6 +5229,7 @@ mod tests {
                 check_capture: false,
                 capture_assistant: false,
                 expected_profile: None,
+                chain_command_b64: None,
                 capture_mode: None,
             };
 
@@ -5180,6 +5286,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         };
 
@@ -5214,6 +5321,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         }
     }
@@ -5297,6 +5405,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         };
 
@@ -5330,6 +5439,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         };
 
@@ -8065,6 +8175,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         }
     }
@@ -8108,6 +8219,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         };
 
@@ -8141,6 +8253,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         }
     }
@@ -8155,6 +8268,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         }
     }
@@ -8169,6 +8283,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         }
     }
@@ -8183,6 +8298,7 @@ mod tests {
             check_capture: false,
             capture_assistant: false,
             expected_profile: None,
+            chain_command_b64: None,
             capture_mode: None,
         }
     }
@@ -9122,6 +9238,7 @@ mod tests {
                 capture_assistant: false,
                 capture_mode: None,
                 expected_profile: None,
+                chain_command_b64: None,
             };
             let mut stdout = Vec::new();
             run_with_payload_in_home(
@@ -12577,5 +12694,178 @@ mod tests {
             seen.iter().any(|r| r.starts_with("POST /hook")),
             "the compaction itself is still captured: {seen:?}"
         );
+    }
+
+    #[test]
+    fn antigravity_statusline_records_usage_and_chains_existing_command() {
+        use base64::Engine as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let payload = serde_json::json!({
+            "cwd": "/tmp/proj",
+            "session_id": "agy-status-1",
+            "model": { "id": "Gemini 3.8 Flash", "display_name": "Gemini 3.8 Flash" },
+            "context_window": {
+                "total_input_tokens": 1234,
+                "total_output_tokens": 567,
+                "used_percentage": 15.0
+            }
+        });
+        let raw_bytes = serde_json::to_vec(&payload).unwrap();
+
+        // 1. Unchained: records snapshot, prints nothing to stdout, exits 0.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_antigravity_statusline(&data_dir, None, &raw_bytes, &mut out, &mut err);
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "unchained statusline must emit empty stdout"
+        );
+        let usage =
+            crate::commands::session_usage::read_antigravity_usage(&data_dir, "agy-status-1")
+                .expect("statusline must persist nonzero usage");
+        assert_eq!(usage.input_tokens, 1234);
+        assert_eq!(usage.output_tokens, 567);
+        assert_eq!(usage.model.as_deref(), Some("Gemini 3.8 Flash"));
+
+        // 2. Chained user command: receives exact stdin bytes, stdout and exit
+        //    code are forwarded untouched, and higher counters update snapshot.
+        let next_payload = serde_json::json!({
+            "session_id": "agy-status-1",
+            "context_window": {
+                "total_input_tokens": 2000,
+                "total_output_tokens": 900
+            }
+        });
+        let next_bytes = serde_json::to_vec(&next_payload).unwrap();
+        #[cfg(not(windows))]
+        let user_cmd = "cat; printf '|user-bar'; exit 7";
+        #[cfg(windows)]
+        let user_cmd = "more & echo |user-bar & exit /b 7";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(user_cmd);
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        let code2 =
+            run_antigravity_statusline(&data_dir, Some(&b64), &next_bytes, &mut out2, &mut err2);
+        assert_eq!(code2, 7, "chained command exit code must be forwarded");
+        let out_str = String::from_utf8_lossy(&out2);
+        assert!(
+            out_str.contains("agy-status-1") && out_str.contains("|user-bar"),
+            "chained command must receive stdin and forward stdout: {out_str}"
+        );
+        let updated =
+            crate::commands::session_usage::read_antigravity_usage(&data_dir, "agy-status-1")
+                .expect("chained statusline must still update usage");
+        assert_eq!(updated.input_tokens, 2000);
+        assert_eq!(updated.output_tokens, 900);
+    }
+
+    #[tokio::test]
+    async fn antigravity_stop_and_session_end_attach_cached_usage_and_omit_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+
+        // Percentage-only statusline payload must leave usage unknown.
+        let pct_only = serde_json::to_vec(&serde_json::json!({
+            "session_id": "agy-conv-pct",
+            "context_window": { "used_percentage": 50.0, "context_window_size": 1_000_000 }
+        }))
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            run_antigravity_statusline(&data_dir, None, &pct_only, &mut out, &mut err),
+            0
+        );
+
+        // Stop for agy-conv-pct must omit `_ai_memory_usage`.
+        let mut stop_out = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("stop", "http://127.0.0.1:49374"),
+            serde_json::json!({
+                "conversationId": "agy-conv-pct",
+                "cwd": proj,
+                "fullyIdle": true,
+                "terminationReason": "NO_TOOL_CALL"
+            })
+            .to_string(),
+            &mut stop_out,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let bodies: Vec<serde_json::Value> = fs::read_dir(&spool)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|e| {
+                let entry: serde_json::Value =
+                    serde_json::from_slice(&fs::read(e.path()).unwrap()).unwrap();
+                serde_json::from_str(entry["body"].as_str().unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].get("_ai_memory_usage").is_none(),
+            "percentage-only statusline must omit _ai_memory_usage"
+        );
+
+        // Now record real nonzero usage for agy-conv-real and fire Stop + SessionEnd.
+        let real_status = serde_json::to_vec(&serde_json::json!({
+            "session_id": "agy-conv-real",
+            "model": { "id": "Gemini 3.8 Pro" },
+            "context_window": {
+                "total_input_tokens": 4200,
+                "total_output_tokens": 880
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            run_antigravity_statusline(&data_dir, None, &real_status, &mut out, &mut err),
+            0
+        );
+        for event in ["stop", "session-end"] {
+            let mut hook_out = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                antigravity_hook_args(event, "http://127.0.0.1:49374"),
+                serde_json::json!({
+                    "conversationId": "agy-conv-real",
+                    "cwd": proj,
+                    "fullyIdle": true,
+                    "terminationReason": "NO_TOOL_CALL"
+                })
+                .to_string(),
+                &mut hook_out,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        }
+        let real_bodies: Vec<serde_json::Value> = fs::read_dir(&spool)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|e| {
+                let entry: serde_json::Value =
+                    serde_json::from_slice(&fs::read(e.path()).unwrap()).unwrap();
+                serde_json::from_str::<serde_json::Value>(entry["body"].as_str().unwrap()).unwrap()
+            })
+            .filter(|b| b["conversationId"].as_str() == Some("agy-conv-real"))
+            .collect();
+        assert_eq!(real_bodies.len(), 2);
+        for body in real_bodies {
+            let u = body
+                .get("_ai_memory_usage")
+                .expect("Antigravity Stop/SessionEnd must attach cached _ai_memory_usage");
+            assert_eq!(u["input_tokens"].as_u64(), Some(4200));
+            assert_eq!(u["output_tokens"].as_u64(), Some(880));
+            assert_eq!(u["model"].as_str(), Some("Gemini 3.8 Pro"));
+        }
     }
 }

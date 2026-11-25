@@ -1118,6 +1118,17 @@ therefore includes inherited usage, not only work billed after the fork.
 Pi does **not** yet send individual response records to the Token usage ledger;
 session totals and coverage can be present while its response table is empty.
 
+OpenCode 2 reports measured assistant response usage via its updated generated
+plugin (`ai-memory install-hooks --agent opencode2 --apply`), deduplicated by
+native message ID on `stop` and `session-end` so streaming updates and plugin
+reloads do not double-count. Antigravity CLI reports cumulative session totals
+by observing its `statusLine` payload (`ai-memory install-hooks --agent
+antigravity-cli --apply`), caching measured `total_input_tokens` and
+`total_output_tokens` locally and attaching them on `stop` and `session-end`
+while chaining any pre-existing user `statusLine` command untouched (and
+restoring it on uninstall). Missing, zero, or percentage-only payloads stay
+unknown.
+
 The metric cards are navigation controls. Workspace cards sort the project
 list by the selected count, and Open sessions also selects projects that have
 an unfinished session. Project cards open the matching Agents, Sessions,
