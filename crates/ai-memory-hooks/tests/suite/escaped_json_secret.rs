@@ -61,20 +61,20 @@ async fn every_object_shaped_tool_result_is_redacted_in_the_stored_tool_body() {
     let state = make_state(&tmp).await;
     for (label, agent, tool_response, survivor) in [
         (
-            "json file in a claude code bash result",
-            "claude-code",
+            "json file in a command code bash result",
+            "command-code",
             serde_json::json!({"stdout": format!("{{\"db_password\": \"{SECRET}\"}}\n"), "stderr": "", "interrupted": false}),
             r#""interrupted":false"#,
         ),
         (
-            "compact json file in a claude code bash result",
-            "claude-code",
+            "compact json file in a command code bash result",
+            "command-code",
             serde_json::json!({"stdout": format!("{{\"SESSION_SECRET\":\"{SECRET}\"}}"), "stderr": "", "interrupted": false}),
             r#""interrupted":false"#,
         ),
         (
-            "a .env past its first line in a claude code bash result",
-            "claude-code",
+            "a .env past its first line in a command code bash result",
+            "command-code",
             serde_json::json!({"stdout": format!("DB_HOST=x\nSTRIPE_SECRET={SECRET}\nPORT=5432\n"), "stderr": "", "interrupted": false}),
             r#"\nPORT=5432\n","stderr":"","interrupted":false"#,
         ),
@@ -148,7 +148,7 @@ async fn an_object_shaped_tool_result_without_a_secret_is_stored_whole() {
         "interrupted": false,
     });
     let expected = serde_json::to_string(&tool_response).unwrap();
-    let body = stored_tool_body(&state, "claude-code", tool_response).await;
+    let body = stored_tool_body(&state, "command-code", tool_response).await;
     assert!(
         body.ends_with(&expected),
         "harmless result must be stored whole: {body:?}"
