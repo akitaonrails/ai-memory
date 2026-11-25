@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode 2 plugin now persists lightweight per-session ownership markers on
+  disk so `session.deleted` still emits `session-end` (preserving subagent
+  `agent_id`, location ownership, and `session.moved` rebinding) after the
+  location plugin reloads, while ignoring uncaptured sessions and preventing
+  duplicate `session-end` deliveries. (#2485)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
