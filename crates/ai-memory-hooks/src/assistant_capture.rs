@@ -143,7 +143,7 @@ pub fn transform_for_client(
     // not a reply (Claude Code and Qwen Code `StopFailure`), and an
     // interrupted turn has no reply, so neither is a candidate.
     let reply_field =
-        assistant_message_field(agent, event).filter(|_| abnormal_turn_end(raw).is_none());
+        assistant_message_field(agent, event).filter(|_| abnormal_turn_end(agent, raw).is_none());
     let candidate = reply_field.and_then(|field| {
         raw.as_object()
             .and_then(|object| object.get(field))
@@ -208,7 +208,7 @@ pub fn apply_assistant_backstop(env: &mut HookEnvelope, server_enabled: bool, ma
     let eligible = server_enabled
         && env.capture_assistant_requested
         && assistant_message_field(env.agent, env.event).is_some()
-        && abnormal_turn_end(&env.raw).is_none();
+        && abnormal_turn_end(env.agent, &env.raw).is_none();
     if !eligible {
         return;
     }

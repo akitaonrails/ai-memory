@@ -355,6 +355,10 @@ pub(crate) fn body_is_subagent(agent: AgentKind, raw: &serde_json::Value) -> boo
 ///   (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts#L419-L421>);
 ///   Codex sends only the common fields
 ///   (<https://github.com/openai/codex/blob/d32063f96c2dff1dc96af839b3952abb6acfeda4/codex-rs/hooks/src/schema.rs#L628-L639>).
+/// - Cursor has no separate event: its `stop` carries a `status` of
+///   `completed`, `aborted` or `error` (<https://cursor.com/docs/agent/hooks>,
+///   stop), so `aborted` reads as an interrupted turn and `error` as a failed
+///   one, neither with details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AbnormalTurnEnd {
     /// An API error ended the turn: its type and details, when sent.
@@ -368,7 +372,10 @@ pub(crate) enum AbnormalTurnEnd {
 
 /// The abnormal end a `Stop`-shaped payload reports, `None` for a normal turn
 /// end. See [`AbnormalTurnEnd`].
-pub(crate) fn abnormal_turn_end(raw: &serde_json::Value) -> Option<AbnormalTurnEnd> {
+pub(crate) fn abnormal_turn_end(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<AbnormalTurnEnd> {
     match raw
         .get("hook_event_name")
         .and_then(serde_json::Value::as_str)
@@ -380,6 +387,16 @@ pub(crate) fn abnormal_turn_end(raw: &serde_json::Value) -> Option<AbnormalTurnE
         Some("Interrupt") => Some(AbnormalTurnEnd::Interrupted {
             reason: extract_string(raw, &["reason"]).and_then(first_line),
         }),
+        _ if agent == AgentKind::Cursor => {
+            match raw.get("status").and_then(serde_json::Value::as_str) {
+                Some("aborted") => Some(AbnormalTurnEnd::Interrupted { reason: None }),
+                Some("error") => Some(AbnormalTurnEnd::Failed {
+                    error: None,
+                    details: None,
+                }),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1462,7 +1479,7 @@ fn best_title_hint(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) 
         }
         HookEvent::Notification => extract_string(raw, &["message", "text"]).and_then(first_line),
         HookEvent::PostCompaction => extract_string(raw, &["summary"]).and_then(first_line),
-        HookEvent::Stop => abnormal_turn_end(raw).map(|end| match end {
+        HookEvent::Stop => abnormal_turn_end(agent, raw).map(|end| match end {
             AbnormalTurnEnd::Failed {
                 error: Some(error), ..
             } => format!("stop failure: {error}"),
@@ -1581,7 +1598,7 @@ fn best_body_excerpt(
         // first-line fields. The harness's rendered error text in
         // `last_assistant_message` is not used: it stays stripped like any
         // assistant message.
-        HookEvent::Stop => abnormal_turn_end(raw).and_then(|end| match end {
+        HookEvent::Stop => abnormal_turn_end(agent, raw).and_then(|end| match end {
             AbnormalTurnEnd::Failed { error, details } => {
                 let lines: Vec<String> = [
                     error.map(|error| format!("error: {error}")),
