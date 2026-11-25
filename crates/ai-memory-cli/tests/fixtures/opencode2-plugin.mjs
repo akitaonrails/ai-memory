@@ -196,6 +196,89 @@ try {
   await disposeB();
 }
 
+// #2485: deleting a session after plugin reload still sends session-end once,
+// preserves subagent ancestry, ignores never-captured IDs, and tracks moves.
+{
+  const sessionEnds = (id) =>
+    requests.filter((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === id);
+  records.set("reload-root", info("reload-root"));
+  records.set("reload-child", info("reload-child", "reload-root"));
+  records.set("move-root", info("move-root"));
+
+  const instA = host(root, records);
+  const disposeInstA = await plugin.setup(instA.ctx);
+  await instA.hooks.get("session.prompt")({ sessionID: "reload-root", messageID: "rr1", prompt: { text: "reload root" } });
+  await instA.hooks.get("session.prompt")({ sessionID: "reload-child", messageID: "rc1", prompt: { text: "reload child" } });
+  await disposeInstA();
+  assert.equal(sessionEnds("reload-root").length, 0, "dispose must not end reload-root");
+  assert.equal(sessionEnds("reload-child").length, 0, "dispose must not end reload-child");
+
+  // Simulate deleted sessions returning 404 from ctx.session.get.
+  records.delete("reload-root");
+  records.delete("reload-child");
+
+  const instB = host(root, records);
+  const instC = host(root + "/beta", records);
+  const disposeInstB = await plugin.setup(instB.ctx);
+  const disposeInstC = await plugin.setup(instC.ctx);
+  try {
+    for (const id of ["reload-root", "reload-child"]) {
+      instB.emit({ type: "session.deleted", data: { sessionID: id } });
+      instC.emit({ type: "session.deleted", data: { sessionID: id } });
+    }
+    await until(() => sessionEnds("reload-root").length === 1 && sessionEnds("reload-child").length === 1,
+      "reloaded location instance must end persisted sessions");
+
+    // Re-delivering session.deleted and deleting an unknown/never-captured session
+    // must not emit duplicates or fabricate rows.
+    for (const id of ["reload-root", "reload-child", "never-captured"]) {
+      instB.emit({ type: "session.deleted", data: { sessionID: id } });
+      instC.emit({ type: "session.deleted", data: { sessionID: id } });
+    }
+  } finally {
+    await Promise.all([disposeInstB(), disposeInstC()]);
+  }
+  assert.equal(sessionEnds("reload-root").length, 1, "reload-root must end exactly once");
+  assert.equal(sessionEnds("reload-root")[0].payload.cwd, root);
+  assert.equal(sessionEnds("reload-root")[0].payload.agent_id, undefined);
+  assert.equal(sessionEnds("reload-child").length, 1, "reload-child must end exactly once");
+  assert.equal(sessionEnds("reload-child")[0].payload.cwd, root);
+  assert.equal(sessionEnds("reload-child")[0].payload.agent_id, "reload-root", "subagent must retain agent_id after reload");
+  assert.equal(sessionEnds("never-captured").length, 0, "unknown session must not emit session-end");
+
+  // Moving a session from dir A to dir B, reloading, then deleting: only B ends it with B's cwd.
+  const moveA = host(root, records);
+  const moveB = host(root + "/beta", records);
+  const disposeMoveA = await plugin.setup(moveA.ctx);
+  const disposeMoveB = await plugin.setup(moveB.ctx);
+  try {
+    await moveA.hooks.get("session.prompt")({ sessionID: "move-root", messageID: "mr1", prompt: { text: "before move" } });
+    records.set("move-root", { ...info("move-root"), location: { directory: root + "/beta" } });
+    const moveEvent = { type: "session.moved", data: { sessionID: "move-root", location: { directory: root + "/beta" } } };
+    moveA.emit(moveEvent);
+    moveB.emit(moveEvent);
+    await until(() => requests.some((r) => r.url.searchParams.get("event") === "session-start" && r.payload.sessionID === "move-root" && r.payload.session_moved === true),
+      "session move transition must be emitted");
+  } finally {
+    await Promise.all([disposeMoveA(), disposeMoveB()]);
+  }
+  records.delete("move-root");
+  const moveA2 = host(root, records);
+  const moveB2 = host(root + "/beta", records);
+  const disposeMoveA2 = await plugin.setup(moveA2.ctx);
+  const disposeMoveB2 = await plugin.setup(moveB2.ctx);
+  try {
+    moveA2.emit({ type: "session.deleted", data: { sessionID: "move-root" } });
+    moveB2.emit({ type: "session.deleted", data: { sessionID: "move-root" } });
+    await until(() => sessionEnds("move-root").length === 1, "moved session must end after reload");
+  } finally {
+    await Promise.all([disposeMoveA2(), disposeMoveB2()]);
+  }
+  assert.equal(sessionEnds("move-root").length, 1, "moved session must end exactly once");
+  assert.equal(sessionEnds("move-root")[0].payload.cwd, root + "/beta", "moved session must end with destination cwd");
+  console.log("PASS: reloaded plugin ends deleted sessions once, preserves subagent ancestry, ignores unknown IDs, and tracks moves");
+}
+
 const spool = join(process.env.AI_MEMORY_DATA_DIR, "hook-spool");
 const realNow = Date.now;
 globalThis.fetch = async () => { throw new Error("offline fixture"); };
