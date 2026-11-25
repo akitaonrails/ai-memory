@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added optional `kind`, `tier`, `path_prefix` and `tag` filters to
+  `GET`/`POST /api/v1/search`, applied before ranking and only with an explicit
+  project or scope. (#2492)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

@@ -484,14 +484,26 @@ async fn search_with_request(
             "scopes cannot be combined with workspace/project",
         ));
     }
+    let filter = search_page_filter(&request)?;
     let hits = match scoped_search_mode(state, &request, viewer).await? {
-        SearchMode::Global => state.reader.search_pages(term, limit, viewer).await,
+        SearchMode::Global => {
+            let filtered = filter.kind.is_some()
+                || filter.tier.is_some()
+                || filter.path_prefix.is_some()
+                || filter.tag.is_some();
+            if filtered {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "filters require an explicit project or scope",
+                ));
+            }
+            state.reader.search_pages(term, limit, viewer).await
+        }
         SearchMode::Scoped(scopes) => {
             let scopes: Vec<(WorkspaceId, ProjectId)> = scopes
                 .iter()
                 .map(|scope| (scope.workspace_id, scope.project_id))
                 .collect();
-            let filter = ai_memory_store::PageFilter::default();
             crate::recall::search_scopes(state, &scopes, &term, limit, false, owner, filter)
                 .await
                 .map(|result| result.hits.into_iter().map(|(hit, _)| hit).collect())
@@ -507,6 +519,56 @@ async fn search_with_request(
     Ok(with_no_store(
         Json(enrich_hits(state, hits).await?).into_response(),
     ))
+}
+
+/// Validate the optional page-metadata filters and borrow them from
+/// `request` for the store's pre-ranking `PageFilter`.
+#[allow(clippy::result_large_err)] // the handler error is the router's `Response`.
+fn search_page_filter(
+    request: &SearchRequest,
+) -> Result<ai_memory_store::PageFilter<'_>, Response> {
+    let kind = match trimmed_opt(request.kind.as_deref()) {
+        Some(kind) if kind.len() > ai_memory_core::page::MAX_PAGE_KIND_LEN => {
+            return Err(json_error(StatusCode::BAD_REQUEST, "kind is too long"));
+        }
+        other => other,
+    };
+    let tier = match trimmed_opt(request.tier.as_deref()) {
+        Some(tier) => Some(
+            ai_memory_core::Tier::ALL
+                .iter()
+                .find(|candidate| candidate.as_str().eq_ignore_ascii_case(tier))
+                .map(ai_memory_core::Tier::as_str)
+                .ok_or_else(|| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        "tier must be working, episodic, semantic or procedural",
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let path_prefix = match trimmed_opt(request.path_prefix.as_deref()) {
+        Some(path_prefix) if path_prefix.len() > MAX_SEARCH_FILTER_LEN => {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "path_prefix is too long",
+            ));
+        }
+        other => other,
+    };
+    let tag = match trimmed_opt(request.tag.as_deref()) {
+        Some(tag) if tag.len() > MAX_SEARCH_FILTER_LEN => {
+            return Err(json_error(StatusCode::BAD_REQUEST, "tag is too long"));
+        }
+        other => other,
+    };
+    Ok(ai_memory_store::PageFilter {
+        kind,
+        tier,
+        path_prefix,
+        tag,
+    })
 }
 
 async fn scoped_search_mode(
@@ -1459,6 +1521,7 @@ fn default_limit() -> usize {
 }
 
 const MAX_SEARCH_SCOPES: usize = 25;
+const MAX_SEARCH_FILTER_LEN: usize = 512;
 
 #[derive(Debug, Deserialize)]
 struct ProjectListQuery {
@@ -1481,6 +1544,10 @@ struct SearchQuery {
     project: Option<String>,
     scope: Vec<String>,
     limit: usize,
+    kind: Option<String>,
+    tier: Option<String>,
+    path_prefix: Option<String>,
+    tag: Option<String>,
 }
 
 impl SearchQuery {
@@ -1491,6 +1558,10 @@ impl SearchQuery {
             q: String::new(),
             scope: Vec::new(),
             workspace: None,
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
         };
         let Some(raw_query) = raw_query else {
             return Ok(query);
@@ -1509,6 +1580,10 @@ impl SearchQuery {
                 "q" | "query" => query.q = value,
                 "scope" => query.scope.push(value),
                 "workspace" => query.workspace = Some(value),
+                "kind" => query.kind = Some(value),
+                "tier" => query.tier = Some(value),
+                "path_prefix" => query.path_prefix = Some(value),
+                "tag" => query.tag = Some(value),
                 _ => {}
             }
         }
@@ -1530,6 +1605,10 @@ impl SearchQuery {
             q: self.q,
             scopes,
             workspace: self.workspace,
+            kind: self.kind,
+            tier: self.tier,
+            path_prefix: self.path_prefix,
+            tag: self.tag,
         })
     }
 }
@@ -1546,6 +1625,14 @@ struct SearchRequest {
     scopes: Vec<ApiSearchScope>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -295,6 +295,12 @@ async fn api_paths(router: &Router, query: &str) -> Vec<String> {
     paths(&serde_json::from_str(&body).unwrap())
 }
 
+async fn api_paths_of(router: &Router, uri: &str) -> Vec<String> {
+    let (status, body) = get(router, uri).await;
+    assert_eq!(status, 200, "{body}");
+    paths(&serde_json::from_str(&body).unwrap())
+}
+
 /// Hit paths in page order, read from the `data-hit-path` attribute.
 fn html_paths(body: &str) -> Vec<String> {
     body.split("data-hit-path=\"")
@@ -415,6 +421,50 @@ async fn scoped_api_search_merges_scopes_like_memory_query() {
         let got = paths(&serde_json::from_slice(&bytes).unwrap());
         assert_eq!(got, expected, "{query}: scopes");
     }
+}
+
+/// Page-metadata filters narrow the candidate set before the limit and rank,
+/// so a filtered `limit = 1` returns the best hit *inside* the filter even
+/// though the unfiltered top hit is outside it.
+#[tokio::test]
+async fn api_search_applies_metadata_filters_before_ranking() {
+    let s = seed().await;
+    let outside = "notes/zorblat.md";
+    let inside = "decisions/zorblat.md";
+    for (path, body) in [
+        (outside, "# Zorblat\n\nZorblat lives in the notes tree."),
+        (inside, "# Zorblat\n\nZorblat lives in the decisions tree."),
+    ] {
+        s.wiki
+            .write_page(write_req(s.ws, s.alpha, path, body))
+            .await
+            .unwrap();
+    }
+    let web = web(&s, None);
+    let base = "/api/v1/search?q=zorblat&workspace=default&project=alpha";
+
+    let top = api_paths_of(&web, &format!("{base}&limit=1")).await;
+    assert_eq!(top.len(), 1, "{top:?}");
+    let (higher, lower, prefix) = match top[0].as_str() {
+        path if path == outside => (outside, inside, "decisions/"),
+        path if path == inside => (inside, outside, "notes/"),
+        other => panic!("unexpected unfiltered hit: {other}"),
+    };
+
+    assert_eq!(
+        api_paths_of(&web, &format!("{base}&limit=1&path_prefix={prefix}")).await,
+        vec![lower.to_owned()],
+        "the filter must run before the limit cut, not after"
+    );
+    assert_eq!(
+        api_paths_of(&web, &format!("{base}&limit=1")).await,
+        vec![higher.to_owned()],
+        "the unfiltered request must keep returning the other page"
+    );
+
+    let (status, body) = get(&web, "/api/v1/search?q=zorblat&kind=fact").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("explicit project or scope"), "{body}");
 }
 
 /// The parity assertions above can fail: without the embedder (the web
