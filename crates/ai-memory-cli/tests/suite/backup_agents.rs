@@ -2346,3 +2346,108 @@ fn backup_agents_include_secrets_and_malformed_config_fallback() {
         raw_codex
     );
 }
+
+/// The documented matrix and `discover_assets` drifted twice: OpenCode global
+/// skills (#2469) and Gemini CLI project skills (#2472) were listed in
+/// `docs/design-backup-agent-assets.md` but never collected. Every root the
+/// matrix names must survive a real `backup-agents` and `restore-agents`.
+#[test]
+fn every_documented_skill_root_survives_a_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let agents = "claude,codex,antigravity,gemini,qwen,qoder,opencode,devin,grok,kimi-code,kiro-cli,copilot-cli";
+
+    // Section "2. Target Matrix by Agent Harness", Skills column: the
+    // (scope, root, file name) every supported harness documents.
+    let documented = [
+        ("global", ".claude/skills", "SKILL.md"),
+        ("global", ".agents/skills", "SKILL.md"),
+        ("global", ".codex/skills", "SKILL.md"),
+        ("global", ".gemini/config/skills", "SKILL.md"),
+        ("global", ".gemini/antigravity-cli/skills", "SKILL.md"),
+        ("global", ".gemini/skills", "SKILL.md"),
+        ("global", ".qwen/skills", "SKILL.md"),
+        ("global", ".config/opencode/skills", "SKILL.md"),
+        ("global", ".config/devin/skills", "SKILL.md"),
+        ("global", ".grok/skills", "SKILL.md"),
+        ("global", ".kimi-code/skills", "SKILL.md"),
+        ("global", ".copilot/skills", "SKILL.md"),
+        ("global", ".kiro/agents", "example.json"),
+        ("project", ".claude/skills", "SKILL.md"),
+        ("project", ".agents/skills", "SKILL.md"),
+        ("project", ".gemini/skills", "SKILL.md"),
+        ("project", ".github/skills", "SKILL.md"),
+        ("project", ".devin/skills", "SKILL.md"),
+        ("project", ".grok/skills", "SKILL.md"),
+    ];
+
+    let body_for = |root: &str, file_name: &str| {
+        if file_name == "SKILL.md" {
+            format!("# parity {root}")
+        } else {
+            "{}".to_string()
+        }
+    };
+    let asset_path = |base: &Path, root: &str, file_name: &str| {
+        if file_name == "SKILL.md" {
+            base.join(root).join("example").join(file_name)
+        } else {
+            base.join(root).join(file_name)
+        }
+    };
+
+    for (scope, root, file_name) in documented {
+        let base = if scope == "global" {
+            home.path()
+        } else {
+            project.path()
+        };
+        let path = asset_path(base, root, file_name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body_for(root, file_name)).unwrap();
+    }
+
+    let archive = project.path().join("documented-skills.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, agents))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, agents))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (scope, root, file_name) in documented {
+        let base = if scope == "global" {
+            restored_home.path()
+        } else {
+            restored_project.path()
+        };
+        let path = asset_path(base, root, file_name);
+        assert!(
+            path.exists(),
+            "documented root {root} ({scope}) did not survive the round trip"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            body_for(root, file_name).into_bytes(),
+            "documented root {root} ({scope}) did not survive the round trip"
+        );
+    }
+
+    // Keep the table above honest: a root the doc no longer lists, or one the
+    // test forgot, surfaces here instead of silently growing stale.
+    let doc = include_str!("../../../../docs/design-backup-agent-assets.md");
+    for (_, root, _) in documented {
+        assert!(
+            doc.contains(root),
+            "documented root {root} is missing from docs/design-backup-agent-assets.md"
+        );
+    }
+}
