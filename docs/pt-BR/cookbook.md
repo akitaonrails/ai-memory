@@ -651,18 +651,23 @@ com três consequências em um servidor solo:
 
   ```bash
   ai-memory() {
-      local want_jail=0 no_jail=0 arg
+      local want_jail=0 no_jail=0 has_no_autowire=0 arg
       if [ "${1:-}" = "run" ] && [ -z "${AI_MEMORY_AUTH_TOKEN:-}" ] && [ -r "$HOME/.config/ai-memory/jail.token" ]; then
           for arg in "${@:2}"; do
               case "$arg" in
                   --) break ;;
                   --no-jail) no_jail=1 ;;
+                  --no-autowire) has_no_autowire=1 ;;
                   --jail|--jail=*|--yolo) want_jail=1 ;;
               esac
           done
       fi
       if [ "$want_jail" -eq 1 ] && [ "$no_jail" -eq 0 ]; then
-          AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory "$@"
+          if [ "$has_no_autowire" -eq 1 ]; then
+              AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory "$@"
+          else
+              AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory run --no-autowire "${@:2}"
+          fi
       else
           command ai-memory "$@"
       fi
@@ -670,8 +675,14 @@ com três consequências em um servidor solo:
   ```
 
   Execuções com `--jail` ou `--yolo` (sem `--no-jail`) recebem apenas a chave
-  `aim_`, enquanto comandos admin e execuções comuns continuam usando
-  `bearer_token_file`.
+  `aim_` e `--no-autowire`, enquanto comandos admin e execuções comuns
+  continuam usando `bearer_token_file`. Passar `--no-autowire` impede que o
+  re-exec dentro do home privado do `ai-jail` (onde
+  `<data_dir>/autowire-state` fica oculto) rode o auto-wire novamente com a
+  chave `aim_` inline e troque uma entrada `mcp-bridge` por um cabeçalho fixo;
+  configure cada harness uma vez fora da `--jail` (ou com
+  `ai-memory install-mcp --client <harness> --apply`) para que sessões sem
+  jail mantenham acesso root e sessões na jail usem `AI_MEMORY_AUTH_TOKEN`.
 
 Consulte [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) para o
 contrato completo.

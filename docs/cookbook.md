@@ -652,18 +652,23 @@ which has three consequences on a solo server:
 
   ```bash
   ai-memory() {
-      local want_jail=0 no_jail=0 arg
+      local want_jail=0 no_jail=0 has_no_autowire=0 arg
       if [ "${1:-}" = "run" ] && [ -z "${AI_MEMORY_AUTH_TOKEN:-}" ] && [ -r "$HOME/.config/ai-memory/jail.token" ]; then
           for arg in "${@:2}"; do
               case "$arg" in
                   --) break ;;
                   --no-jail) no_jail=1 ;;
+                  --no-autowire) has_no_autowire=1 ;;
                   --jail|--jail=*|--yolo) want_jail=1 ;;
               esac
           done
       fi
       if [ "$want_jail" -eq 1 ] && [ "$no_jail" -eq 0 ]; then
-          AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory "$@"
+          if [ "$has_no_autowire" -eq 1 ]; then
+              AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory "$@"
+          else
+              AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory run --no-autowire "${@:2}"
+          fi
       else
           command ai-memory "$@"
       fi
@@ -671,8 +676,13 @@ which has three consequences on a solo server:
   ```
 
   Launches with `--jail` or `--yolo` (without `--no-jail`) receive only the
-  `aim_` key, while admin commands and plain runs keep using
-  `bearer_token_file`.
+  `aim_` key and `--no-autowire`, while admin commands and plain runs keep
+  using `bearer_token_file`. Passing `--no-autowire` stops the re-exec inside
+  `ai-jail`'s private home (where `<data_dir>/autowire-state` is hidden) from
+  re-running MCP auto-wiring with the inline `aim_` key and replacing a
+  `mcp-bridge` entry with a static header; wire each harness once outside
+  `--jail` (or with `ai-memory install-mcp --client <harness> --apply`) so
+  unjailed runs keep root access and jailed runs use `AI_MEMORY_AUTH_TOKEN`.
 
 See [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) for the
 full contract.
