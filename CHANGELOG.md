@@ -47,6 +47,12 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed `backup-agents` to archive Gemini CLI plugins from `~/.gemini/plugins`,
   the second plugin root the asset matrix lists beside Antigravity's. (#2477)
 
+### Fixed
+
+- Kept spooled hook events queued instead of charging a retry when a request
+  deadline shorter than the 2 s connect budget expires while still connecting.
+  (#2465)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
