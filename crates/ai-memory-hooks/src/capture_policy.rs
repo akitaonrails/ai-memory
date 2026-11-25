@@ -1047,6 +1047,21 @@ impl CapturePolicy {
                 _ => (CaptureDisposition::Keep, extracted.state),
             },
         };
+        // A file the command changed is as much the call's as one it names:
+        // an ignored one drops the call, and a list that cannot be matched
+        // proves nothing.
+        let edited = match (self.state, &extracted.edited) {
+            (PolicyState::Active, Some(Ok(paths))) => match self.match_paths(paths, cwd) {
+                Ok(true) => Some(CaptureDisposition::Drop),
+                Ok(false) => None,
+                Err(()) => Some(CaptureDisposition::MetadataOnly),
+            },
+            _ => None,
+        };
+        let disposition = match (disposition, edited) {
+            (CaptureDisposition::Drop, _) | (_, None) => disposition,
+            (_, Some(edited)) => edited,
+        };
         CaptureDecision {
             protocol: CaptureProtocol::new(
                 disposition,
@@ -1357,6 +1372,9 @@ struct Extracted<'a> {
     powershell: bool,
     /// A non-file tool whose input is program source ([`INLINE_CODE_TOOL_NAMES`]).
     inline_code: bool,
+    /// The files Claude Code says the call changed ([`bash_edit_diff_paths`]);
+    /// `Err` when its list cannot be read.
+    edited: Option<Result<Vec<String>, ()>>,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -1556,9 +1574,53 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         powershell: name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh"),
         inline_code: family == ToolFamily::NonFile
             && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
+        edited: (agent == AgentKind::ClaudeCode)
+            .then(|| bash_edit_diff_paths(object))
+            .flatten(),
         call_id,
         state,
     }
+}
+
+/// The most files Claude Code lists as changed by one shell command.
+const MAX_BASH_EDIT_DIFF_FILES: usize = 200;
+
+/// The files a Claude Code shell command changed, from its PostToolUse
+/// `tool_response.bashEditDiff` (v2.1.269+, the Bash section of
+/// <https://code.claude.com/docs/en/hooks>): `changedFiles`, absolute paths
+/// of at most 200 files, and the `filePath` of each diff in `files`. A
+/// command that names no file on its command line (`make gen`) can still
+/// rewrite one, and the diff carries its old and new lines. `None` without a
+/// diff; `Err` for a list that is not that shape, or longer than Claude Code
+/// sends.
+fn bash_edit_diff_paths(object: &Map<String, Value>) -> Option<Result<Vec<String>, ()>> {
+    let diff = object.get("tool_response")?.get("bashEditDiff")?;
+    if diff.is_null() {
+        return None;
+    }
+    let read = || -> Option<Vec<String>> {
+        let diff = diff.as_object()?;
+        let listed = |key: &str| match diff.get(key) {
+            None => Some(&[][..]),
+            Some(value) => value.as_array().map(Vec::as_slice),
+        };
+        let mut paths: Vec<String> = Vec::new();
+        let changed = listed("changedFiles")?.iter().map(Value::as_str);
+        let diffed = listed("files")?
+            .iter()
+            .map(|file| file.get("filePath").and_then(Value::as_str));
+        for path in changed.chain(diffed) {
+            let path = path?;
+            if !paths.iter().any(|seen| seen == path) {
+                if paths.len() == MAX_BASH_EDIT_DIFF_FILES {
+                    return None;
+                }
+                paths.push(path.to_owned());
+            }
+        }
+        Some(paths)
+    };
+    Some(read().ok_or(()))
 }
 
 /// [`family`] plus tool names only one agent is documented to use, so a
