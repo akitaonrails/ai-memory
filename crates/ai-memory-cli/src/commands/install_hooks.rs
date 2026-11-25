@@ -5250,7 +5250,10 @@ const OPENCODE2_BINDING: &str = r#"
                 if (!(await ensureSession(id))) continue;
                 const model = typeof part.modelID === "string" ? part.modelID
                   : typeof part.model?.id === "string" ? part.model.id : undefined;
-                recordUsage(id, part.messageID ?? part.id, part.tokens, model);
+                // Native step events identify the assistant response as assistantMessageID.
+                // https://github.com/anomalyco/opencode/blob/v2.0.14/packages/schema/src/session-event.ts
+                const callID = part.assistantMessageID ?? part.messageID ?? part.id;
+                recordUsage(id, callID, part.tokens, model);
               }
             } else if (event.type === "session.execution.succeeded" ||
                        event.type === "session.execution.failed" ||
