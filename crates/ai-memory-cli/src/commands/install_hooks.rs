@@ -674,6 +674,16 @@ pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// `~/.gemini/antigravity-cli/settings.json` — Antigravity CLI settings
+/// (including `statusLine` for measured token-usage observation, #2486).
+pub(crate) fn antigravity_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.gemini/antigravity-cli/settings.json")?
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json"))
+}
+
 /// `~/.grok/hooks/ai-memory.json` — Grok Build CLI lifecycle hooks.
 pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
     grok_hooks_path_in(std::env::var_os("GROK_HOME"))
@@ -3864,9 +3874,128 @@ fn apply_to_antigravity_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    if args.config_file.is_none() {
+        let settings_path = antigravity_settings_path()?;
+        let statusline_outcome =
+            merge_antigravity_statusline(data_dir, &settings_path, args.absolute_paths)?;
+        println!(
+            "✓ {} {} ({})",
+            statusline_outcome.verb(),
+            settings_path.display(),
+            match statusline_outcome {
+                ApplyOutcome::Created => "new file",
+                ApplyOutcome::Updated => "backup written next to it",
+                ApplyOutcome::NoOp => "already up to date",
+            }
+        );
+    }
     println!();
     print!("{ANTIGRAVITY_FINALIZATION_GUIDANCE}");
     Ok(())
+}
+
+/// Recognize an ai-memory Antigravity CLI `statusLine.command` string.
+///
+/// Returns `None` if `command` is not an ai-memory statusline wrapper.
+/// Returns `Some(None)` if it is an ai-memory statusline wrapper with no
+/// chained user command. Returns `Some(Some(original))` if it wraps a
+/// pre-existing user `statusLine` command via `--chain-command-b64`.
+pub(crate) fn parse_antigravity_statusline_command(command: &str) -> Option<Option<String>> {
+    use base64::Engine as _;
+    let is_ours = command.contains("ai-memory")
+        && command.contains("hook")
+        && (command.contains("--event statusline --agent antigravity-cli")
+            || command.contains("--agent antigravity-cli --event statusline"));
+    if !is_ours {
+        return None;
+    }
+    const FLAG: &str = "--chain-command-b64 ";
+    let Some(pos) = command.find(FLAG) else {
+        return Some(None);
+    };
+    let rest = command[pos + FLAG.len()..].trim_start();
+    let token = if let Some(after_quote) = rest.strip_prefix('\'') {
+        after_quote.split('\'').next().unwrap_or("")
+    } else if let Some(after_quote) = rest.strip_prefix('"') {
+        after_quote.split('"').next().unwrap_or("")
+    } else {
+        rest.split_whitespace().next().unwrap_or("")
+    };
+    if token.is_empty() {
+        return Some(None);
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    Some(decoded)
+}
+
+/// Merge ai-memory's lightweight `statusLine` token-usage observer into
+/// Antigravity CLI's `settings.json` (`~/.gemini/antigravity-cli/settings.json`).
+///
+/// - When no `statusLine` exists, inserts one with `stack_with_default: true`
+///   so Antigravity's built-in status bar stays intact while ai-memory observes
+///   measured token totals silently.
+/// - When a user `statusLine.command` already exists, wraps it with
+///   `--chain-command-b64` while preserving all other `statusLine` settings.
+/// - On reinstall, recognizes the existing ai-memory wrapper and preserves its
+///   original chained command without double-wrapping.
+pub(crate) fn merge_antigravity_statusline(
+    data_dir: &Path,
+    settings_path: &Path,
+    absolute_paths: bool,
+) -> Result<ApplyOutcome> {
+    apply_atomic(settings_path, |existing| {
+        mutate_json(existing, |root| {
+            let had_statusline = root.get("statusLine").is_some();
+            let status_line = root
+                .entry("statusLine")
+                .or_insert_with(|| {
+                    serde_json::json!({
+                        "type": "command",
+                        "enabled": true,
+                        "stack_with_default": true,
+                    })
+                })
+                .as_object_mut()
+                .context("`statusLine` is present in settings.json but not an object")?;
+            let existing_cmd = status_line
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let chain_command: Option<String> = match existing_cmd {
+                None => None,
+                Some(cmd) => match parse_antigravity_statusline_command(cmd) {
+                    Some(existing_chain) => existing_chain,
+                    None => Some(cmd.to_owned()),
+                },
+            };
+            if !had_statusline || !status_line.contains_key("type") {
+                status_line.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("command".into()),
+                );
+            }
+            if !had_statusline {
+                status_line.insert("enabled".to_string(), serde_json::Value::Bool(true));
+                status_line.insert(
+                    "stack_with_default".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            let rendered = super::render_shared::build_antigravity_statusline_command(
+                data_dir,
+                absolute_paths,
+                chain_command.as_deref(),
+            );
+            status_line.insert("command".to_string(), serde_json::Value::String(rendered));
+            Ok(())
+        })
+    })
 }
 
 const ANTIGRAVITY_FINALIZATION_GUIDANCE: &str = "\
@@ -4830,6 +4959,17 @@ const OPENCODE2_BINDING: &str = r#"
     type SessionInfo = Awaited<ReturnType<typeof ctx.session.get>>;
     const sessions = new Map<SessionID, Promise<SessionInfo>>();
     const assistantText = new Map<SessionID, string>();
+    type UsageCall = {
+      call_id: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_write_tokens: number;
+      cache_read_tokens: number;
+      model?: string;
+    };
+    const usageCalls = new Map<SessionID, Map<string, UsageCall>>();
+    const MAX_USAGE_CALLS_PER_SESSION = 256;
+    const SAFE_CALL_ID = /^[A-Za-z0-9._:-]{1,128}$/;
     // Failed startup-context fetches per root session. A failure is retried on
     // the next model request, but only a few times: the `context` hook fires on
     // every model call, and a server slower than the fetch timeout keeps
@@ -4840,6 +4980,58 @@ const OPENCODE2_BINDING: &str = r#"
     // Stops listening on unload. Deliveries keep `hookAbort` until the queued
     // events have had their drain budget.
     const unload = new AbortController();
+
+    function nonNegInt(value: unknown): value is number {
+      return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    }
+
+    function recordUsage(sessionID: SessionID, rawCallID: unknown, tokens: any, rawModel: unknown): void {
+      if (typeof rawCallID !== "string" || !SAFE_CALL_ID.test(rawCallID)) return;
+      if (!tokens || typeof tokens !== "object") return;
+      const input = tokens.input === undefined ? 0 : tokens.input;
+      const output = tokens.output === undefined ? 0 : tokens.output;
+      const cache = tokens.cache && typeof tokens.cache === "object" ? tokens.cache : undefined;
+      const cacheRead = cache?.read === undefined ? 0 : cache.read;
+      const cacheWrite = cache?.write === undefined ? 0 : cache.write;
+      if (!nonNegInt(input) || !nonNegInt(output) || !nonNegInt(cacheRead) || !nonNegInt(cacheWrite)) {
+        return;
+      }
+      if (input + output + cacheRead + cacheWrite === 0) return;
+      const model = typeof rawModel === "string" && rawModel.trim().length > 0
+        ? rawModel.trim().slice(0, 64)
+        : undefined;
+      let perSession = usageCalls.get(sessionID);
+      if (!perSession) {
+        perSession = new Map();
+        usageCalls.set(sessionID, perSession);
+      }
+      const existing = perSession.get(rawCallID);
+      if (existing) {
+        existing.input_tokens = Math.max(existing.input_tokens, input);
+        existing.output_tokens = Math.max(existing.output_tokens, output);
+        existing.cache_read_tokens = Math.max(existing.cache_read_tokens, cacheRead);
+        existing.cache_write_tokens = Math.max(existing.cache_write_tokens, cacheWrite);
+        if (model) existing.model = model;
+        return;
+      }
+      if (perSession.size >= MAX_USAGE_CALLS_PER_SESSION) return;
+      const entry: UsageCall = {
+        call_id: rawCallID,
+        input_tokens: input,
+        output_tokens: output,
+        cache_write_tokens: cacheWrite,
+        cache_read_tokens: cacheRead,
+      };
+      if (model) entry.model = model;
+      perSession.set(rawCallID, entry);
+    }
+
+    function takeUsagePayload(id: SessionID): { _ai_memory_usage_calls?: UsageCall[] } {
+      const perSession = usageCalls.get(id);
+      if (!perSession || perSession.size === 0) return {};
+      usageCalls.delete(id);
+      return { _ai_memory_usage_calls: Array.from(perSession.values()) };
+    }
 
     async function sessionInfo(id: SessionID): Promise<SessionInfo> {
       let pending = sessions.get(id);
@@ -4863,6 +5055,7 @@ const OPENCODE2_BINDING: &str = r#"
     function forgetSession(id: SessionID): void {
       sessions.delete(id);
       assistantText.delete(id);
+      usageCalls.delete(id);
       handoffFetches.delete(id);
       handoffFailures.delete(id);
       recapFetches.delete(id);
@@ -4888,7 +5081,7 @@ const OPENCODE2_BINDING: &str = r#"
       if (!session) return;
       const text = assistantText.get(id);
       assistantText.delete(id);
-      const payload = { ...hookPayload(id, session), turn_checkpoint: !session.parentID };
+      const payload = { ...hookPayload(id, session), turn_checkpoint: !session.parentID, ...takeUsagePayload(id) };
       if (!NATIVE_HOOK || !text) {
         postHook("stop", payload);
         return;
@@ -4940,6 +5133,24 @@ const OPENCODE2_BINDING: &str = r#"
               } else {
                 assistantText.delete(event.data.sessionID);
               }
+            } else if (event.type === "message.updated") {
+              const info = event.data?.info ?? event.data?.message ?? event.data;
+              const id = info?.sessionID ?? event.data?.sessionID;
+              if (id && (info?.role === undefined || info.role === "assistant") && info?.tokens) {
+                if (!(await ensureSession(id))) continue;
+                const model = typeof info.modelID === "string" ? info.modelID
+                  : typeof info.model?.id === "string" ? info.model.id : undefined;
+                recordUsage(id, info.id ?? info.messageID, info.tokens, model);
+              }
+            } else if (event.type === "message.part.updated" || event.type === "session.step.ended") {
+              const part = event.data?.part ?? event.data;
+              const id = part?.sessionID ?? event.data?.sessionID;
+              if (id && (event.type === "session.step.ended" || part?.type === "step-finish") && part?.tokens) {
+                if (!(await ensureSession(id))) continue;
+                const model = typeof part.modelID === "string" ? part.modelID
+                  : typeof part.model?.id === "string" ? part.model.id : undefined;
+                recordUsage(id, part.messageID ?? part.id, part.tokens, model);
+              }
             } else if (event.type === "session.execution.succeeded" ||
                        event.type === "session.execution.failed" ||
                        event.type === "session.execution.interrupted") {
@@ -4947,7 +5158,7 @@ const OPENCODE2_BINDING: &str = r#"
             } else if (event.type === "session.deleted") {
               const id = event.data.sessionID;
               const session = await sessions.get(id)?.catch(() => undefined);
-              endSession(id, directory, undefined, subagentMarker(session));
+              endSession(id, directory, undefined, { ...subagentMarker(session), ...takeUsagePayload(id) });
               forgetSession(id);
             } else if (event.type === "session.moved") {
               const id = event.data.sessionID;
@@ -19155,6 +19366,81 @@ process.stdout.write(JSON.stringify({
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    #[test]
+    fn antigravity_statusline_installs_wraps_user_command_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+
+        // 1. Fresh settings.json: creates statusLine with stack_with_default=true.
+        let fresh = tmp.path().join("fresh-settings.json");
+        let outcome = merge_antigravity_statusline(&data_dir, &fresh, false).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Created);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(parsed["statusLine"]["type"].as_str(), Some("command"));
+        assert_eq!(parsed["statusLine"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["statusLine"]["stack_with_default"].as_bool(),
+            Some(true)
+        );
+        let cmd = parsed["statusLine"]["command"].as_str().unwrap();
+        assert_eq!(parse_antigravity_statusline_command(cmd), Some(None));
+        // Reinstall is a NoOp.
+        assert_eq!(
+            merge_antigravity_statusline(&data_dir, &fresh, false).unwrap(),
+            ApplyOutcome::NoOp
+        );
+
+        // 2. Existing user statusLine: preserves user fields and chains command without double-wrapping.
+        let existing = tmp.path().join("user-settings.json");
+        let user_cmd = "~/.gemini/antigravity-cli/my-status.sh --theme 'dark'";
+        std::fs::write(
+            &existing,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "theme": "solarized",
+                "statusLine": {
+                    "type": "command",
+                    "command": user_cmd,
+                    "enabled": true,
+                    "stack_with_default": false,
+                    "padding": 2
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let first = merge_antigravity_statusline(&data_dir, &existing, false).unwrap();
+        assert_eq!(first, ApplyOutcome::Updated);
+        let wrapped: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&existing).unwrap()).unwrap();
+        assert_eq!(wrapped["theme"].as_str(), Some("solarized"));
+        assert_eq!(
+            wrapped["statusLine"]["stack_with_default"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(wrapped["statusLine"]["padding"].as_u64(), Some(2));
+        let wrapped_cmd = wrapped["statusLine"]["command"].as_str().unwrap();
+        assert_eq!(
+            parse_antigravity_statusline_command(wrapped_cmd),
+            Some(Some(user_cmd.to_string()))
+        );
+        // Reinstall must not double-wrap.
+        let second = merge_antigravity_statusline(&data_dir, &existing, false).unwrap();
+        assert_eq!(second, ApplyOutcome::NoOp);
+        // Reinstall with a new data dir updates the wrapper while keeping the exact original user command.
+        let data_dir2 = tmp.path().join("data2");
+        let third = merge_antigravity_statusline(&data_dir2, &existing, false).unwrap();
+        assert_eq!(third, ApplyOutcome::Updated);
+        let rewrapped: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&existing).unwrap()).unwrap();
+        assert_eq!(
+            parse_antigravity_statusline_command(
+                rewrapped["statusLine"]["command"].as_str().unwrap()
+            ),
+            Some(Some(user_cmd.to_string()))
+        );
     }
 
     // ----------------------------------------------------------------

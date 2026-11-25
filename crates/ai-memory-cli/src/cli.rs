@@ -3526,6 +3526,11 @@ pub struct HookArgs {
     /// value is a validated profile name, never a token.
     #[arg(long)]
     pub expected_profile: Option<String>,
+    /// Base64-encoded user `statusLine` command to chain after observing an
+    /// Antigravity CLI `statusline` payload. Receives the exact stdin bytes
+    /// and its stdout, stderr and exit code are forwarded untouched (#2486).
+    #[arg(long, hide = true)]
+    pub chain_command_b64: Option<String>,
 }
 
 /// Arguments for hidden `hook-drain`.

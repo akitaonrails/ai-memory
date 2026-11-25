@@ -179,18 +179,179 @@ try {
   assert.ok(!afterDelete.system.some((part) => part.text === anchorC), "a deleted session's anchor is forgotten");
   assert.equal(anchors().length, 3, "a deleted session never refetches its anchor");
 
+  // #2486: OpenCode 2 token usage reporting via _ai_memory_usage_calls.
+  // 1. Streaming updates to the same message ID + step-finish part for that
+  //    message ID must deduplicate by call_id using MAX (no double-counting).
+  const stopsBeforeUsage = stopCount();
+  a.emit({
+    type: "message.updated",
+    data: {
+      info: {
+        id: "msg_1",
+        sessionID: "root-a",
+        role: "assistant",
+        modelID: "claude-sonnet-4",
+        tokens: { input: 100, output: 10, cache: { read: 40, write: 5 } },
+      },
+    },
+  });
+  a.emit({
+    type: "message.updated",
+    data: {
+      info: {
+        id: "msg_1",
+        sessionID: "root-a",
+        role: "assistant",
+        modelID: "claude-sonnet-4",
+        tokens: { input: 100, output: 35, cache: { read: 40, write: 5 } },
+      },
+    },
+  });
+  a.emit({
+    type: "message.part.updated",
+    data: {
+      part: {
+        id: "prt_1",
+        messageID: "msg_1",
+        sessionID: "root-a",
+        type: "step-finish",
+        modelID: "claude-sonnet-4",
+        tokens: { input: 100, output: 35, cache: { read: 40, write: 5 } },
+      },
+    },
+  });
+  // Invalid / zero / negative / float counters must be ignored (omitted).
+  a.emit({
+    type: "message.updated",
+    data: {
+      info: {
+        id: "msg_zero",
+        sessionID: "root-a",
+        role: "assistant",
+        tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      },
+    },
+  });
+  a.emit({
+    type: "message.updated",
+    data: {
+      info: {
+        id: "msg_neg",
+        sessionID: "root-a",
+        role: "assistant",
+        tokens: { input: -5, output: 10 },
+      },
+    },
+  });
+  a.emit({
+    type: "message.updated",
+    data: {
+      info: {
+        id: "msg_float",
+        sessionID: "root-a",
+        role: "assistant",
+        tokens: { input: 12.5, output: 10 },
+      },
+    },
+  });
+  a.emit({ type: "session.execution.succeeded", data: { sessionID: "root-a" } });
+  await until(() => stopCount() > stopsBeforeUsage, "usage stop delivered");
+  const usageStop = requests.filter((r) => r.url.searchParams.get("event") === "stop").at(-1);
+  assert.deepEqual(usageStop.payload._ai_memory_usage_calls, [
+    {
+      call_id: "msg_1",
+      input_tokens: 100,
+      output_tokens: 35,
+      cache_write_tokens: 5,
+      cache_read_tokens: 40,
+      model: "claude-sonnet-4",
+    },
+  ], "repeated updates and step-finish for the same message must merge into one call_id");
+
+  // 2. A stop with no new measured usage (or only zero/invalid counters) must
+  //    omit _ai_memory_usage_calls completely.
+  const stopsBeforeEmptyUsage = stopCount();
+  a.emit({
+    type: "message.updated",
+    data: { info: { id: "msg_absent", sessionID: "root-a", role: "assistant" } },
+  });
+  a.emit({ type: "session.execution.succeeded", data: { sessionID: "root-a" } });
+  await until(() => stopCount() > stopsBeforeEmptyUsage, "empty usage stop delivered");
+  const emptyUsageStop = requests.filter((r) => r.url.searchParams.get("event") === "stop").at(-1);
+  assert.equal(emptyUsageStop.payload._ai_memory_usage_calls, undefined, "absent/zero usage must omit _ai_memory_usage_calls");
+
+  // 3. Trailing usage before session.deleted is flushed on session-end.
+  a.emit({
+    type: "message.updated",
+    data: {
+      info: {
+        id: "msg_child_final",
+        sessionID: "child",
+        role: "assistant",
+        modelID: "claude-haiku-4",
+        tokens: { input: 50, output: 20, cache: { read: 0, write: 0 } },
+      },
+    },
+  });
+
   await b.hooks.get("session.prompt")({ sessionID: "root-b", messageID: "b1", prompt: { text: "beta" } });
   await b.hooks.get("session.context")({ sessionID: "root-b", system: [] });
   // Deletion, not unload, is the end signal: a deleted child keeps ancestry
   // so its close does not hand the next session a sub-task baton.
   a.emit({ type: "session.deleted", data: { sessionID: "child" } });
   await until(() => requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "child"), "deleted session must end");
-  assert.equal(requests.find((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "child").payload.agent_id, "root-a", "child close must retain ancestry to suppress automatic handoffs");
+  const childEnd = requests.find((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "child");
+  assert.equal(childEnd.payload.agent_id, "root-a", "child close must retain ancestry to suppress automatic handoffs");
+  assert.deepEqual(childEnd.payload._ai_memory_usage_calls, [
+    {
+      call_id: "msg_child_final",
+      input_tokens: 50,
+      output_tokens: 20,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
+      model: "claude-haiku-4",
+    },
+  ], "session-end must flush trailing measured usage");
   // #1074: OpenCode unloads the plugin when it evicts idle location services;
   // the host and its sessions stay alive, so unload must not end them.
   await disposeA();
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-a"), "eviction unload must not end a live session");
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-b"), "location cleanup must not close another instance");
+
+  // 4. Plugin reload: replaying the same message ID after reload preserves the
+  //    same native call_id so server deduplication never double-counts.
+  const reloadedA = host(root, records);
+  const disposeReloadedA = await plugin.setup(reloadedA.ctx);
+  try {
+    const stopsBeforeReload = stopCount();
+    reloadedA.emit({
+      type: "message.updated",
+      data: {
+        info: {
+          id: "msg_1",
+          sessionID: "root-a",
+          role: "assistant",
+          modelID: "claude-sonnet-4",
+          tokens: { input: 100, output: 35, cache: { read: 40, write: 5 } },
+        },
+      },
+    });
+    reloadedA.emit({ type: "session.execution.succeeded", data: { sessionID: "root-a" } });
+    await until(() => stopCount() > stopsBeforeReload, "reloaded stop delivered");
+    const reloadStop = requests.filter((r) => r.url.searchParams.get("event") === "stop").at(-1);
+    assert.deepEqual(reloadStop.payload._ai_memory_usage_calls, [
+      {
+        call_id: "msg_1",
+        input_tokens: 100,
+        output_tokens: 35,
+        cache_write_tokens: 5,
+        cache_read_tokens: 40,
+        model: "claude-sonnet-4",
+      },
+    ], "reload must preserve native call_id for idempotent server deduplication");
+  } finally {
+    await disposeReloadedA();
+  }
   console.log("PASS: resumed sessions, retained handoff, child isolation, bounded handoff retries, terminal events, post-compaction anchor, deletion ends, unload does not");
 } finally {
   await disposeB();

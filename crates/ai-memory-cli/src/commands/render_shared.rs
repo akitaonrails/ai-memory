@@ -1998,6 +1998,34 @@ fn build_antigravity_payload_for_platform(
     json!({ "ai-memory": group })
 }
 
+/// Build the Antigravity CLI `statusLine.command` string that observes
+/// measured session token usage and optionally chains a pre-existing user
+/// `statusLine` command (base64-encoded so quoting and round-trip restore
+/// stay exact across shells).
+pub(crate) fn build_antigravity_statusline_command(
+    data_dir: &Path,
+    absolute_paths: bool,
+    chain_command: Option<&str>,
+) -> String {
+    use base64::Engine as _;
+    let exe = if absolute_paths {
+        embedded_exe_from(std::env::current_exe().ok())
+    } else {
+        PathBuf::from(FALLBACK_HOOK_EXE)
+    };
+    let mut cmd = format!(
+        "{} --data-dir {} hook --event statusline --agent antigravity-cli",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(&data_dir.to_string_lossy()),
+    );
+    if let Some(chain) = chain_command.map(str::trim).filter(|s| !s.is_empty()) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(chain);
+        cmd.push_str(" --chain-command-b64 ");
+        cmd.push_str(&shell_quote(&encoded));
+    }
+    cmd
+}
+
 /// Build a hook payload for `profile`. The output is always
 /// `{ "hooks": { "<EventName>": <profile-specific-array> } }`; the
 /// caller is responsible for any sibling top-level keys (e.g.

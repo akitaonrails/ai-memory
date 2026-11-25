@@ -13,6 +13,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Reported measured session token usage for OpenCode 2 and Antigravity CLI:
+  OpenCode 2's generated plugin records measured assistant message/step token
+  counters keyed by native message ID (`_ai_memory_usage_calls`) on `stop` and
+  `session-end` without double-counting streaming updates or reloads;
+  Antigravity CLI installs a `statusLine` observer in
+  `~/.gemini/antigravity-cli/settings.json` (chaining and restoring any
+  pre-existing user `statusLine` command untouched) that caches cumulative
+  measured token totals per session and attaches `_ai_memory_usage` on `stop`
+  and `session-end`; and the hook router persists `_ai_memory_usage` on
+  `Stop` for OpenCode and Antigravity CLI idempotently alongside Pi. Missing,
+  zero, or percentage-only counters remain unknown. (#2486)
+
 - Opt-in extra Antigravity transcript roots for Antigravity ACP agents whose
   brain directory lives outside `~/.gemini/<app>/brain`: operators can set
   `[capture] antigravity_transcript_roots` in `<data_dir>/config.toml` and/or
