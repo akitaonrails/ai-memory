@@ -1474,7 +1474,13 @@ antigravity-cli` configura cinco de seus
 A transcrição é lida apenas quando `transcriptPath` aponta para o próprio
 `~/.gemini/<app>/brain/<conversationId>/.system_generated/logs/transcript.jsonl` da conversa
 (ou o `transcript_full.jsonl` ao lado dele, relatado pela CLI), sendo
-`<app>` um entre `antigravity`, `antigravity-cli` ou `antigravity-ide`. Outro
+`<app>` um entre `antigravity`, `antigravity-cli` ou `antigravity-ide`. Para
+agentes Antigravity ACP cujo diretório `brain` fica fora de
+`~/.gemini/<app>/brain`, operadores podem habilitar raízes locais adicionais via
+`[capture] antigravity_transcript_roots` em `<data_dir>/config.toml` ou
+`AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (separadas pelo delimitador de lista de
+caminhos do SO, limitadas a 16 raízes absolutas sem componentes `.`/`..`; nunca
+lidas de `.ai-memory.toml` nem de payloads de hook). Outro
 arquivo, a transcrição de outra conversa e um diretório em symlink que aponte para
 fora da conversa são recusados. Um hook lê no máximo 8 MiB sob um
 limite de tempo de sistema de arquivos de 100 ms; um timeout mantém o cursor intocado para que o próximo
@@ -2561,6 +2567,31 @@ que roteiam cada chamada para o projeto atual e a captura de ciclo de vida
 permanecem os mesmos. A saída de pré-visualização e todo `--apply` posterior (inclusive a atualização que o
 `ai-memory upgrade` executa) leem a mesma configuração, de modo que regenerar mantém a sua
 escolha. Volte para `direct`, ou remova-a, para retornar ao padrão.
+
+#### Ferramentas seletivas diretas/adiadas do Pi (`pi_direct_tools`)
+
+Para manter um pequeno conjunto de ferramentas do ai-memory declaradas
+diretamente para o modelo enquanto adia os demais esquemas atrás do
+`tool_search` do Pi, defina `pi_direct_tools` no `config.toml` (ou
+`AI_MEMORY_PI_DIRECT_TOOLS` como um array JSON) e regenere a extensão:
+
+```toml
+pi_direct_tools = ["memory_query", "memory_briefing"]
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+As ferramentas listadas são registradas com `exposure: "direct"`, todas as
+demais ferramentas do ai-memory são registradas com `exposure: "deferred"`, uma
+dica concisa em `promptGuidelines` é anexada uma vez para que o modelo saiba
+usar `tool_search` para ferramentas de memória adiadas, e `session_start` ativa
+`tool_search` quando o Pi expõe `getActiveTools`/`setActiveTools`. Defina
+`pi_direct_tools = []` para adiar todas as ferramentas do ai-memory mantendo a
+ativação de `tool_search`. `pi_direct_tools` é mutuamente exclusivo com
+`pi_tool_exposure = "codemode"`. Remova a chave para voltar à saída padrão da
+extensão.
 
 ### Montagens bind vs docker cp
 

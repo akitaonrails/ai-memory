@@ -29,6 +29,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `run_autowire` | `true` | `AI_MEMORY_RUN_AUTOWIRE` | Install a harness's hooks and MCP server on the first `ai-memory run` launch when they are missing. |
 | `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Deprecated and ignored since 3.4.3: `ai-memory run --yolo` on Claude always forces `bypassPermissions` now. Still loads; `ai-memory run` asks you to remove it. |
 | `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
+| `pi_direct_tools` | unset | `AI_MEMORY_PI_DIRECT_TOOLS` | Optional list of ai-memory MCP tool names kept `direct` in the generated Pi extension while deferring all other tools (`exposure: "deferred"`) and activating Pi's `tool_search` on `session_start`. `[]` defers all tools. Mutually exclusive with `pi_tool_exposure = "codemode"`. |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
 | `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`: `llm` needs a generative provider; `decisions-choice` needs `OPENAI_API_KEY` and explicit `llm_model`, without a generative provider. Case-insensitive; other values refuse startup. Choice probabilities are relative: leave `min_relevance` unset. |
@@ -47,7 +48,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |
 | `llm_quota_cooldown_secs` | `900` (`ai_memory_llm::DEFAULT_QUOTA_COOLDOWN`) | `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS` | How long a fallback chain (`[[llm_fallbacks]]` or a task's `[[llm.<task>.fallbacks]]`) skips a candidate that reported exhausted credit, quota or billing before the next call tries it again. Accepted range 30 to 86400. |
 | `embedding_provider` | unset (in-process local embeddings) | `AI_MEMORY_EMBEDDING_PROVIDER` | Embedding provider: `none`, `openai`, `voyage`, `google` or `gemini`, or `openai-compat`. |
-| `embedding_model` | unset | `AI_MEMORY_EMBEDDING_MODEL` | Provider-specific embedding model override. For `local`, accepts `all-MiniLM-L6-v2` (default) or `intfloat/multilingual-e5-small` (alias `multilingual-e5-small`). |
+| `embedding_model` | unset | `AI_MEMORY_EMBEDDING_MODEL` | Provider-specific embedding model override. For `local`, accepts `all-MiniLM-L6-v2` (default) or `intfloat/multilingual-e5-small` (alias `multilingual-e5-small`). With no `embedding_provider` set, any other name is ignored with a startup warning and the default local model runs. |
 | `embedding_dim` | unset | `AI_MEMORY_EMBEDDING_DIM` | Embedding dimension override. It must match the model. |
 | `embedding_base_url` | unset | `AI_MEMORY_EMBEDDING_BASE_URL` | Embedding endpoint override. Required when `embedding_provider` is `openai-compat`. |
 | `embedding_query_prefix` | unset | `AI_MEMORY_EMBEDDING_QUERY_PREFIX` | Text prepended to every embedding query for the `openai` and `openai-compat` embedders. Kept verbatim. |
@@ -126,7 +127,7 @@ Profile names use 1 to 64 ASCII letters, digits, `.`, `_` or `-`. A config holds
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
-| `idle_end_after_hours` | `0` (off) | `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS` | Hours of silence after which the maintenance tick ends an open session that never got a SessionEnd. 0 or 1 to 8760. |
+| `idle_end_after_hours` | `0` (off) | `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS` | Hours of silence after which the maintenance tick ends an open session that never got a SessionEnd. A nonzero value replaces the forget sweep's 48-hour session closure. 0 or 1 to 8760. |
 
 ## `[decay]`
 
@@ -350,6 +351,12 @@ Defined by `SanitizeConfig` in `ai-memory-core`. Built-in redaction patterns alw
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `max_attempts` | `8` (`DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS`) | `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` | Failed drain passes before a spooled hook event is dropped. 0 disables the limit. |
+
+## `[capture]`
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `antigravity_transcript_roots` | `[]` | `AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` | Additional operator-owned root directories where Antigravity hooks may read `<root>/<conversationId>/.system_generated/logs/transcript.jsonl` or `transcript_full.jsonl` (for Antigravity ACP agents outside `~/.gemini/<app>/brain`). Each entry must be absolute (or `~`-prefixed), contain no `.` or `..` components, and canonicalize to a real directory; at most 16 roots are checked. Env uses OS path-list separation (`:` on Unix, `;` on Windows). Never read from `.ai-memory.toml` or hook payloads. |
 
 ## `[routing]`
 

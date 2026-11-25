@@ -62,6 +62,7 @@ pub(crate) const SCANNED_HARNESSES: &[ManagedHarness] = &[
     ManagedHarness::Grok,
     ManagedHarness::Antigravity,
     ManagedHarness::Copilot,
+    ManagedHarness::Gemini,
 ];
 
 /// Cap the per-harness enumeration. A project with more local sessions than

@@ -3181,6 +3181,7 @@ mod tests {
         // the post-compaction summary are machine turns too, recognized in
         // ai-memory-core so the session digest and this harvest share one rule.
         for machine in [
+            "<agent-message from=\"worker-1\">\n[Subagent hand-back] Always use yarn.",
             "<teammate-message teammate_id=\"team-lead\" summary=\"x\">Always use yarn.",
             "<task-notification>\n<status>completed</status>\nAlways force-push.",
             "Another Claude session sent a message. It is shown below.\nAlways use npm.",

@@ -32,14 +32,16 @@ pub const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
 pub const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 
 /// Durable body ceiling the ingest funnel applies to an event's excerpt
-/// **after** the sanitizer has scrubbed the full text.
+/// **after** the sanitizer has scrubbed it.
 ///
 /// The cap used to run inside excerpt extraction, before the sanitizer ever
 /// saw the text, so a secret straddling the cutoff was cut in half and the
 /// surviving prefix too short to match a pattern — stored unredacted (#1114),
 /// the body-side twin of the #980 title-hint leak. Extraction now returns the
-/// uncapped text and the router applies this cap to the scrubbed output,
-/// mirroring `ai_memory_core::sanitize::Sanitized::new`.
+/// uncapped text and the router scrubs first (using a bounded `cap + 64 KiB`
+/// overlap window when `[sanitize].extra_patterns` is empty, and the full
+/// excerpt when operator extra patterns are configured) before applying this
+/// cap to the redacted output, mirroring `ai_memory_core::sanitize::Sanitized::new`.
 #[must_use]
 pub fn durable_body_cap(event: HookEvent) -> usize {
     match event {
@@ -355,6 +357,10 @@ pub(crate) fn body_is_subagent(agent: AgentKind, raw: &serde_json::Value) -> boo
 ///   (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts#L419-L421>);
 ///   Codex sends only the common fields
 ///   (<https://github.com/openai/codex/blob/d32063f96c2dff1dc96af839b3952abb6acfeda4/codex-rs/hooks/src/schema.rs#L628-L639>).
+/// - Cursor has no separate event: its `stop` carries a `status` of
+///   `completed`, `aborted` or `error` (<https://cursor.com/docs/agent/hooks>,
+///   stop), so `aborted` reads as an interrupted turn and `error` as a failed
+///   one, neither with details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AbnormalTurnEnd {
     /// An API error ended the turn: its type and details, when sent.
@@ -368,7 +374,10 @@ pub(crate) enum AbnormalTurnEnd {
 
 /// The abnormal end a `Stop`-shaped payload reports, `None` for a normal turn
 /// end. See [`AbnormalTurnEnd`].
-pub(crate) fn abnormal_turn_end(raw: &serde_json::Value) -> Option<AbnormalTurnEnd> {
+pub(crate) fn abnormal_turn_end(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<AbnormalTurnEnd> {
     match raw
         .get("hook_event_name")
         .and_then(serde_json::Value::as_str)
@@ -380,6 +389,16 @@ pub(crate) fn abnormal_turn_end(raw: &serde_json::Value) -> Option<AbnormalTurnE
         Some("Interrupt") => Some(AbnormalTurnEnd::Interrupted {
             reason: extract_string(raw, &["reason"]).and_then(first_line),
         }),
+        _ if agent == AgentKind::Cursor => {
+            match raw.get("status").and_then(serde_json::Value::as_str) {
+                Some("aborted") => Some(AbnormalTurnEnd::Interrupted { reason: None }),
+                Some("error") => Some(AbnormalTurnEnd::Failed {
+                    error: None,
+                    details: None,
+                }),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1272,6 +1291,10 @@ fn safe_tool_body(
                 raw.pointer("/tool_response/output")
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/tool_response/error").and_then(value_to_text))
+            } else if agent == AgentKind::ClaudeCode
+                && let Some(text) = claude_code_tool_text(raw)
+            {
+                text
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -1285,6 +1308,128 @@ fn safe_tool_body(
         }
         _ => None,
     }
+}
+
+/// The text of a Claude Code built-in tool's PostToolUse result.
+///
+/// Claude Code passes the tool's structured output object as `tool_response`,
+/// not the text the model reads (PostToolUse input in
+/// <https://code.claude.com/docs/en/hooks>; the per-tool shapes are the Agent
+/// SDK's tool output types, <https://code.claude.com/docs/en/agent-sdk/typescript>).
+/// Flattened whole, that object was stored as escaped JSON, with whatever the
+/// tool adds for display, and full-text search could not split its lines.
+/// Each tool's output field is read instead. `None` for any other tool or
+/// shape, such as a failed call's error string or fields the SDK does not
+/// document, which keep the generic reading; `Some(None)` for a result with
+/// no text to keep.
+fn claude_code_tool_text(raw: &serde_json::Value) -> Option<Option<String>> {
+    let response = raw.get("tool_response")?.as_object()?;
+    let text = |key: &str| {
+        response
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    match raw.get("tool_name")?.as_str()? {
+        // `stdout` carries the command's output, stdout and stderr merged,
+        // and `stderr` the notices the tool itself adds. `isImage` marks an
+        // image printed as data; `bashEditDiff` and `gitOperation` describe
+        // the command's effects for display.
+        "Bash" | "PowerShell" => {
+            response.get("stdout")?.as_str()?;
+            if response.get("isImage") == Some(&serde_json::Value::Bool(true)) {
+                return Some(None);
+            }
+            let output = [text("stdout"), text("stderr")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some((!output.is_empty()).then_some(output))
+        }
+        // Discriminated on `type`: a text read keeps the file's text; an
+        // image, a PDF or its extracted pages keep no bytes, and an unchanged
+        // file returns no content. A notebook keeps the generic reading.
+        "Read" => {
+            let file = response.get("file")?.as_object()?;
+            match response.get("type")?.as_str()? {
+                "text" => {
+                    let content = file.get("content")?.as_str()?;
+                    Some((!content.is_empty()).then(|| content.to_owned()))
+                }
+                "image" | "pdf" | "parts" | "file_unchanged" => Some(None),
+                _ => None,
+            }
+        }
+        // The patch, never `originalFile`: the whole file before the edit,
+        // which filled the excerpt ahead of the change itself.
+        "Edit" => structured_patch_text(response),
+        // A new file keeps what was written; an overwrite keeps its patch,
+        // or the new content when Claude Code took no diff.
+        "Write" => match response.get("type")?.as_str()? {
+            "update" => match structured_patch_text(response)? {
+                Some(patch) => Some(Some(patch)),
+                None => Some(text("content")),
+            },
+            "create" => Some(text("content")),
+            _ => None,
+        },
+        // A content search returns its matching lines in `content`; the
+        // file list and count modes name the matching files.
+        "Grep" => {
+            let files = response.get("filenames")?.as_array()?;
+            Some(text("content").or_else(|| joined_strings(files)))
+        }
+        "Glob" => Some(joined_strings(response.get("filenames")?.as_array()?)),
+        // The cell's new source, or what went wrong, never `original_file`
+        // and `updated_file`: the whole notebook before and after.
+        "NotebookEdit" => {
+            response.get("new_source")?.as_str()?;
+            Some(text("error").or_else(|| text("new_source")))
+        }
+        _ => None,
+    }
+}
+
+/// A Claude Code Edit or Write `structuredPatch` as unified diff text: each
+/// hunk's `@@` header, then its lines, which already carry their `-`, `+` or
+/// space. `None` when there is no patch array; `Some(None)` when it is empty.
+fn structured_patch_text(
+    response: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Option<String>> {
+    let hunks = response.get("structuredPatch")?.as_array()?;
+    let mut lines = Vec::new();
+    for hunk in hunks {
+        let number = |key: &str| hunk.get(key).and_then(serde_json::Value::as_u64);
+        if let (Some(old_start), Some(old_lines), Some(new_start), Some(new_lines)) = (
+            number("oldStart"),
+            number("oldLines"),
+            number("newStart"),
+            number("newLines"),
+        ) {
+            lines.push(format!(
+                "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@"
+            ));
+        }
+        let hunk_lines = hunk.get("lines").and_then(serde_json::Value::as_array);
+        for line in hunk_lines.into_iter().flatten() {
+            if let Some(line) = line.as_str() {
+                lines.push(line.to_owned());
+            }
+        }
+    }
+    Some((!lines.is_empty()).then(|| lines.join("\n")))
+}
+
+/// The strings of a JSON array, one per line; `None` when there are none.
+fn joined_strings(items: &[serde_json::Value]) -> Option<String> {
+    let joined = items
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Cursor's `postToolUseFailure` has no `tool_output`; what went wrong is in
@@ -1304,14 +1449,24 @@ fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option
     let tool = tool_call.get("name")?.as_str()?;
     if !matches!(
         tool.to_ascii_lowercase().as_str(),
-        "write_to_file" | "replace_file_content" | "multi_replace_file_content"
+        "write_to_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "write_file"
+            | "edit_file"
     ) {
         return None;
     }
     let args = tool_call.get("args")?;
     extract_content(
         args,
-        &["ReplacementContent", "CodeContent", "ReplacementChunks"],
+        &[
+            "ReplacementContent",
+            "CodeContent",
+            "ReplacementChunks",
+            "Replacement",
+            "Content",
+        ],
     )
 }
 
@@ -1452,7 +1607,7 @@ fn best_title_hint(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) 
         }
         HookEvent::Notification => extract_string(raw, &["message", "text"]).and_then(first_line),
         HookEvent::PostCompaction => extract_string(raw, &["summary"]).and_then(first_line),
-        HookEvent::Stop => abnormal_turn_end(raw).map(|end| match end {
+        HookEvent::Stop => abnormal_turn_end(agent, raw).map(|end| match end {
             AbnormalTurnEnd::Failed {
                 error: Some(error), ..
             } => format!("stop failure: {error}"),
@@ -1571,7 +1726,7 @@ fn best_body_excerpt(
         // first-line fields. The harness's rendered error text in
         // `last_assistant_message` is not used: it stays stripped like any
         // assistant message.
-        HookEvent::Stop => abnormal_turn_end(raw).and_then(|end| match end {
+        HookEvent::Stop => abnormal_turn_end(agent, raw).and_then(|end| match end {
             AbnormalTurnEnd::Failed { error, details } => {
                 let lines: Vec<String> = [
                     error.map(|error| format!("error: {error}")),
@@ -1590,11 +1745,10 @@ fn best_body_excerpt(
     }
 }
 
-/// Reduce a hook-supplied string to its first line.
+/// Reduce a hook-supplied string to its first nonblank line.
 ///
-/// Terminators are LF, CRLF, and a lone CR (`str::lines`). An empty first
-/// line (a payload that starts with a newline) yields `None` so the caller
-/// can fall back instead of storing `""`.
+/// Skip leading blank lines, including whitespace-only lines from a paste.
+/// A wholly blank payload yields `None` so the caller can fall back.
 ///
 /// This is the only shaping `title_hint` gets before it reaches the
 /// sanitizer: the 80-char display cap used to happen here too, but that ran
@@ -1604,12 +1758,10 @@ fn best_body_excerpt(
 /// `ai_memory_core::sanitize::truncate_for_title`, applied by
 /// `Sanitized::new` *after* `Sanitizer::scrub`.
 fn first_line(s: String) -> Option<String> {
-    // `str::lines` treats `\n`, `\r\n`, and a lone `\r` as terminators and
-    // does not keep them. Stopping only at `\n` left a trailing CR on
-    // Windows prompts, which the sanitizer preserves and `truncate_for_title`
-    // does not strip, so the CR was stored in the observation title.
-    let line = s.lines().next().unwrap_or("").to_string();
-    (!line.is_empty()).then_some(line)
+    // Keep the complete chosen line for sanitization, without a CRLF terminator.
+    s.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Cap core lifecycle body fields before the native hook writes its local
@@ -2229,6 +2381,52 @@ mod tests {
                 !env.body_excerpt.unwrap_or_default().contains("API Error"),
                 "{agent}: the rendered error text stays out of the body"
             );
+        }
+    }
+
+    /// Cursor's `stop` reports how the agent loop ended in `status`
+    /// (`completed`, `aborted` or `error`; <https://cursor.com/docs/agent/hooks>,
+    /// stop). An aborted turn is titled as an interrupt and a failed one as a
+    /// stop failure, with no details to describe. Controls: `completed`, a
+    /// missing status, and the same status from agents that report abnormal
+    /// ends through their own events stay normal turn ends.
+    #[test]
+    fn cursor_stop_status_marks_an_aborted_or_failed_turn() {
+        let stop = |agent: &str, status: Option<&str>| {
+            let mut body = serde_json::json!({
+                "conversation_id": "c1",
+                "generation_id": "g1",
+                "hook_event_name": "stop",
+                "loop_count": 0,
+                "session_id": "c1",
+            });
+            if let Some(status) = status {
+                body["status"] = serde_json::json!(status);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        for (status, title) in [("aborted", "interrupt"), ("error", "stop failure")] {
+            let env = stop("cursor", Some(status));
+            assert_eq!(env.event, HookEvent::Stop, "{status}");
+            assert_eq!(env.title_hint.as_deref(), Some(title), "{status}");
+            assert_eq!(env.body_excerpt, None, "{status}");
+        }
+        for (agent, status) in [
+            ("cursor", Some("completed")),
+            ("cursor", None),
+            ("claude-code", Some("error")),
+            ("codex", Some("aborted")),
+        ] {
+            let env = stop(agent, status);
+            assert_eq!(env.event, HookEvent::Stop, "{agent} {status:?}");
+            assert_eq!(env.title_hint, None, "{agent} {status:?}");
         }
     }
 
@@ -3788,11 +3986,7 @@ mod tests {
             q.clone(),
             serde_json::json!({ "prompt": "\r\nhello" }),
         );
-        assert!(
-            env.title_hint.is_none(),
-            "empty first line after leading CRLF must not become a CR or empty title, got {:?}",
-            env.title_hint
-        );
+        assert_eq!(env.title_hint.as_deref(), Some("hello"));
 
         // Very long single line → title_hint keeps every character; the
         // 80-char cap now happens later, after sanitization.
@@ -3801,6 +3995,34 @@ mod tests {
         let title = env.title_hint.unwrap();
         assert_eq!(title.chars().count(), 200);
         assert!(!title.contains('…'));
+    }
+
+    #[test]
+    fn user_prompt_title_skips_blank_lines_without_shortening_the_body() {
+        let q = HookQuery {
+            event: "UserPromptSubmit".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        for prefix in ["\n\n", "\r\n\r\n", " \t\n\u{2003}\n"] {
+            let prompt = format!("{prefix}<pasted_content id=\"example\">\nKeep the decision here");
+            let env = HookEnvelope::from_query_and_body(
+                q.clone(),
+                serde_json::json!({ "prompt": prompt }),
+            );
+            assert_eq!(
+                env.title_hint.as_deref(),
+                Some("<pasted_content id=\"example\">")
+            );
+            assert_eq!(env.body_excerpt.as_deref(), Some(prompt.as_str()));
+        }
+        for prompt in ["", " \t\n\r\n\u{2003}"] {
+            let env = HookEnvelope::from_query_and_body(
+                q.clone(),
+                serde_json::json!({ "prompt": prompt }),
+            );
+            assert!(env.title_hint.is_none());
+        }
     }
 
     #[test]
@@ -4758,6 +4980,296 @@ mod tests {
         assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
     }
 
+    /// The result part of the body a Claude Code PostToolUse for `tool` with
+    /// this `tool_response` stores, read as `agent`.
+    fn tool_result_as(agent: &str, tool: &str, response: serde_json::Value) -> String {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some(agent.into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool,
+                "tool_input": {},
+                "tool_use_id": "toolu_1",
+                "tool_response": response,
+            }),
+        );
+        let body = env.body_excerpt.expect("post-tool body");
+        let (_, result) = body
+            .split_once(TOOL_BODY_SEPARATOR)
+            .expect("a result after the separator");
+        result.to_owned()
+    }
+
+    fn claude_result(tool: &str, response: serde_json::Value) -> String {
+        tool_result_as("claude-code", tool, response)
+    }
+
+    /// Claude Code's Bash (and PowerShell) result is `{stdout, stderr,
+    /// interrupted, isImage, ...}` (hooks reference; SDK `BashOutput`). The
+    /// body keeps the output text with its real line breaks, so full-text
+    /// search splits every line, and never the `bashEditDiff` of the files
+    /// the command changed nor its `gitOperation`. Controls: a failed call's
+    /// error string, an object without `stdout`, and the same object from
+    /// another agent keep the generic reading.
+    #[test]
+    fn claude_code_bash_result_keeps_its_output_text() {
+        let output = "running 2 tests\ntest b ... FAILED\n\nfailures:\n    b\n";
+        for tool in ["Bash", "PowerShell"] {
+            let result = claude_result(
+                tool,
+                serde_json::json!({
+                    "stdout": output,
+                    "stderr": "Shell cwd was reset to /repo",
+                    "interrupted": false,
+                    "isImage": false,
+                    "noOutputExpected": false,
+                    "bashEditDiff": {
+                        "changedFiles": ["/repo/src/gen.rs"],
+                        "files": [{"filePath": "/repo/src/gen.rs", "hunks": [{
+                            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+                            "lines": ["-SENTINEL_DIFF_OLD", "+SENTINEL_DIFF_NEW"],
+                        }]}],
+                        "moreFiles": 0,
+                    },
+                    "gitOperation": {"commit": {"sha": "SENTINEL_SHA", "kind": "committed"}},
+                }),
+            );
+            assert_eq!(
+                result,
+                format!("{output}\nShell cwd was reset to /repo"),
+                "{tool}"
+            );
+        }
+        let quiet = serde_json::json!({"stdout": "", "stderr": "", "interrupted": false});
+        assert_eq!(claude_result("Bash", quiet), "(no output captured)");
+        let image = serde_json::json!({
+            "stdout": "data:image/png;base64,iVBORw0KGgoSENTINEL",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": true,
+        });
+        assert_eq!(claude_result("Bash", image), "(no output captured)");
+
+        let failed = serde_json::json!("Exit code 2\nMARKER_FAILED_CALL");
+        assert_eq!(
+            claude_result("Bash", failed),
+            "Exit code 2\nMARKER_FAILED_CALL"
+        );
+        let unmodeled = serde_json::json!({"output": "MARKER_UNMODELED"});
+        assert_eq!(
+            claude_result("Bash", unmodeled),
+            r#"{"output":"MARKER_UNMODELED"}"#
+        );
+        let other = tool_result_as(
+            "command-code",
+            "Bash",
+            serde_json::json!({"stdout": "MARKER_OTHER_AGENT", "stderr": ""}),
+        );
+        assert!(other.contains("\"stdout\""), "{other:?}");
+    }
+
+    /// Claude Code's Read result is discriminated on `type` (SDK
+    /// `FileReadOutput`). A text read keeps the file's text; an image, a PDF
+    /// and its extracted pages keep no base64, and an unchanged file has no
+    /// content. Control: a notebook keeps the generic reading.
+    #[test]
+    fn claude_code_read_result_keeps_the_file_text_and_no_bytes() {
+        let content = "pub struct Cache;\nfn evict() {}\nREAD_LINE3_MARKER\n";
+        let text = serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": "/repo/src/cache.rs",
+                "content": content,
+                "numLines": 3,
+                "startLine": 1,
+                "totalLines": 3,
+            },
+        });
+        assert_eq!(claude_result("Read", text), content);
+        let empty = serde_json::json!({
+            "type": "text",
+            "file": {"filePath": "/repo/empty", "content": "", "numLines": 0, "startLine": 1, "totalLines": 0},
+        });
+        assert_eq!(claude_result("Read", empty), "(no output captured)");
+        for binary in [
+            serde_json::json!({"type": "image", "file": {
+                "base64": "iVBORw0KGgoAAAANSUhEUgSENTINEL", "type": "image/png", "originalSize": 2048,
+                "dimensions": {"originalWidth": 64, "originalHeight": 64},
+            }}),
+            serde_json::json!({"type": "pdf", "file": {
+                "filePath": "/repo/spec.pdf", "base64": "JVBERi0xSENTINEL", "originalSize": 4096,
+            }}),
+            serde_json::json!({"type": "parts", "file": {
+                "filePath": "/repo/spec.pdf", "originalSize": 4096, "count": 2, "outputDir": "/tmp/SENTINEL_PAGES",
+            }}),
+            serde_json::json!({"type": "file_unchanged", "file": {"filePath": "/repo/SENTINEL_SAME.md"}}),
+        ] {
+            assert_eq!(
+                claude_result("Read", binary.clone()),
+                "(no output captured)",
+                "{binary}"
+            );
+        }
+        let notebook = serde_json::json!({
+            "type": "notebook",
+            "file": {"filePath": "/repo/a.ipynb", "cells": [{"cell_type": "code", "source": "MARKER_NOTEBOOK"}]},
+        });
+        assert!(claude_result("Read", notebook).contains("MARKER_NOTEBOOK"));
+    }
+
+    /// Claude Code's Edit result carries `originalFile`, the whole file before
+    /// the edit, beside `structuredPatch` (SDK `FileEditOutput`). The body
+    /// keeps the patch as unified diff text, never the original file, which
+    /// filled the excerpt ahead of the change.
+    #[test]
+    fn claude_code_edit_result_keeps_its_patch_not_the_original_file() {
+        let edit = |patch: serde_json::Value| {
+            serde_json::json!({
+                "filePath": "/repo/src/lib.rs",
+                "oldString": "fn old() {}",
+                "newString": "fn EDIT_PATCH_MARKER() {}",
+                "originalFile": "SENTINEL_ORIGINAL_FILE\n".repeat(200),
+                "structuredPatch": patch,
+                "userModified": false,
+                "replaceAll": false,
+                "gitDiff": {"filename": "src/lib.rs", "status": "modified", "additions": 1,
+                    "deletions": 1, "changes": 2, "patch": "SENTINEL_GIT_DIFF"},
+            })
+        };
+        let patch = serde_json::json!([
+            {"oldStart": 3, "oldLines": 1, "newStart": 3, "newLines": 1,
+             "lines": ["-fn old() {}", "+fn EDIT_PATCH_MARKER() {}"]},
+            {"oldStart": 9, "oldLines": 2, "newStart": 9, "newLines": 1,
+             "lines": [" keep();", "-drop();"]},
+        ]);
+        assert_eq!(
+            claude_result("Edit", edit(patch)),
+            "@@ -3,1 +3,1 @@\n-fn old() {}\n+fn EDIT_PATCH_MARKER() {}\n\
+             @@ -9,2 +9,1 @@\n keep();\n-drop();"
+        );
+        assert_eq!(
+            claude_result("Edit", edit(serde_json::json!([]))),
+            "(no output captured)"
+        );
+    }
+
+    /// Claude Code's Write result has `type` `create` or `update`, the new
+    /// `content`, and for an overwrite `originalFile` and `structuredPatch`
+    /// (SDK `FileWriteOutput`). A new file keeps what was written; an
+    /// overwrite keeps its patch, or the content when Claude Code took no
+    /// diff; never the original file. The hooks reference's own example,
+    /// `{filePath, type}`, stores no output.
+    #[test]
+    fn claude_code_write_result_keeps_what_was_written() {
+        let create = serde_json::json!({
+            "type": "create",
+            "filePath": "/repo/NOTES.md",
+            "content": "# Notes\nWRITE_NEW_FILE_MARKER\n",
+            "structuredPatch": [],
+            "originalFile": null,
+        });
+        assert_eq!(
+            claude_result("Write", create),
+            "# Notes\nWRITE_NEW_FILE_MARKER\n"
+        );
+        let update = |patch: serde_json::Value| {
+            serde_json::json!({
+                "type": "update",
+                "filePath": "/repo/NOTES.md",
+                "content": "MARKER_WHOLE_NEW_FILE\n",
+                "structuredPatch": patch,
+                "originalFile": "SENTINEL_ORIGINAL_FILE\n",
+            })
+        };
+        let patch = serde_json::json!([{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+            "lines": ["-old line", "+WRITE_PATCH_MARKER"]}]);
+        assert_eq!(
+            claude_result("Write", update(patch)),
+            "@@ -1,1 +1,1 @@\n-old line\n+WRITE_PATCH_MARKER"
+        );
+        assert_eq!(
+            claude_result("Write", update(serde_json::json!([]))),
+            "MARKER_WHOLE_NEW_FILE\n"
+        );
+        let documented = serde_json::json!({"filePath": "/path/to/file.txt", "type": "create"});
+        assert_eq!(claude_result("Write", documented), "(no output captured)");
+    }
+
+    /// Claude Code's NotebookEdit result carries the whole notebook before and
+    /// after the edit, `original_file` and `updated_file`, beside the cell's
+    /// `new_source` (SDK `NotebookEditOutput`). The body keeps the new source,
+    /// or the error when the edit failed.
+    #[test]
+    fn claude_code_notebook_edit_result_keeps_the_cell_source() {
+        let edit = |error: Option<&str>| {
+            let mut response = serde_json::json!({
+                "new_source": "df.describe()  # NOTEBOOK_CELL_MARKER",
+                "old_source": "df.head()",
+                "cell_id": "c3",
+                "cell_type": "code",
+                "language": "python",
+                "edit_mode": "replace",
+                "notebook_path": "/repo/analysis.ipynb",
+                "original_file": "{\"cells\": [\"SENTINEL_ORIGINAL_NOTEBOOK\"]}",
+                "updated_file": "{\"cells\": [\"SENTINEL_UPDATED_NOTEBOOK\"]}",
+            });
+            if let Some(error) = error {
+                response["error"] = serde_json::json!(error);
+            }
+            response
+        };
+        assert_eq!(
+            claude_result("NotebookEdit", edit(None)),
+            "df.describe()  # NOTEBOOK_CELL_MARKER"
+        );
+        assert_eq!(
+            claude_result("NotebookEdit", edit(Some("Cell c3 not found"))),
+            "Cell c3 not found"
+        );
+    }
+
+    /// Claude Code's Grep returns matching lines in `content` (content mode)
+    /// or the matching files (file list and count modes), and Glob the
+    /// matching files (SDK `GrepOutput`, `GlobOutput`). The body keeps them
+    /// one per line rather than as a JSON array.
+    #[test]
+    fn claude_code_search_results_keep_their_matches() {
+        let content = serde_json::json!({
+            "mode": "content",
+            "numFiles": 1,
+            "filenames": ["src/a.rs"],
+            "content": "src/a.rs:3:fn GREP_MATCH_MARKER() {}\nsrc/a.rs:9:GREP_MATCH_MARKER();",
+            "numLines": 2,
+        });
+        assert_eq!(
+            claude_result("Grep", content),
+            "src/a.rs:3:fn GREP_MATCH_MARKER() {}\nsrc/a.rs:9:GREP_MATCH_MARKER();"
+        );
+        let files = serde_json::json!({
+            "mode": "files_with_matches",
+            "numFiles": 2,
+            "filenames": ["src/a.rs", "src/b.rs"],
+        });
+        assert_eq!(claude_result("Grep", files), "src/a.rs\nsrc/b.rs");
+        let glob = serde_json::json!({
+            "durationMs": 4,
+            "numFiles": 2,
+            "filenames": ["src/GLOB_MARKER.rs", "src/lib.rs"],
+            "truncated": false,
+        });
+        assert_eq!(
+            claude_result("Glob", glob),
+            "src/GLOB_MARKER.rs\nsrc/lib.rs"
+        );
+        let none = serde_json::json!({"durationMs": 1, "numFiles": 0, "filenames": [], "truncated": false});
+        assert_eq!(claude_result("Glob", none), "(no output captured)");
+    }
+
     /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
     /// with `outcome: error` and the error text, never the tool's arguments.
     #[test]
@@ -5443,6 +5955,50 @@ outcome: unknown
         assert!(body.contains("tool_family: file"));
         assert!(body.contains("Line 1: first line edited"));
         assert!(body.contains("Line 4: fourth line edited"));
+
+        // Antigravity CLI 1.5.x renamed write_to_file/replace_file_content to
+        // write_file/edit_file with Path + Content/Replacement args.
+        let write_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {
+                        "Path": "/repo/src/new_file.rs",
+                        "Content": "pub fn created_by_1_5() -> bool { true }\n",
+                        "Overwrite": true
+                    }
+                }
+            }),
+        );
+        let body = write_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("created_by_1_5"));
+
+        let edit_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "edit_file",
+                    "args": {
+                        "Path": "/repo/src/new_file.rs",
+                        "Target": "true",
+                        "Replacement": "EDITED_BY_1_5_SENTINEL"
+                    }
+                }
+            }),
+        );
+        let body = edit_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("EDITED_BY_1_5_SENTINEL"));
     }
 
     #[test]

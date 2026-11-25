@@ -372,7 +372,11 @@ there. The Codex plugin likewise registers `ai-memory mcp-bridge
   instead of `postToolUse` when a tool fails, times out or is denied. A
   failed or timed-out call is stored as `outcome: error` with Cursor's
   `error_message`, so the session page counts it and the handoff names it;
-  a denied call keeps its message but stays `outcome: unknown`.
+  a denied call keeps its message but stays `outcome: unknown`. Cursor's
+  `stop` reports how the turn ended in `status`: an `aborted` turn is stored
+  as an interrupted turn end (`interrupt`) and an `error` one as a failed
+  turn end (`stop failure`), as Claude Code's `StopFailure` is; `completed`
+  stays a normal turn end.
 - When the default data dir's path needs quoting, `install-hooks --agent
   cursor` leaves `--data-dir` out of each hook command and the hook finds that
   directory itself. This covers the macOS default
@@ -930,10 +934,12 @@ stdio shim. Requires Node.js installed on the same machine.
 ## Gemini CLI
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
-`ai-memory install-hooks --agent gemini-cli --apply`.
+`ai-memory install-hooks --agent gemini-cli --apply`. ✅ Managed workstreams
+supported via `ai-memory run gemini` (alias `gemini-cli`; see
+[`docs/managed-workstreams.md`](managed-workstreams.md)).
 
 **Config file:**
-- User: `~/.gemini/settings.json`
+- User: `~/.gemini/settings.json` (or `$GEMINI_CLI_HOME/.gemini/settings.json`)
 - Project: `.gemini/settings.json`
 
 Gemini CLI uses `httpUrl` (not `url`) for streamable-HTTP MCP

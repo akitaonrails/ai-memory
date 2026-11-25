@@ -49,8 +49,11 @@ Official: <https://antigravity.google/docs/hooks/>
 - Events: `SessionStart` (once per new conversation, before the first model
   call; documented in the hook reference bundled with `agy` 1.4.0 and App
   2.24.0, absent from `agy` 1.3.0), `PreToolUse`, `PostToolUse` (matcher =
-  tool name regex: `run_command`, `view_file`, `write_to_file`,
-  `replace_file_content`, `grep_search`, `invoke_subagent`, …),
+  tool name regex: `run_command`, `view_file` / `read_file`, `write_to_file` /
+  `write_file`, `replace_file_content` / `edit_file`, `grep_search`,
+  `invoke_subagent`, …; `agy` 1.5.x renamed the 1.3.x file tools to
+  `read_file`, `write_file`, and `edit_file` with `Path`/`Content`/`Replacement`
+  arguments),
   `PreInvocation`, `PostInvocation` (around each model call), `Stop`
   (`terminationReason`, `fullyIdle`). No event marks a conversation's end, and
   none carries the user's prompt.

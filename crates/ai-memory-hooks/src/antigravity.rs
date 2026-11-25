@@ -38,13 +38,14 @@ pub const MAX_ANTIGRAVITY_OUTPUT_BYTES: usize = 2048;
 /// Check if a tool is eligible for output extraction from `output.txt`.
 ///
 /// Whitelist rationale:
-/// - Tools like `run_command`, `view_file`, and search tools produce valuable
-///   execution logs or inspection output in `output.txt`.
-/// - Mutation tools (`write_to_file`, `replace_file_content`) must NEVER be
-///   enriched here because their `output.txt` only contains generic confirmation
-///   strings ("Created file..."), whereas `ai-memory` extracts the real code
-///   from `args.CodeContent` / `args.ReplacementContent`. Overwriting with
-///   `tool_response` would destroy that code capture.
+/// - Tools like `run_command`, `view_file` / `read_file`, and search tools
+///   produce valuable execution logs or inspection output in `output.txt`.
+/// - Mutation tools (`write_to_file`, `replace_file_content`, `write_file`,
+///   `edit_file`) must NEVER be enriched here because their `output.txt` only
+///   contains generic confirmation strings ("Created file..."), whereas
+///   `ai-memory` extracts the real code from `args.CodeContent` /
+///   `args.ReplacementContent` / `args.Content` / `args.Replacement`.
+///   Overwriting with `tool_response` would destroy that code capture.
 /// - Unproven generic tools (`read_url_content`, `read_resource`, `call_mcp_tool`)
 ///   fail closed to `ToolFamily::Unknown`.
 #[must_use]
@@ -53,6 +54,7 @@ pub fn is_output_eligible(tool_name: &str) -> bool {
         tool_name.to_ascii_lowercase().as_str(),
         "run_command"
             | "view_file"
+            | "read_file"
             | "list_dir"
             | "find_by_name"
             | "grep_search"
@@ -360,6 +362,10 @@ pub fn antigravity_conversation_id(raw: &serde_json::Value) -> Option<&str> {
     .then_some(id)
 }
 
+/// Maximum number of operator-configured extra Antigravity transcript roots
+/// checked per hook invocation. Keeps canonicalization work bounded.
+pub const MAX_EXTRA_TRANSCRIPT_ROOTS: usize = 16;
+
 /// The transcript a payload's `transcriptPath` names, when it is the
 /// conversation's own:
 /// `~/.gemini/<app>/brain/<conversationId>/.system_generated/logs/<file>`
@@ -371,16 +377,31 @@ pub fn antigravity_conversation_id(raw: &serde_json::Value) -> Option<&str> {
 /// when it is opened. Returns the path under the canonical directory.
 #[must_use]
 pub fn antigravity_transcript_path(raw: &serde_json::Value, home: &Path) -> Option<PathBuf> {
+    antigravity_transcript_path_with_roots(raw, home, &[])
+}
+
+/// Like [`antigravity_transcript_path`], also accepting operator-configured
+/// extra transcript roots (for example an Antigravity ACP agent whose brain
+/// root lives outside `~/.gemini/<app>/brain`).
+///
+/// When `extra_roots` is empty, behaviour is identical to
+/// [`antigravity_transcript_path`]. Each extra root is capped at
+/// [`MAX_EXTRA_TRANSCRIPT_ROOTS`], must be absolute (after `~` expansion
+/// against `home`), must not contain `.` or `..` components, must canonicalize
+/// to a real directory, and must satisfy exact equality:
+/// `canonical(logs) == canonical(extra_root)/<conversationId>/.system_generated/logs`.
+#[must_use]
+pub fn antigravity_transcript_path_with_roots(
+    raw: &serde_json::Value,
+    home: &Path,
+    extra_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let conversation = antigravity_conversation_id(raw)?;
     let declared = raw
         .get("transcriptPath")
         .and_then(serde_json::Value::as_str)?;
     let path = resolve_artifact_dir(declared, Some(home))?;
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-    {
+    if !path.is_absolute() || path_has_dot_segments(&path) {
         return None;
     }
     let name = path.file_name()?.to_str()?;
@@ -388,14 +409,57 @@ pub fn antigravity_transcript_path(raw: &serde_json::Value, home: &Path) -> Opti
         return None;
     }
     let logs = std::fs::canonicalize(path.parent()?).ok()?;
-    ANTIGRAVITY_APP_DATA_DIRS.iter().find_map(|app| {
+    if let Some(matched) = ANTIGRAVITY_APP_DATA_DIRS.iter().find_map(|app| {
         let brain = std::fs::canonicalize(home.join(".gemini").join(app).join("brain")).ok()?;
         let expected = brain
             .join(conversation)
             .join(".system_generated")
             .join("logs");
         (logs == expected).then(|| expected.join(name))
+    }) {
+        return Some(matched);
+    }
+    extra_roots
+        .iter()
+        .take(MAX_EXTRA_TRANSCRIPT_ROOTS)
+        .find_map(|extra_root| {
+            let canonical_root = resolve_extra_transcript_root(extra_root, home)?;
+            let expected = canonical_root
+                .join(conversation)
+                .join(".system_generated")
+                .join("logs");
+            (logs == expected).then(|| expected.join(name))
+        })
+}
+
+fn path_has_dot_segments(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return true;
+    }
+    path.to_str().is_some_and(|raw| {
+        raw.split(['/', '\\'])
+            .any(|segment| segment == "." || segment == "..")
     })
+}
+
+fn resolve_extra_transcript_root(root: &Path, home: &Path) -> Option<PathBuf> {
+    let resolved = match root.to_str() {
+        Some(raw) => resolve_artifact_dir(raw, Some(home))?,
+        None => {
+            if root.as_os_str().is_empty() {
+                return None;
+            }
+            root.to_path_buf()
+        }
+    };
+    if !resolved.is_absolute() || path_has_dot_segments(&resolved) {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(&resolved).ok()?;
+    canonical.is_dir().then_some(canonical)
 }
 
 /// Open `path` only if it is a regular file, not a symlink, FIFO or device,
@@ -741,6 +805,8 @@ mod tests {
         assert!(is_output_eligible("RUN_COMMAND"));
         assert!(is_output_eligible("view_file"));
         assert!(is_output_eligible("View_File"));
+        assert!(is_output_eligible("read_file"));
+        assert!(is_output_eligible("Read_File"));
         assert!(is_output_eligible("list_dir"));
         assert!(is_output_eligible("find_by_name"));
         assert!(is_output_eligible("grep_search"));
@@ -752,6 +818,8 @@ mod tests {
         assert!(!is_output_eligible("write_to_file"));
         assert!(!is_output_eligible("replace_file_content"));
         assert!(!is_output_eligible("multi_replace_file_content"));
+        assert!(!is_output_eligible("write_file"));
+        assert!(!is_output_eligible("edit_file"));
         assert!(!is_output_eligible("generate_image"));
         assert!(!is_output_eligible("ask_question"));
         assert!(!is_output_eligible("schedule"));
@@ -971,6 +1039,60 @@ mod tests {
         // Assert
         assert!(!enriched);
         assert!(payload.get("tool_response").is_none());
+    }
+
+    #[test]
+    fn test_enrich_antigravity_step_output_supports_1_5_read_file_and_skips_write_edit() {
+        let dir = tempdir().unwrap();
+        let step_dir = dir.path().join(".system_generated").join("steps").join("7");
+        fs::create_dir_all(&step_dir).unwrap();
+        fs::write(
+            step_dir.join("output.txt"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+
+        let mut read_payload = serde_json::json!({
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": "/workspace/src/lib.rs"}
+            },
+            "stepIdx": 7,
+            "artifactDirectoryPath": dir.path().to_str().unwrap()
+        });
+        assert!(enrich_antigravity_step_output(
+            &mut read_payload,
+            HookEvent::PostToolUse,
+            None
+        ));
+        assert_eq!(
+            read_payload
+                .get("tool_response")
+                .and_then(serde_json::Value::as_str),
+            Some("pub fn answer() -> u32 { 42 }")
+        );
+
+        for (tool, args) in [
+            (
+                "write_file",
+                serde_json::json!({"Path": "/workspace/new.rs", "Content": "fn main() {}"}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"Path": "/workspace/new.rs", "Target": "a", "Replacement": "b"}),
+            ),
+        ] {
+            let mut payload = serde_json::json!({
+                "toolCall": {"name": tool, "args": args},
+                "stepIdx": 7,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            });
+            assert!(
+                !enrich_antigravity_step_output(&mut payload, HookEvent::PostToolUse, None),
+                "{tool} must not be overwritten with output.txt"
+            );
+            assert!(payload.get("tool_response").is_none());
+        }
     }
 
     #[test]
@@ -1677,6 +1799,261 @@ mod tests {
         assert_eq!(
             read_transcript_prompts(&path, &TranscriptCursor::default()),
             None
+        );
+    }
+
+    fn write_extra_root_transcript(
+        extra_root: &Path,
+        conversation: &str,
+        file: &str,
+        lines: &[&str],
+    ) -> PathBuf {
+        let logs = extra_root
+            .join(conversation)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let path = logs.join(file);
+        let mut text = lines.join("\n");
+        if !lines.is_empty() {
+            text.push('\n');
+        }
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn extra_transcript_roots_accept_configured_acp_roots_and_enforce_bounds() {
+        let home = tempdir().unwrap();
+        let acp_root = tempdir().unwrap();
+        let other_root = tempdir().unwrap();
+
+        for file in ANTIGRAVITY_TRANSCRIPT_FILES {
+            let path = write_extra_root_transcript(acp_root.path(), "conv-acp", file, &[]);
+            // Refused by default when no extra roots are configured.
+            assert_eq!(
+                antigravity_transcript_path(&payload_for(&path, "conv-acp"), home.path()),
+                None,
+                "{file} must be refused when extra_roots is empty"
+            );
+            assert_eq!(
+                antigravity_transcript_path_with_roots(
+                    &payload_for(&path, "conv-acp"),
+                    home.path(),
+                    &[],
+                ),
+                None,
+                "{file} must be refused when extra_roots is empty"
+            );
+            // Accepted when the ACP root is configured.
+            assert_eq!(
+                antigravity_transcript_path_with_roots(
+                    &payload_for(&path, "conv-acp"),
+                    home.path(),
+                    &[acp_root.path().to_path_buf()],
+                ),
+                Some(canonical(&path)),
+                "{file} must be accepted when configured"
+            );
+        }
+
+        // Tilde-expanded extra root under home is accepted.
+        let home_acp = home.path().join("acp-brain");
+        let tilde_path =
+            write_extra_root_transcript(&home_acp, "conv-tilde", "transcript.jsonl", &[]);
+        assert_eq!(
+            antigravity_transcript_path_with_roots(
+                &payload_for(&tilde_path, "conv-tilde"),
+                home.path(),
+                &[PathBuf::from("~/acp-brain")],
+            ),
+            Some(canonical(&tilde_path))
+        );
+
+        // Adversarial: mismatched conversationId, non-allowlisted filename, `..`
+        // traversal in declared path, `..`/`.`/relative/file extra_root, and
+        // roots past MAX_EXTRA_TRANSCRIPT_ROOTS are all refused.
+        let valid =
+            write_extra_root_transcript(acp_root.path(), "conv-acp", "transcript.jsonl", &[]);
+        let logs = valid.parent().unwrap();
+        let secret = logs.join("secrets.jsonl");
+        fs::write(&secret, "{}\n").unwrap();
+        let file_as_root = other_root.path().join("not-a-dir");
+        fs::write(&file_as_root, "x").unwrap();
+
+        let roots = [acp_root.path().to_path_buf()];
+        for raw in [
+            payload_for(&valid, "other-conv"),
+            payload_for(&secret, "conv-acp"),
+            payload_for(&logs.join("../logs/transcript.jsonl"), "conv-acp"),
+            payload_for(&logs.join("./transcript.jsonl"), "conv-acp"),
+        ] {
+            assert_eq!(
+                antigravity_transcript_path_with_roots(&raw, home.path(), &roots),
+                None,
+                "must refuse {raw}"
+            );
+        }
+
+        let bad_roots = [
+            acp_root.path().join("sub/.."),
+            acp_root.path().join("."),
+            PathBuf::from("relative/acp-root"),
+            PathBuf::from(""),
+            file_as_root,
+        ];
+        assert_eq!(
+            antigravity_transcript_path_with_roots(
+                &payload_for(&valid, "conv-acp"),
+                home.path(),
+                &bad_roots,
+            ),
+            None,
+            "malformed extra roots must be refused"
+        );
+
+        // Cap at MAX_EXTRA_TRANSCRIPT_ROOTS: an entry past the cap is ignored.
+        let mut over_cap = vec![other_root.path().to_path_buf(); MAX_EXTRA_TRANSCRIPT_ROOTS];
+        over_cap.push(acp_root.path().to_path_buf());
+        assert_eq!(
+            antigravity_transcript_path_with_roots(
+                &payload_for(&valid, "conv-acp"),
+                home.path(),
+                &over_cap,
+            ),
+            None,
+            "root beyond MAX_EXTRA_TRANSCRIPT_ROOTS must not be checked"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extra_transcript_roots_refuse_symlink_escapes_and_non_regular_files() {
+        use std::os::unix::fs::symlink;
+        let home = tempdir().unwrap();
+        let acp_root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+
+        // Target outside the extra root.
+        let escaped_logs = outside.path().join("escaped/.system_generated/logs");
+        fs::create_dir_all(&escaped_logs).unwrap();
+        let escaped_file = escaped_logs.join("transcript.jsonl");
+        fs::write(
+            &escaped_file,
+            format!("{}\n", user_input(0, "escaped prompt")),
+        )
+        .unwrap();
+
+        // 1. Symlinked `<extra_root>/<id>` escaping `<extra_root>`.
+        symlink(
+            outside.path().join("escaped"),
+            acp_root.path().join("conv-id-link"),
+        )
+        .unwrap();
+        let id_link_path = acp_root
+            .path()
+            .join("conv-id-link/.system_generated/logs/transcript.jsonl");
+        assert_eq!(
+            antigravity_transcript_path_with_roots(
+                &payload_for(&id_link_path, "conv-id-link"),
+                home.path(),
+                &[acp_root.path().to_path_buf()],
+            ),
+            None
+        );
+
+        // 2. Symlinked `.system_generated` escaping `<extra_root>`.
+        let conv_sys = acp_root.path().join("conv-sys-link");
+        fs::create_dir_all(&conv_sys).unwrap();
+        symlink(
+            outside.path().join("escaped/.system_generated"),
+            conv_sys.join(".system_generated"),
+        )
+        .unwrap();
+        let sys_link_path = conv_sys.join(".system_generated/logs/transcript.jsonl");
+        assert_eq!(
+            antigravity_transcript_path_with_roots(
+                &payload_for(&sys_link_path, "conv-sys-link"),
+                home.path(),
+                &[acp_root.path().to_path_buf()],
+            ),
+            None
+        );
+
+        // 3. Symlinked `logs` escaping `<extra_root>`.
+        let conv_logs_parent = acp_root.path().join("conv-logs-link/.system_generated");
+        fs::create_dir_all(&conv_logs_parent).unwrap();
+        symlink(&escaped_logs, conv_logs_parent.join("logs")).unwrap();
+        let logs_link_path = conv_logs_parent.join("logs/transcript.jsonl");
+        assert_eq!(
+            antigravity_transcript_path_with_roots(
+                &payload_for(&logs_link_path, "conv-logs-link"),
+                home.path(),
+                &[acp_root.path().to_path_buf()],
+            ),
+            None
+        );
+
+        // 4. Symlinked `transcript.jsonl` escaping `<extra_root>` is refused on open.
+        let conv_file_logs = acp_root
+            .path()
+            .join("conv-file-link/.system_generated/logs");
+        fs::create_dir_all(&conv_file_logs).unwrap();
+        let file_link = conv_file_logs.join("transcript.jsonl");
+        symlink(&escaped_file, &file_link).unwrap();
+        let resolved = antigravity_transcript_path_with_roots(
+            &payload_for(&file_link, "conv-file-link"),
+            home.path(),
+            &[acp_root.path().to_path_buf()],
+        )
+        .expect("directory containment holds; file check runs on open");
+        assert_eq!(
+            read_transcript_prompts(&resolved, &TranscriptCursor::default()),
+            None
+        );
+
+        // 5. Non-regular file (directory named `transcript.jsonl`) is refused on open.
+        let conv_dir_logs = acp_root.path().join("conv-dir-file/.system_generated/logs");
+        fs::create_dir_all(conv_dir_logs.join("transcript.jsonl")).unwrap();
+        let dir_as_file = conv_dir_logs.join("transcript.jsonl");
+        let resolved_dir = antigravity_transcript_path_with_roots(
+            &payload_for(&dir_as_file, "conv-dir-file"),
+            home.path(),
+            &[acp_root.path().to_path_buf()],
+        )
+        .unwrap();
+        assert_eq!(
+            read_transcript_prompts(&resolved_dir, &TranscriptCursor::default()),
+            None
+        );
+
+        // Control: symlinked parent directory ABOVE `<extra_root>` is accepted.
+        let real_parent = tempdir().unwrap();
+        let real_root = real_parent.path().join("real-acp-root");
+        let real_transcript = write_extra_root_transcript(
+            &real_root,
+            "conv-control",
+            "transcript.jsonl",
+            &[&user_input(0, "acp prompt")],
+        );
+        let link_parent = tempdir().unwrap();
+        let linked_parent = link_parent.path().join("linked-parent");
+        symlink(real_parent.path(), &linked_parent).unwrap();
+        let linked_root = linked_parent.join("real-acp-root");
+        let declared_via_link =
+            linked_root.join("conv-control/.system_generated/logs/transcript.jsonl");
+        let resolved_control = antigravity_transcript_path_with_roots(
+            &payload_for(&declared_via_link, "conv-control"),
+            home.path(),
+            &[linked_root],
+        )
+        .expect("symlinked parent above extra_root must be accepted");
+        assert_eq!(resolved_control, canonical(&real_transcript));
+        assert_eq!(
+            texts(
+                &read_transcript_prompts(&resolved_control, &TranscriptCursor::default()).unwrap()
+            ),
+            ["acp prompt"]
         );
     }
 }

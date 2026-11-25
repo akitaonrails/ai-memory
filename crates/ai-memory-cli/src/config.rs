@@ -576,6 +576,16 @@ pub struct Config {
     /// `--apply` alike, so regenerating the extension keeps the choice. Set
     /// with `AI_MEMORY_PI_TOOL_EXPOSURE` or `pi_tool_exposure` in config.toml.
     pub pi_tool_exposure: PiToolExposure,
+    /// Optional allowlist of ai-memory MCP tool names kept directly exposed in
+    /// the generated Pi extension while all other ai-memory tools are
+    /// registered as `exposure: "deferred"` and Pi's `tool_search` is
+    /// activated on `session_start` (#2428). Unset (`None`, the default) keeps
+    /// the generated extension byte-identical to `pi_tool_exposure` alone.
+    /// An empty list (`Some([])`) defers every ai-memory tool and activates
+    /// `tool_search`. Mutually exclusive with `pi_tool_exposure = "codemode"`.
+    /// Set with `AI_MEMORY_PI_DIRECT_TOOLS` or `pi_direct_tools` in
+    /// `config.toml`.
+    pub pi_direct_tools: Option<Vec<String>>,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -753,6 +763,8 @@ pub struct Config {
     pub routing: RoutingSettings,
     /// Client-side hook spool retry policy.
     pub hook_spool: HookSpoolSettings,
+    /// `[capture]` — client-side hook capture settings.
+    pub capture: CaptureSettings,
     /// `[ingest]` — server-side drop list for tool events (#1241).
     pub ingest: IngestSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
@@ -1537,6 +1549,18 @@ pub struct IngestSettings {
     pub drop_list: Box<ai_memory_hooks::IngestDropList>,
 }
 
+/// Client-side hook capture settings (`[capture]` in `<data_dir>/config.toml`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureSettings {
+    /// Additional operator-owned Antigravity transcript root directories
+    /// (for example an Antigravity ACP agent whose brain root lives outside
+    /// `~/.gemini/<app>/brain`). Empty by default.
+    ///
+    /// Never read from `.ai-memory.toml` or hook payloads.
+    pub antigravity_transcript_roots: Vec<PathBuf>,
+}
+
 /// Client-side hook spool retry policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
@@ -1619,6 +1643,7 @@ impl Default for Config {
             run: RunSettings::default(),
             claude_true_yolo: false,
             pi_tool_exposure: PiToolExposure::default(),
+            pi_direct_tools: None,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -1649,6 +1674,7 @@ impl Default for Config {
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
             hook_spool: HookSpoolSettings::default(),
+            capture: CaptureSettings::default(),
             ingest: IngestSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
@@ -2640,6 +2666,17 @@ fn apply_fts_stopwords_env(config: &mut Config, raw: Option<&str>) {
     );
 }
 
+fn apply_antigravity_transcript_roots_env(config: &mut Config, raw: Option<&std::ffi::OsStr>) {
+    let Some(raw) = raw else { return };
+    for path in std::env::split_paths(raw) {
+        if !path.as_os_str().is_empty()
+            && !config.capture.antigravity_transcript_roots.contains(&path)
+        {
+            config.capture.antigravity_transcript_roots.push(path);
+        }
+    }
+}
+
 fn apply_hook_spool_max_attempts_env(config: &mut Config, raw: Option<&str>) {
     let Some(raw) = raw else { return };
     config.hook_spool.max_attempts = raw
@@ -2757,6 +2794,12 @@ impl Config {
                 .as_deref(),
         );
         apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
+        apply_antigravity_transcript_roots_env(
+            &mut config,
+            runtime_env
+                .var_os("AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS")
+                .as_deref(),
+        );
         apply_run_require_server_env(&mut config, runtime_env.run_require_server());
         // The flat spelling would otherwise resolve to `run_exit_prompt`,
         // not `run.exit_prompt`, through figment's `__` split.
@@ -3112,6 +3155,7 @@ impl Config {
             .llm_extra_headers()
             .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?;
         validate_auth_settings(&config.auth)?;
+        validate_pi_direct_tools(config.pi_tool_exposure, config.pi_direct_tools.as_deref())?;
 
         // Validated and resolved eagerly, unlike the primary provider (which
         // stays lazily checked at `serve` startup): a fallback can otherwise
@@ -3559,6 +3603,21 @@ impl Config {
         }
     }
 
+    /// The configured `embedding_model` that the unset-provider default
+    /// cannot run, so [`Self::embedder_config`] runs the default local model
+    /// instead. `None` when a provider is set, no model is set, or the model
+    /// is a local one. `serve` warns with it at startup.
+    #[must_use]
+    pub fn ignored_embedding_model(&self) -> Option<&str> {
+        if non_empty(self.embedding_provider.as_deref()).is_some() {
+            return None;
+        }
+        let model = non_empty(self.embedding_model.as_deref())?;
+        ai_memory_llm::resolve_local_model(model)
+            .is_err()
+            .then_some(model)
+    }
+
     /// Build the configured embedder settings, if hybrid search is enabled.
     ///
     /// # Errors
@@ -3607,7 +3666,16 @@ impl Config {
             },
         };
         let model = if provider == EmbedderChoice::Local {
-            ai_memory_llm::resolve_local_model(&model)?.id.to_string()
+            match ai_memory_llm::resolve_local_model(&model) {
+                Ok(spec) => spec.id.to_string(),
+                // The unset-provider default is best-effort: a name it cannot
+                // run, typically one left from a hosted provider, keeps the
+                // default model, which is also what every release before the
+                // multilingual model ran with that config. Refusing it would
+                // stop `serve` on upgrade. An explicit `local` still refuses.
+                Err(_) if defaulted => ai_memory_llm::LOCAL_MODEL.to_string(),
+                Err(error) => return Err(error),
+            }
         } else {
             model
         };
@@ -4096,6 +4164,50 @@ fn env_secret(name: &str) -> Option<SecretString> {
 
 fn non_empty_secret(secret: Option<&SecretString>) -> Option<&str> {
     non_empty(secret.map(ExposeSecret::expose_secret))
+}
+
+/// Maximum number of tool names allowed in `pi_direct_tools`.
+const MAX_PI_DIRECT_TOOLS: usize = 64;
+
+/// Maximum length in bytes of a single tool name in `pi_direct_tools`.
+const MAX_PI_DIRECT_TOOL_NAME_LEN: usize = 128;
+
+/// Validate `pi_direct_tools` against `pi_tool_exposure` and safe ASCII tool
+/// name constraints (#2428).
+fn validate_pi_direct_tools(
+    exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
+) -> Result<()> {
+    let Some(tools) = direct_tools else {
+        return Ok(());
+    };
+    if exposure == PiToolExposure::Codemode {
+        anyhow::bail!(
+            "pi_direct_tools and pi_tool_exposure = \"codemode\" are mutually exclusive; \
+             remove pi_direct_tools or set pi_tool_exposure = \"direct\""
+        );
+    }
+    if tools.len() > MAX_PI_DIRECT_TOOLS {
+        anyhow::bail!(
+            "pi_direct_tools may list at most {MAX_PI_DIRECT_TOOLS} tools (got {})",
+            tools.len()
+        );
+    }
+    for tool in tools {
+        if tool.is_empty()
+            || tool.len() > MAX_PI_DIRECT_TOOL_NAME_LEN
+            || !tool
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            anyhow::bail!(
+                "pi_direct_tools entry `{tool}` is invalid; tool names must be non-empty, \
+                 at most {MAX_PI_DIRECT_TOOL_NAME_LEN} characters, and use only ASCII letters, \
+                 digits, `_`, or `-`"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reject equal configured secrets without logging their values.
@@ -4753,6 +4865,32 @@ mod tests {
         );
         assert_eq!(cfg.ingest.drop_tool_use_id_prefixes, ["toolu_plugin_"]);
         assert_eq!(cfg.ingest.drop_tool_names, ["mcp__noisy__poll"]);
+        assert!(cfg.capture.antigravity_transcript_roots.is_empty());
+    }
+
+    #[test]
+    fn antigravity_transcript_roots_load_from_config_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[capture]\nantigravity_transcript_roots = [\"/opt/acp/brain\"]\n",
+        )
+        .unwrap();
+        let env = RuntimeEnv::with_process_env_for_tests(&[(
+            "AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS",
+            "/var/lib/acp-brain",
+        )]);
+        let cfg =
+            Config::load_with_runtime_env(Some(&cfg_path), Some(dir.path().to_path_buf()), env)
+                .unwrap();
+        assert_eq!(
+            cfg.capture.antigravity_transcript_roots,
+            vec![
+                PathBuf::from("/opt/acp/brain"),
+                PathBuf::from("/var/lib/acp-brain"),
+            ]
+        );
     }
 
     /// #1269: a thin client must reach the server the SAME config starts.
@@ -6747,6 +6885,76 @@ input_token_safety_margin = {margin}
         }
     }
 
+    /// #2428: `pi_direct_tools` defaults to `None`, accepts a valid list or an
+    /// empty list (defer all), rejects empty/whitespace/invalid entries and
+    /// excessive lengths/counts, and is mutually exclusive with
+    /// `pi_tool_exposure = "codemode"`.
+    #[test]
+    fn load_validates_pi_direct_tools() {
+        let absent = load_with_toml("").unwrap();
+        assert_eq!(absent.pi_direct_tools, None);
+
+        let valid =
+            load_with_toml("pi_direct_tools = [\"memory_query\", \"memory_briefing\"]\n").unwrap();
+        assert_eq!(
+            valid.pi_direct_tools,
+            Some(vec![
+                "memory_query".to_string(),
+                "memory_briefing".to_string(),
+            ])
+        );
+
+        let empty = load_with_toml("pi_direct_tools = []\n").unwrap();
+        assert_eq!(empty.pi_direct_tools, Some(Vec::new()));
+
+        for bad in [
+            "pi_direct_tools = [\"\"]\n",
+            "pi_direct_tools = [\"   \"]\n",
+            "pi_direct_tools = [\"memory query\"]\n",
+            "pi_direct_tools = [\"memory_query;alert(1)\"]\n",
+            "pi_direct_tools = [\"memory.query\"]\n",
+        ] {
+            let err = load_with_toml(bad).expect_err(bad);
+            assert!(
+                err.to_string().contains("pi_direct_tools entry"),
+                "{bad}: {err}"
+            );
+        }
+
+        let too_long = format!("pi_direct_tools = [\"{}\"]\n", "a".repeat(129));
+        let err = load_with_toml(&too_long).unwrap_err();
+        assert!(err.to_string().contains("pi_direct_tools entry"), "{err}");
+
+        let too_many = format!(
+            "pi_direct_tools = [{}]\n",
+            (0..65)
+                .map(|i| format!("\"tool_{i}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let err = load_with_toml(&too_many).unwrap_err();
+        assert!(
+            err.to_string().contains("pi_direct_tools may list at most"),
+            "{err}"
+        );
+
+        let conflict = load_with_toml(
+            "pi_tool_exposure = \"codemode\"\npi_direct_tools = [\"memory_query\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            conflict.to_string().contains("mutually exclusive"),
+            "{conflict}"
+        );
+
+        let conflict_empty =
+            load_with_toml("pi_tool_exposure = \"codemode\"\npi_direct_tools = []\n").unwrap_err();
+        assert!(
+            conflict_empty.to_string().contains("mutually exclusive"),
+            "{conflict_empty}"
+        );
+    }
+
     #[test]
     fn defaults_bound_consolidation_prompts_for_a_large_context_provider() {
         let tmp = TempDir::new().unwrap();
@@ -7154,6 +7362,83 @@ input_token_safety_margin = {margin}
         let msg = err.to_string();
         assert!(msg.contains("nonexistent-local-model"), "{msg}");
         assert!(msg.contains("intfloat/multilingual-e5-small"), "{msg}");
+    }
+
+    #[test]
+    fn unset_provider_keeps_the_default_local_model_for_a_hosted_embedding_model() {
+        // A model left from a hosted provider once the provider line is
+        // gone. Earlier releases ran the default local model with this
+        // config, and its stored vectors carry that model's name.
+        for leftover in [
+            "text-embedding-3-small",
+            "voyage-3",
+            "nonexistent-local-model",
+        ] {
+            let cfg = Config {
+                embedding_model: Some(leftover.into()),
+                ..Config::default()
+            };
+            let embedder = cfg
+                .embedder_config()
+                .unwrap_or_else(|err| panic!("{leftover}: {err}"))
+                .unwrap();
+            assert_eq!(embedder.provider, EmbedderChoice::Local, "{leftover}");
+            assert!(embedder.defaulted, "{leftover}");
+            assert_eq!(embedder.model, ai_memory_llm::LOCAL_MODEL, "{leftover}");
+            assert_eq!(embedder.dim, 384, "{leftover}");
+        }
+    }
+
+    #[test]
+    fn unset_provider_still_runs_the_local_model_embedding_model_names() {
+        // The documented way to pick the multilingual model needs no
+        // provider line (config.default.toml, docs/local-embeddings.md).
+        for configured in ["intfloat/multilingual-e5-small", "multilingual-e5-small"] {
+            let cfg = Config {
+                embedding_model: Some(configured.into()),
+                ..Config::default()
+            };
+            let embedder = cfg.embedder_config().unwrap().unwrap();
+            assert_eq!(embedder.provider, EmbedderChoice::Local, "{configured}");
+            assert!(embedder.defaulted, "{configured}");
+            assert_eq!(
+                embedder.model, "intfloat/multilingual-e5-small",
+                "{configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_embedding_model_names_only_a_model_the_default_cannot_run() {
+        let with = |provider: Option<&str>, model: Option<&str>| Config {
+            embedding_provider: provider.map(Into::into),
+            embedding_model: model.map(Into::into),
+            ..Config::default()
+        };
+        assert_eq!(
+            with(None, Some("text-embedding-3-small")).ignored_embedding_model(),
+            Some("text-embedding-3-small")
+        );
+        // A blank provider is the unset default too.
+        assert_eq!(
+            with(Some("  "), Some("voyage-3")).ignored_embedding_model(),
+            Some("voyage-3")
+        );
+        for (provider, model) in [
+            (None, None),
+            (None, Some("   ")),
+            (None, Some("all-MiniLM-L6-v2")),
+            (None, Some("multilingual-e5-small")),
+            (Some("openai"), Some("text-embedding-3-small")),
+            (Some("local"), Some("nonexistent-local-model")),
+            (Some("none"), Some("text-embedding-3-small")),
+        ] {
+            assert_eq!(
+                with(provider, model).ignored_embedding_model(),
+                None,
+                "{provider:?} {model:?}"
+            );
+        }
     }
 
     #[test]

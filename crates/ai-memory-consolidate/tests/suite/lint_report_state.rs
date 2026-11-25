@@ -160,6 +160,90 @@ fn report_body(fx: &Fixture) -> String {
         .body
 }
 
+#[tokio::test]
+async fn duplicate_title_lint_uses_the_indexed_title() {
+    let fx = fixture().await;
+    write_page(
+        &fx,
+        "notes/heading-a.md",
+        serde_json::Value::Null,
+        "# Release  Notes\n\nFirst page.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/heading-b.md",
+        serde_json::Value::Null,
+        "# release notes\n\nSecond page.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/explicit.md",
+        serde_json::json!({"title": "RELEASE NOTES"}),
+        "# Different heading\n\nThird page.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/override.md",
+        serde_json::json!({"title": "Different title"}),
+        "# Release Notes\n\nThe indexed title comes from frontmatter.",
+    )
+    .await;
+    write_page(
+        &fx,
+        "notes/expired.md",
+        serde_json::json!({"expires_at": "2000-01-01"}),
+        "# Release Notes\n\nExpired page.",
+    )
+    .await;
+    for path in ["concepts/handbook.md", "notes/handbook.md"] {
+        write_page(
+            &fx,
+            path,
+            serde_json::Value::Null,
+            "The filename supplies the title.",
+        )
+        .await;
+    }
+
+    let report = run_lint(
+        &fx.store.reader,
+        &fx.wiki,
+        None,
+        fx.ws,
+        fx.proj,
+        LintOptions {
+            dry_run: true,
+            ..options(false, false)
+        },
+    )
+    .await
+    .unwrap();
+    let mut duplicate_groups: Vec<_> = report
+        .findings
+        .into_iter()
+        .filter(|finding| finding.kind == "duplicate")
+        .map(|mut finding| {
+            finding.pages.sort();
+            finding.pages
+        })
+        .collect();
+    duplicate_groups.sort();
+    assert_eq!(
+        duplicate_groups,
+        [
+            vec!["concepts/handbook.md", "notes/handbook.md"],
+            vec![
+                "notes/explicit.md",
+                "notes/heading-a.md",
+                "notes/heading-b.md"
+            ],
+        ]
+    );
+}
+
 async fn seed_knowledge(fx: &Fixture) {
     write_page(
         fx,
@@ -231,8 +315,8 @@ async fn the_report_frontmatter_feeds_the_lint_summary_and_briefing() {
 
     // Seven pairs sharing a title: seven `duplicate` warnings naming
     // fourteen pages, of which the summary lists the first five.
-    for i in 0..7 {
-        for side in ["a", "b"] {
+    for i in (0..7).rev() {
+        for side in ["b", "a"] {
             write_page(
                 &fx,
                 &format!("notes/{i}-{side}.md"),
@@ -256,13 +340,20 @@ async fn the_report_frontmatter_feeds_the_lint_summary_and_briefing() {
     assert_eq!(summary.warnings, 7);
     // The `_rules/` page adds an `info` rule suggestion.
     assert_eq!(summary.findings, 8);
-    assert_eq!(summary.warning_pages.len(), 5);
-    assert!(
-        summary
-            .warning_pages
-            .iter()
-            .all(|p| p.starts_with("notes/"))
+    assert_eq!(
+        summary.warning_pages,
+        [
+            "notes/0-a.md",
+            "notes/0-b.md",
+            "notes/1-a.md",
+            "notes/1-b.md",
+            "notes/2-a.md",
+        ]
     );
+
+    let report = report_body(&fx);
+    lint(&fx, None, options(false, false)).await;
+    assert_eq!(report_body(&fx), report);
 
     let briefing = reader
         .briefing_for_project_with_slot_visibility(

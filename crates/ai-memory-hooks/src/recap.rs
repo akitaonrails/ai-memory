@@ -117,7 +117,7 @@ async fn build_recap(
     if let Err(e) = crate::grants::authorize_resolved(
         &state.reader,
         Some((ws, proj)),
-        viewer,
+        ai_memory_store::ScopeCaller::from(viewer),
         ProjectAccess::Read,
     )
     .await

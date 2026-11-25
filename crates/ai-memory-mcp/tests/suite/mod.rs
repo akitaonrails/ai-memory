@@ -35,6 +35,7 @@ mod launch_scope_fallback;
 mod llm_request_subject;
 mod mcp_stateless_http;
 mod message_routes;
+mod proxy_reserved_scopes;
 mod query_answer;
 mod query_default_limit;
 mod query_min_relevance;

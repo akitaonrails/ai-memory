@@ -434,8 +434,11 @@ pub fn discover_assets(
 
     // 4. Gemini CLI
     if filter_agent(AgentKind::GeminiCli) {
-        let gemini_dir = home.join(".gemini");
         if want_global {
+            let gemini_dir = agent_config_home(env.var_os("GEMINI_CLI_HOME"))
+                .as_deref()
+                .unwrap_or(home)
+                .join(".gemini");
             push_if_file(
                 &mut assets,
                 AgentKind::GeminiCli,
@@ -454,6 +457,15 @@ pub fn discover_assets(
                 ".gemini/skills",
                 "gemini/skills",
             )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::Plugin,
+                AgentAssetScope::Global,
+                &gemini_dir.join("plugins"),
+                ".gemini/plugins",
+                "gemini/plugins",
+            )?;
         }
         if want_project {
             push_if_file(
@@ -465,6 +477,15 @@ pub fn discover_assets(
                 "GEMINI.md",
                 "project/GEMINI.md",
             );
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Project,
+                &cwd.join(".gemini").join("skills"),
+                ".gemini/skills",
+                "project/gemini/skills",
+            )?;
         }
     }
 
@@ -648,6 +669,15 @@ pub fn discover_assets(
                 ".config/opencode/plugins",
                 "opencode/plugins",
             )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::OpenCode,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &opencode_dir.join("skills"),
+                ".config/opencode/skills",
+                "opencode/skills",
+            )?;
         }
         if want_project {
             push_if_file(
@@ -719,7 +749,8 @@ pub fn discover_assets(
     // 7. Grok
     if filter_agent(AgentKind::Grok) {
         if want_global {
-            let grok_dir = home.join(".grok");
+            let grok_dir =
+                agent_config_home(env.var_os("GROK_HOME")).unwrap_or_else(|| home.join(".grok"));
             push_if_file(
                 &mut assets,
                 AgentKind::Grok,
@@ -763,7 +794,8 @@ pub fn discover_assets(
 
     // 8. Kiro CLI
     if filter_agent(AgentKind::KiroCli) && want_global {
-        let kiro_dir = home.join(".kiro");
+        let kiro_dir =
+            agent_config_home(env.var_os("KIRO_HOME")).unwrap_or_else(|| home.join(".kiro"));
         push_if_file(
             &mut assets,
             AgentKind::KiroCli,
@@ -826,6 +858,15 @@ pub fn discover_assets(
         let kimi_dir = cwd.join(crate::commands::install_mcp::kimi_code_home(
             std::env::var_os("KIMI_CODE_HOME"),
         )?);
+        push_if_file(
+            &mut assets,
+            AgentKind::KimiCode,
+            AgentAssetKind::McpConfig,
+            AgentAssetScope::Global,
+            kimi_dir.join("config.toml"),
+            ".kimi-code/config.toml",
+            "kimi-code/config.toml",
+        );
         let legacy_dir = home.join(".kimi");
         for (dir, name) in [(&kimi_dir, "kimi-code"), (&legacy_dir, "kimi")] {
             // An override can point at the legacy directory. Archive it once

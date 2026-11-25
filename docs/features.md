@@ -72,8 +72,11 @@ Code session's responses include its subagents', which Claude Code keeps in
 their own transcripts beside the session's; they arrive with the main
 conversation's next response.
 Pi also reports cumulative session totals through its updated generated
-extension, but not individual response records. See
-[Pi capture and accounting limits](usage.md#investigate-token-usage-in-the-dashboard)
+extension, but not individual response records. OpenCode 2 reports measured
+response usage keyed by native message ID through its updated generated plugin,
+and Antigravity CLI reports cumulative session totals through its `statusLine`
+observer while preserving any existing user `statusLine` command. See
+[capture and accounting details](usage.md#investigate-token-usage-in-the-dashboard)
 for setup, included history and fork behavior.
 
 The Token usage form filters the complete authorized response ledger on the

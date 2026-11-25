@@ -78,3 +78,112 @@ fn an_unknown_pi_tool_exposure_is_rejected() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("pi_tool_exposure"), "{stderr}");
 }
+
+fn install_hooks_with_direct_tools_env(
+    root: &Path,
+    config: &str,
+    direct_tools_env: Option<&str>,
+    apply: bool,
+) -> Output {
+    let config_path = root.join("config.toml");
+    std::fs::write(&config_path, config).unwrap();
+    let mut cmd = hermetic(BIN);
+    cmd.arg("--config")
+        .arg(&config_path)
+        .args(["install-hooks", "--agent", "pi"])
+        .args(["--server-url", "http://127.0.0.1:49374"])
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("AI_MEMORY_HOME", root)
+        .env("AI_MEMORY_DATA_DIR", root.join("data"))
+        .env("PI_CODING_AGENT_DIR", root.join("pi"))
+        .current_dir(root);
+    if apply {
+        cmd.arg("--apply")
+            .arg("--config-file")
+            .arg(root.join("ai-memory-pi.ts"));
+    }
+    if let Some(value) = direct_tools_env {
+        cmd.env("AI_MEMORY_PI_DIRECT_TOOLS", value);
+    }
+    cmd.output().unwrap()
+}
+
+#[test]
+fn preview_and_apply_follow_pi_direct_tools() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let baseline = stdout(&install_hooks_with_direct_tools_env(root, "", None, false));
+    assert!(!baseline.contains("DIRECT_TOOLS"), "{baseline}");
+    assert!(!baseline.contains("setActiveTools"), "{baseline}");
+
+    let cfg = "pi_direct_tools = [\"memory_query\", \"memory_briefing\"]\n";
+    let preview = stdout(&install_hooks_with_direct_tools_env(root, cfg, None, false));
+    assert!(
+        preview.contains("const DIRECT_TOOLS = new Set([\"memory_query\",\"memory_briefing\"]);"),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("exposure: DIRECT_TOOLS.has(tool.name) ? \"direct\" : \"deferred\","),
+        "{preview}"
+    );
+    assert!(preview.contains("promptGuidelines:"), "{preview}");
+    assert!(preview.contains("setActiveTools"), "{preview}");
+
+    stdout(&install_hooks_with_direct_tools_env(root, cfg, None, true));
+    let extension = root.join("ai-memory-pi.ts");
+    let written = std::fs::read_to_string(&extension).unwrap();
+    assert!(written.contains("DIRECT_TOOLS"), "{written}");
+    let again = stdout(&install_hooks_with_direct_tools_env(root, cfg, None, true));
+    assert!(again.contains("already up to date"), "{again}");
+
+    // Empty list is valid: defers all tools and activates tool_search.
+    let empty_preview = stdout(&install_hooks_with_direct_tools_env(
+        root,
+        "pi_direct_tools = []\n",
+        None,
+        false,
+    ));
+    assert!(
+        empty_preview.contains("const DIRECT_TOOLS = new Set([]);"),
+        "{empty_preview}"
+    );
+    assert!(empty_preview.contains("setActiveTools"), "{empty_preview}");
+
+    // Environment override works with JSON array syntax.
+    let env_preview = stdout(&install_hooks_with_direct_tools_env(
+        root,
+        "",
+        Some("[\"memory_recent\"]"),
+        false,
+    ));
+    assert!(
+        env_preview.contains("const DIRECT_TOOLS = new Set([\"memory_recent\"]);"),
+        "{env_preview}"
+    );
+}
+
+#[test]
+fn pi_direct_tools_conflict_and_invalid_entries_are_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conflict = install_hooks_with_direct_tools_env(
+        tmp.path(),
+        "pi_tool_exposure = \"codemode\"\npi_direct_tools = [\"memory_query\"]\n",
+        None,
+        false,
+    );
+    assert!(!conflict.status.success());
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(stderr.contains("mutually exclusive"), "{stderr}");
+
+    let invalid = install_hooks_with_direct_tools_env(
+        tmp.path(),
+        "pi_direct_tools = [\"bad name\"]\n",
+        None,
+        false,
+    );
+    assert!(!invalid.status.success());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("pi_direct_tools entry"), "{stderr}");
+}

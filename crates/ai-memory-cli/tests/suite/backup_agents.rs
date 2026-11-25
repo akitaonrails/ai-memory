@@ -37,6 +37,8 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .env_remove("COPILOT_HOME")
+        .env_remove("GEMINI_CLI_HOME")
+        .env_remove("GROK_HOME")
         .env_remove("KIMI_CODE_HOME")
         .env_remove("KIRO_HOME");
     #[cfg(windows)]
@@ -482,6 +484,220 @@ fn codex_assets_follow_codex_home_on_backup_and_restore() {
     assert!(!destination.join("skills/stale").exists());
 }
 
+#[test]
+fn gemini_assets_follow_gemini_cli_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let gemini_home = home.path().join("active Gemini home");
+    let settings = ".gemini/settings.json";
+    let skill = ".gemini/skills/example/SKILL.md";
+    let active_settings = r#"{"ui":{"theme":"Active profile"}}"#;
+    let stale_settings = r#"{"ui":{"theme":"Default profile"}}"#;
+    for (path, body) in [
+        (gemini_home.join(settings), active_settings),
+        (gemini_home.join(skill), "# Example Gemini skill"),
+        (home.path().join(settings), stale_settings),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("gemini-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("GEMINI_CLI_HOME", &gemini_home)
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Gemini home");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("GEMINI_CLI_HOME", &destination)
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(destination.join(settings)).unwrap(),
+        active_settings
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join(skill)).unwrap(),
+        "# Example Gemini skill"
+    );
+    assert!(!restored_home.path().join(".gemini").exists());
+}
+
+#[test]
+fn grok_assets_follow_grok_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let grok_home = home.path().join("active Grok home");
+    let fixtures = [
+        ("config.toml", "model = \"grok-code\"\n"),
+        ("skills/example/SKILL.md", "# Example Grok skill"),
+    ];
+    for (relative, body) in fixtures {
+        let path = grok_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_skill = home.path().join(".grok/skills/stale/SKILL.md");
+    fs::create_dir_all(inactive_skill.parent().unwrap()).unwrap();
+    fs::write(inactive_skill, "# Stale skill").unwrap();
+    let project_config = "model = \"grok-project\"\n";
+    let project_config_path = project.path().join(".grok/config.toml");
+    fs::create_dir_all(project_config_path.parent().unwrap()).unwrap();
+    fs::write(&project_config_path, project_config).unwrap();
+
+    let archive = project.path().join("grok-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("GROK_HOME", &grok_home)
+        .args(backup_agents_args(&archive, "grok"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Grok home");
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .env("GROK_HOME", &destination)
+        .args(restore_agents_args(&archive, "grok"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(restored_project.path().join(".grok/config.toml")).unwrap(),
+        project_config,
+        "a project-scoped Grok config stays under the project"
+    );
+    assert!(!restored_home.path().join(".grok").exists());
+    assert!(!destination.join("skills/stale").exists());
+}
+
+#[test]
+fn kiro_cli_assets_follow_kiro_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let kiro_home = home.path().join("active Kiro home");
+    let fixtures = [
+        ("settings/mcp.json", r#"{"mcpServers":{}}"#),
+        ("agents/example.json", r#"{"name":"example"}"#),
+    ];
+    for (relative, body) in fixtures {
+        let path = kiro_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_agent = home.path().join(".kiro/agents/stale.json");
+    fs::create_dir_all(inactive_agent.parent().unwrap()).unwrap();
+    fs::write(inactive_agent, r#"{"name":"stale"}"#).unwrap();
+
+    let archive = project.path().join("kiro-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("KIRO_HOME", &kiro_home)
+        .args(backup_agents_args(&archive, "kiro-cli"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Kiro home");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("KIRO_HOME", &destination)
+        .args(restore_agents_args(&archive, "kiro-cli"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert!(!restored_home.path().join(".kiro").exists());
+    assert!(!destination.join("agents/stale.json").exists());
+}
+
+/// Gemini CLI reads project skills from `.gemini/skills` inside the repository,
+/// alongside the user-level `~/.gemini/skills` the installer writes.
+#[test]
+fn gemini_project_skills_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let skill = ".gemini/skills/example/SKILL.md";
+    let body = "# Example Gemini project skill";
+    let source = project.path().join(skill);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, body).unwrap();
+
+    let archive = project.path().join("gemini-project.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(restored_project.path().join(skill)).unwrap(),
+        body
+    );
+    assert!(!restored_home.path().join(".gemini").exists());
+}
+
+/// Gemini CLI keeps global plugins under `~/.gemini/plugins`, the second plugin
+/// root the documented matrix lists in the Antigravity/Gemini row.
+#[test]
+fn gemini_global_plugins_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let plugin = ".gemini/plugins/example/index.js";
+    let body = "export default { name: \"example\" };\n";
+    let source = home.path().join(plugin);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, body).unwrap();
+
+    let archive = project.path().join("gemini-plugins.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), project.path())
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(restored_home.path().join(plugin)).unwrap(),
+        body
+    );
+}
+
 /// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default
 /// `~/.copilot/skills`) and repository skills from `.github/skills`, the
 /// roots `install-skills --agent copilot-cli` writes:
@@ -608,6 +824,49 @@ fn copilot_cli_skills_follow_copilot_home_on_backup_and_restore() {
     );
 }
 
+#[test]
+fn opencode_global_skills_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let config = r#"{"$schema":"https://opencode.ai/config.json"}"#;
+    let skill = "# Example OpenCode skill";
+    for (path, body) in [
+        (home.path().join(".config/opencode/opencode.json"), config),
+        (
+            home.path().join(".config/opencode/skills/example/SKILL.md"),
+            skill,
+        ),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("opencode.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "opencode"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), project.path())
+        .args(restore_agents_args(&archive, "opencode"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    let restored_root = restored_home.path().join(".config/opencode");
+    assert_eq!(
+        fs::read_to_string(restored_root.join("skills/example/SKILL.md")).unwrap(),
+        skill
+    );
+    assert_eq!(
+        fs::read_to_string(restored_root.join("opencode.json")).unwrap(),
+        config
+    );
+}
+
 /// The Copilot allowlist entries cover skills only: an archive cannot use
 /// them to reach Copilot's MCP or hook configuration, or other `.github`
 /// files such as workflows. The skill paths stay restorable as a control.
@@ -696,7 +955,7 @@ fn restore_agents_limits_copilot_destinations_to_skill_roots() {
 }
 
 #[test]
-fn kimi_code_backup_round_trips_mcp_config_and_skills() {
+fn kimi_code_backup_round_trips_mcp_hooks_and_skills() {
     let _guard = cli_test_lock();
     for (source_dir, restore_dir) in [
         (".kimi-code", ".kimi-code"),
@@ -732,6 +991,37 @@ fn kimi_code_backup_round_trips_mcp_config_and_skills() {
                 .unwrap()
                 .contains(token)
         );
+        let hook_config = kimi_home.join("config.toml");
+        fs::write(
+            &hook_config,
+            format!(
+                "default_model = \"fixture-model\"\n\n[providers.fixture]\napi_key = \"{token}\"\n"
+            ),
+        )
+        .unwrap();
+        let hooks_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+        let hooks = command()
+            .args([
+                "install-hooks",
+                "--agent",
+                "kimi-code",
+                "--apply",
+                "--hooks-dir",
+            ])
+            .arg(hooks_dir)
+            .args(["--server-url", "http://127.0.0.1:49374"])
+            .output()
+            .unwrap();
+        assert_success(&hooks, "install hook config");
+        let installed_toml = fs::read_to_string(hook_config)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let installed_hooks = installed_toml["hooks"].as_array_of_tables().unwrap();
+        assert!(!installed_hooks.is_empty());
+        let credentials = kimi_home.join("credentials");
+        fs::create_dir_all(&credentials).unwrap();
+        fs::write(credentials.join("fixture.json"), "{}").unwrap();
         let skill = kimi_home.join("skills/current/SKILL.md");
         fs::create_dir_all(skill.parent().unwrap()).unwrap();
         fs::write(&skill, "# Current Kimi skill").unwrap();
@@ -765,6 +1055,21 @@ fn kimi_code_backup_round_trips_mcp_config_and_skills() {
             mcp["mcpServers"]["ai-memory"]["url"],
             "http://127.0.0.1:49374/mcp?flavor=moonshot"
         );
+        let restored_config = fs::read_to_string(restored_kimi_home.join("config.toml")).unwrap();
+        assert!(!restored_config.contains(token));
+        let restored_toml = restored_config.parse::<toml_edit::DocumentMut>().unwrap();
+        let restored_hooks = restored_toml["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(restored_hooks.to_string(), installed_hooks.to_string());
+        assert_eq!(
+            restored_toml["default_model"].as_str(),
+            Some("fixture-model")
+        );
+        assert!(
+            restored_toml["providers"]["fixture"]["api_key"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("[REDACTED"))
+        );
+        assert!(!restored_kimi_home.join("credentials").exists());
         assert_eq!(
             fs::read_to_string(restored_kimi_home.join("skills/current/SKILL.md")).unwrap(),
             "# Current Kimi skill"
@@ -1632,6 +1937,48 @@ fn restore_agents_rejects_a_symlinked_destination_parent() {
         assert!(!restore.status.success());
         assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
         assert!(!outside.path().join(name).exists());
+    }
+}
+
+/// A relocated Grok or Kiro home is the base the symlink check starts from:
+/// a symlinked directory inside `GROK_HOME` or `KIRO_HOME` still refuses the
+/// restore, and nothing reaches the directory it points to.
+#[cfg(unix)]
+#[test]
+fn restore_agents_rejects_a_symlinked_parent_inside_a_relocated_home() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = cli_test_lock();
+    for (agent, variable, dir, linked, below) in [
+        ("grok", "GROK_HOME", ".grok", "skills", "demo/SKILL.md"),
+        ("kiro-cli", "KIRO_HOME", ".kiro", "agents", "demo.json"),
+    ] {
+        let source_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let asset = source_home.path().join(dir).join(linked).join(below);
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        fs::write(&asset, "{}").unwrap();
+        let archive = project.path().join("backup.tar.gz");
+        let backup = command_with_env(source_home.path(), project.path())
+            .args(backup_agents_args(&archive, agent))
+            .output()
+            .unwrap();
+        assert_success(&backup, "backup");
+
+        let restore_home = tempfile::tempdir().unwrap();
+        let relocated = restore_home.path().join("relocated home");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(&relocated).unwrap();
+        symlink(outside.path(), relocated.join(linked)).unwrap();
+        let restore = command_with_env(restore_home.path(), project.path())
+            .env(variable, &relocated)
+            .args(restore_agents_args(&archive, agent))
+            .output()
+            .unwrap();
+
+        assert!(!restore.status.success());
+        assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
+        assert!(!outside.path().join(below).exists());
     }
 }
 

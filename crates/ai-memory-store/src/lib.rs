@@ -69,7 +69,10 @@ pub use decay::{
 pub use error::{
     AmbiguousMatch, AmbiguousProjectHolder, AmbiguousProjectHolders, StoreError, StoreResult,
 };
-pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
+pub use grants::{
+    GrantFilter, GrantListing, GrantOutcome, ProjectGrant, WorkspaceGrantFilter,
+    WorkspaceGrantListing,
+};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
@@ -91,8 +94,9 @@ pub use profile::{
     ProjectProfileFlags,
 };
 pub use project_authz::{
-    AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
-    RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
+    AccessMode, GLOBAL_SCOPE_WRITE_FORBIDDEN, GrantLevel, ProjectAccess, ProjectAuthz,
+    ProjectPrincipal, RESTRICTED_PROJECT_FORBIDDEN, ScopeCaller, authorize_project,
+    resolve_project_authz,
 };
 pub use query_signals::{
     QUERY_SIGNAL_COUNT_CAP, QUERY_SIGNAL_TEXT_MAX_CHARS, QuerySignalRow, normalize_query,
@@ -132,10 +136,13 @@ pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ResolvedWriteScope, ScopeName, ScopeResolutionError,
     ScopeResolver, ScopeSource, WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for,
-    create_explicit_scope, create_explicit_scope_guarded, create_global_scope,
-    create_profile_scope, lookup_existing_scope, lookup_existing_scope_guarded,
-    lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
-    lookup_project_id_guarded, resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    authorize_scope_for_caller, create_explicit_scope, create_explicit_scope_guarded,
+    create_explicit_scope_guarded_for_caller, create_global_scope, create_profile_scope,
+    create_profile_scope_for_caller, lookup_existing_scope, lookup_existing_scope_guarded,
+    lookup_existing_scope_guarded_for_caller, lookup_existing_workspace, lookup_global_scope,
+    lookup_profile_scope, lookup_project_id_guarded, lookup_project_id_guarded_for_caller,
+    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    resolve_many_existing_scopes_guarded_for_caller,
 };
 pub use session_consolidation::{
     SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, TRANSPORT_RECOVERY_MAX_ATTEMPTS,
@@ -4196,11 +4203,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, IngestObservationOutcome::ResumePending);
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap(),
+            "an incomplete key must stay on the full replay path"
+        );
         store
             .writer
             .complete_observation_ingest(proj_a, "entry-1".into())
             .await
             .unwrap();
+        assert!(
+            store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap()
+        );
         let complete = store
             .writer
             .insert_observation_ingest(
@@ -4239,6 +4275,21 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap(),
+            "an expired ordinary key must fall through to be swept and inserted"
+        );
         let reused = store
             .writer
             .insert_observation_ingest(
@@ -4267,6 +4318,21 @@ mod tests {
             .complete_observation_ingest(proj_a, recovery_key.clone())
             .await
             .unwrap();
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    &recovery_key,
+                )
+                .await
+                .unwrap(),
+            "a recovery key still has to compare event identity"
+        );
         let conn = Connection::open(store.db_path()).unwrap();
         conn.execute(
             "UPDATE ingest_keys SET seen_at = 1 WHERE project_id = ?1 AND key = ?2",

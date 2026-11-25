@@ -80,6 +80,7 @@ pub(crate) enum WriteCmd {
     SetAccessMode {
         project_id: ProjectId,
         mode: crate::AccessMode,
+        changed_by: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
     },
     SetProjectProfileFlags {
@@ -764,6 +765,19 @@ pub(crate) enum WriteCmd {
         revoked_by: Option<UserId>,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    GrantWorkspace {
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        level: crate::GrantLevel,
+        granted_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<crate::grants::GrantOutcome>>,
+    },
+    RevokeWorkspace {
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        revoked_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     CreateHumanUser {
         new_user: NewUser,
         role: UserRole,
@@ -1131,10 +1145,27 @@ impl WriterHandle {
         project_id: ProjectId,
         mode: crate::AccessMode,
     ) -> StoreResult<Option<crate::AccessMode>> {
+        self.set_access_mode_as(project_id, mode, None).await
+    }
+
+    /// Set a project's access mode and audit the change with its operator.
+    /// `None` identifies the root bearer, which has no users row. Repeats are
+    /// not audited. Returns the previous mode, or `None` for a missing project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates SQL errors without committing an unaudited change.
+    pub async fn set_access_mode_as(
+        &self,
+        project_id: ProjectId,
+        mode: crate::AccessMode,
+        changed_by: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<Option<crate::AccessMode>> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::SetAccessMode {
             project_id,
             mode,
+            changed_by,
             reply: tx,
         })
         .await?;
@@ -3504,6 +3535,54 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Grant `user_id` `level` on every project of `workspace_id`, present
+    /// and future; see [`crate::grants::grant_workspace`].
+    ///
+    /// # Errors
+    /// Writer closed, an unknown workspace, or SQL.
+    pub async fn grant_workspace(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        level: crate::GrantLevel,
+        granted_by: Option<UserId>,
+    ) -> StoreResult<crate::grants::GrantOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::GrantWorkspace {
+            user_id,
+            workspace_id,
+            level,
+            granted_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Revoke the workspace grant `user_id` holds on `workspace_id`. Project
+    /// grants inside the workspace stay in force.
+    ///
+    /// Returns whether anything was in force to revoke.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn revoke_workspace(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        revoked_by: Option<UserId>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeWorkspace {
+            user_id,
+            workspace_id,
+            revoked_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a human identity. `new_user` MUST already have been validated.
     /// No API credential is created.
     ///
@@ -4301,9 +4380,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::SetAccessMode {
                 project_id,
                 mode,
+                changed_by,
                 reply,
             } => {
-                let result = crate::grants::set_access_mode(&conn, project_id, mode);
+                let result = crate::grants::set_access_mode(
+                    &conn,
+                    project_id,
+                    mode,
+                    changed_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
                 send_or_warn(reply, result, "set_access_mode");
             }
             WriteCmd::SetProjectProfileFlags {
@@ -5486,6 +5572,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     jiff::Timestamp::now().as_microsecond(),
                 );
                 send_or_warn(reply, result, "revoke_memory");
+            }
+            WriteCmd::GrantWorkspace {
+                user_id,
+                workspace_id,
+                level,
+                granted_by,
+                reply,
+            } => {
+                let result = crate::grants::grant_workspace(
+                    &conn,
+                    user_id,
+                    workspace_id,
+                    level,
+                    granted_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "grant_workspace");
+            }
+            WriteCmd::RevokeWorkspace {
+                user_id,
+                workspace_id,
+                revoked_by,
+                reply,
+            } => {
+                let result = crate::grants::revoke_workspace(
+                    &conn,
+                    user_id,
+                    workspace_id,
+                    revoked_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "revoke_workspace");
             }
             WriteCmd::CreateHumanUser {
                 new_user,

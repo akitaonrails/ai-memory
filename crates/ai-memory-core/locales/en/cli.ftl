@@ -377,6 +377,7 @@ cli-grant-who-previous-on-project = { $value0 }: { $value1 } -> { $value2 } on {
 cli-grant-who-now-holds-on-project = { $value0 } now holds { $value1 } on { $value2 }.
 cli-grant-no-longer-holds-anything-on-project = { $value0 } no longer holds anything on { $value1 }.
 cli-grant-held-nothing-on-project-nothing-changed = { $value0 } held nothing on { $value1 }; nothing changed.
+cli-grant-every-project-of-workspace = every project of { $value0 }
 cli-install-instructions-would-write-into = # Would write into: { $value0 }{ "\u000A" }
 cli-install-instructions-getting-cwd-for-install-instructions-target = getting CWD for install-instructions target
 cli-install-instructions-note-neither-claude-md-nor-agents-md-exists-in-creating-claude-md-if-you-use = note: neither CLAUDE.md nor AGENTS.md exists in { $value0 }; creating CLAUDE.md. If you use Codex / OpenCode / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Kiro CLI, re-run with `--target AGENTS.md`.

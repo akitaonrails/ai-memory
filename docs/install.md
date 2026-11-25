@@ -203,7 +203,7 @@ runs, in order, the commands a native install otherwise needs one by one:
    `CODEX_HOME` and similar relocations). The plan numbers each agent and
    says what it was found by (its session store, its MCP config, or for Muse
    its directory), then lists the other agents `--agent` accepts. Cursor,
-   Gemini CLI, Droid and the other agents with no store to look for are
+   Droid and the other agents with no store to look for are
    wired by naming them. OpenCode 1 and 2 share one session store, so a
    detected or named `opencode` runs `opencode --version` once and wires the
    plugin and MCP entry for the major it reports, as `install-mcp --client
@@ -1563,7 +1563,13 @@ antigravity-cli` wires five of its
 The transcript is read only when `transcriptPath` names the conversation's own
 `~/.gemini/<app>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
 (or the `transcript_full.jsonl` beside it, which the CLI reports), with
-`<app>` one of `antigravity`, `antigravity-cli` or `antigravity-ide`. Another
+`<app>` one of `antigravity`, `antigravity-cli` or `antigravity-ide`. For
+Antigravity ACP agents whose brain directory lives outside
+`~/.gemini/<app>/brain`, operators may opt in to additional local roots via
+`[capture] antigravity_transcript_roots` in `<data_dir>/config.toml` or
+`AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (OS path-list separated, capped at 16
+absolute roots with no `.`/`..` components; never read from `.ai-memory.toml`
+or hook payloads). Another
 file, another conversation's transcript and a symlinked directory that leads
 out of the conversation are refused. One hook reads at most 8 MiB under a
 100 ms filesystem deadline; a timeout leaves the cursor untouched so the next
@@ -2595,6 +2601,13 @@ The Pi and OMP extensions use distinct filenames (`ai-memory-pi.ts` and
 `ai-memory-omp.ts`) so installing one never overwrites the other. They are
 not interchangeable: only Pi's bridges MCP tools.
 
+If ai-memory tools are missing, check the extension's startup warning. Discovery
+runs when the extension loads; a failed `initialize` or `tools/list` request does
+not stop lifecycle capture, but leaves the tools unavailable. Start or restore
+the server, check its URL and credentials, then run `/reload` in Pi to load the
+extension and discover the tools again. Starting a new session alone does not
+retry discovery.
+
 #### OMP profiles
 
 `omp --profile <name>` relocates OMP's agent home to
@@ -2660,6 +2673,30 @@ that route each call to the current project, and lifecycle capture stay the
 same. Preview output and every later `--apply` (including the refresh that
 `ai-memory upgrade` runs) read the same setting, so regenerating keeps your
 choice. Set it back to `direct`, or remove it, to return to the default.
+
+#### Pi selective direct/deferred tools (`pi_direct_tools`)
+
+To keep a small set of ai-memory tools directly declared to the model while
+deferring the remaining schemas behind Pi's `tool_search`, set
+`pi_direct_tools` in `config.toml` (or `AI_MEMORY_PI_DIRECT_TOOLS` as a JSON
+array) and regenerate the extension:
+
+```toml
+pi_direct_tools = ["memory_query", "memory_briefing"]
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Listed tools register with `exposure: "direct"`, all other ai-memory tools
+register with `exposure: "deferred"`, a concise `promptGuidelines` hint is
+attached once so the model knows to use `tool_search` for deferred memory
+tools, and `session_start` activates `tool_search` when Pi exposes
+`getActiveTools`/`setActiveTools`. Set `pi_direct_tools = []` to defer every
+ai-memory tool while still activating `tool_search`. `pi_direct_tools` is
+mutually exclusive with `pi_tool_exposure = "codemode"`. Remove the key to
+return to the default extension output.
 
 ### Bind mounts vs docker cp
 
@@ -4203,13 +4240,20 @@ the binary is genuine. Point it only at origins you control. Prefer an
 on-path attacker can substitute both the archive and its matching checksum.
 Each response body is capped at 128 MiB.
 
-When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the Claude Code
-refresh reuses the endpoint shared by its installed native hooks and leaves
-the hook credential files alone. If the hook commands use different URLs,
-contain inline credentials, or cannot be safely re-rendered as native hooks,
-upgrade refreshes the staged scripts and keeps the existing settings. To
-update those hooks, re-run `ai-memory install-hooks --apply --agent claude-code`
-with the original connection options.
+When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the refresh reuses the
+endpoint an agent's installed native hooks share and leaves the hook
+credential files alone. This covers Claude Code, Codex, Copilot CLI, Cursor,
+Gemini CLI, Kimi Code and the other agents whose hooks file
+`install-hooks --apply` writes; the generated integrations (OpenCode, Omp, Pi,
+OpenClaw) keep the endpoint their file names. If Claude Code's hook commands
+use different URLs, contain inline credentials, or cannot be safely
+re-rendered as native hooks, upgrade refreshes the staged scripts and keeps
+the existing settings. To update those hooks, re-run
+`ai-memory install-hooks --apply --agent claude-code` with the original
+connection options. Another agent's hooks in that state are refreshed as
+before, with the configured connection, so re-run
+`ai-memory install-hooks --apply --agent <agent>` with the original
+`--server-url` and `--auth-token` if they pointed at a remote server.
 
 ### Hook files after an update
 

@@ -123,8 +123,8 @@ fn history_visible(table: &str, now_param: &str) -> String {
 /// "May read" is what [`crate::authorize_project`] admits for
 /// [`crate::ProjectAccess::Read`]: a project that is not `restricted` (an
 /// unrecognised mode reads as open there too), one the viewer created, or one
-/// they hold any grant on — every level admits a read, and a test pins the two
-/// together. The global
+/// they hold any grant on, directly or through its workspace — every level
+/// admits a read, and a test pins the two together. The global
 /// preferences scope is always readable: it is shared by construction (see
 /// `lookup_global_scope`).
 ///
@@ -213,6 +213,11 @@ fn readable_repository_sql(
                                        OR op.created_by = {user}) \
                OR {project_column} IN (SELECT pg.project_id FROM project_grants pg \
                                     WHERE pg.user_id = {user}) \
+               OR {project_column} IN (SELECT wp.id FROM projects wp \
+                                       JOIN workspace_grants wg \
+                                         ON wg.workspace_id = wp.workspace_id \
+                                       WHERE wg.user_id = {user} \
+                                         AND wp.name NOT LIKE '\\_profile.%' ESCAPE '\\') \
                OR {project_column} IN (SELECT gp.id FROM projects gp \
                                        JOIN workspaces gw ON gw.id = gp.workspace_id \
                                        WHERE gw.name = {workspace} AND gp.name = {project}))"
@@ -3263,6 +3268,18 @@ impl ReaderPool {
         filter: crate::grants::GrantFilter,
     ) -> StoreResult<Vec<crate::grants::GrantListing>> {
         self.with_conn(move |conn| crate::grants::list_grants(conn, filter))
+            .await
+    }
+
+    /// Workspace grants matching `filter`, resolved to names for display.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_workspace_grants(
+        &self,
+        filter: crate::grants::WorkspaceGrantFilter,
+    ) -> StoreResult<Vec<crate::grants::WorkspaceGrantListing>> {
+        self.with_conn(move |conn| crate::grants::list_workspace_grants(conn, filter))
             .await
     }
 
@@ -6672,6 +6689,95 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether an ordinary ingest key in this project is already complete and
+    /// unexpired for the given live, unpurged session, owner, and agent.
+    ///
+    /// A replay can acknowledge that delivery without scrubbing its body again
+    /// only when the full admission invariants also hold:
+    /// - The key is an ordinary key (`recovery_retained = 0`), is marked
+    ///   complete (`completed_at IS NOT NULL`), and has not aged past the
+    ///   30-day [`crate::ops::INGEST_KEY_TTL_MICROS`] sweep window.
+    /// - The target session row exists, is not recorded in `purged_sessions`
+    ///   for `(session_id, workspace_id, project_id)`, has a valid owner
+    ///   admitted by `owner_filter`, and matches `agent_kind`.
+    ///
+    /// In any other case this returns `false` so the request falls through to
+    /// the full `admit_hook_session_event` path (which sweeps expired keys,
+    /// rejects collisions/mismatches/purged sessions, or handles recovery keys).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn ordinary_ingest_key_completed(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        owner_filter: &OwnerFilter,
+        ingest_key: &str,
+    ) -> StoreResult<bool> {
+        if crate::ops::recovery_ingest_key(ingest_key) {
+            return Ok(false);
+        }
+        let key = ingest_key.to_owned();
+        let owner_filter = owner_filter.clone();
+        let cutoff = Timestamp::now().as_microsecond() - crate::ops::INGEST_KEY_TTL_MICROS;
+        self.with_conn(move |conn| {
+            let completed: bool = conn.query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM ingest_keys \
+                     WHERE project_id = ?1 \
+                       AND key = ?2 \
+                       AND recovery_retained = 0 \
+                       AND completed_at IS NOT NULL \
+                       AND seen_at >= ?3 \
+                 )",
+                params![project_id.as_bytes(), key, cutoff],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if !completed {
+                return Ok(false);
+            }
+            let purged: bool = conn.query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM purged_sessions \
+                     WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                 )",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if purged {
+                return Ok(false);
+            }
+            let existing: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT agent_kind, actor_user FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((agent, owner)) = existing else {
+                return Ok(false);
+            };
+            if owner
+                .as_deref()
+                .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
+                || !owner_filter.admits(owner.as_deref())
+            {
+                return Ok(false);
+            }
+            if agent != agent_kind.as_str() {
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .await
+    }
+
     /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
     /// `sessions/<session_id>.md` page row. These are the scopes a re-home
     /// (`move-session` of a session already rooted in the destination)
@@ -7645,7 +7751,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json, expires_at, salience, compacted_at \
+                        frontmatter_json, expires_at, salience, compacted_at, title \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -16616,6 +16722,8 @@ pub struct DecayCandidate {
     pub id: PageId,
     /// Relative wiki path.
     pub path: PagePath,
+    /// The indexed page title, including a heading or path-stem fallback.
+    pub title: String,
     /// Tier (the sweep only considers `episodic`).
     pub tier: ai_memory_core::Tier,
     /// Pinned flag — true means "never decay".
@@ -16666,6 +16774,7 @@ fn row_to_decay_candidate(
     let expires_at_us: Option<i64> = row.get(8)?;
     let salience: Option<f64> = row.get(9)?;
     let compacted_at_us: Option<i64> = row.get(10)?;
+    let title: String = row.get(11)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -16678,6 +16787,7 @@ fn row_to_decay_candidate(
         expires_at_us,
         salience,
         compacted_at_us,
+        title,
     ))
 }
 
@@ -16694,10 +16804,12 @@ fn materialise_decay_candidate(
     expires_at_us: Option<i64>,
     salience: Option<f64>,
     compacted_at_us: Option<i64>,
+    title: String,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
         path: PagePath::new(path)?,
+        title,
         tier: tier_str
             .parse::<ai_memory_core::Tier>()
             .map_err(StoreError::from)?,

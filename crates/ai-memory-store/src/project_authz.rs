@@ -125,6 +125,63 @@ pub enum ProjectAccess {
     Write,
 }
 
+/// The authenticated caller identity reduced to what scope authorization needs.
+///
+/// Distinct from `Option<UserId>` because a non-root trusted-proxy caller
+/// carries [`ai_memory_core::AuthLevel::User`] with no database [`UserId`]
+/// ([`ai_memory_core::AuthorizedViewer`]), and must still be gated against
+/// reserved shared-scope writes (`default/_global`, `<workspace>/_profile`) and
+/// private profile scopes (`_profile.<user_id>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeCaller {
+    /// Root operator or a deployment that does not distinguish operators.
+    Unrestricted,
+    /// A database user authenticated by API key or session.
+    User(UserId),
+    /// A non-root trusted-proxy caller with no database user row.
+    ProxyUser,
+}
+
+impl ScopeCaller {
+    /// Derive the scope caller from HTTP auth extensions.
+    ///
+    /// - A present [`ai_memory_core::AuthorizedViewer`] always yields
+    ///   [`Self::User`].
+    /// - Otherwise, [`ai_memory_core::AuthLevel::User`] yields
+    ///   [`Self::ProxyUser`] (a non-root trusted-proxy caller).
+    /// - Anything else (root, anonymous, or single-user installs) yields
+    ///   [`Self::Unrestricted`].
+    #[must_use]
+    pub fn from_auth(
+        level: Option<ai_memory_core::AuthLevel>,
+        viewer: Option<ai_memory_core::AuthorizedViewer>,
+    ) -> Self {
+        match (viewer, level) {
+            (Some(v), _) => Self::User(v.user()),
+            (None, Some(ai_memory_core::AuthLevel::User)) => Self::ProxyUser,
+            (None, _) => Self::Unrestricted,
+        }
+    }
+
+    /// Return the database user id when this caller is [`Self::User`].
+    #[must_use]
+    pub const fn user_id(self) -> Option<UserId> {
+        match self {
+            Self::User(id) => Some(id),
+            Self::Unrestricted | Self::ProxyUser => None,
+        }
+    }
+}
+
+impl From<Option<UserId>> for ScopeCaller {
+    fn from(viewer: Option<UserId>) -> Self {
+        match viewer {
+            Some(id) => Self::User(id),
+            None => Self::Unrestricted,
+        }
+    }
+}
+
 /// The caller, reduced to the facts the gate needs.
 ///
 /// Root is supplied by the auth layer; the grant is looked up from
@@ -141,6 +198,12 @@ pub struct ProjectPrincipal {
     /// The caller's `users.id`, used to look up a grant. `None` for anonymous
     /// callers and for identities not mapped to a DB user.
     pub user_id: Option<UserId>,
+    /// Whether ordinary `restricted` project grants apply to this principal.
+    /// `true` for root, database users, and anonymous callers; `false` for
+    /// non-root trusted-proxy callers (which have no DB user id to hold
+    /// per-project grants, while still obeying the reserved-global write gate
+    /// and private-profile isolation).
+    pub subject_to_project_grants: bool,
 }
 
 impl ProjectPrincipal {
@@ -151,6 +214,7 @@ impl ProjectPrincipal {
             is_root: false,
             is_creator: false,
             user_id: None,
+            subject_to_project_grants: true,
         }
     }
 
@@ -161,6 +225,7 @@ impl ProjectPrincipal {
             is_root: true,
             is_creator: false,
             user_id: None,
+            subject_to_project_grants: true,
         }
     }
 
@@ -172,6 +237,22 @@ impl ProjectPrincipal {
             is_root: false,
             is_creator: false,
             user_id: Some(user_id),
+            subject_to_project_grants: true,
+        }
+    }
+
+    /// A non-root trusted-proxy user with no database user row.
+    ///
+    /// Subject to the reserved-global write gate (`default/_global`,
+    /// `<workspace>/_profile`) and private-profile isolation (`_profile.*`),
+    /// while preserving documented trusted-proxy access to ordinary projects.
+    #[must_use]
+    pub fn proxy_user() -> Self {
+        Self {
+            is_root: false,
+            is_creator: false,
+            user_id: None,
+            subject_to_project_grants: false,
         }
     }
 }
@@ -189,21 +270,36 @@ pub struct ProjectAuthz {
     pub is_creator: bool,
     /// The caller's grant on the project, if any.
     pub grant: Option<GrantLevel>,
+    /// The caller's grant on the project's whole workspace, if any
+    /// (`workspace_grants`, V115). It counts as a grant at that level on every
+    /// project of the workspace except private `_profile.<user_id>` scopes and
+    /// writes to a reserved shared scope.
+    pub workspace_grant: Option<GrantLevel>,
     /// The project is a shared reserved scope: the global preferences scope
     /// (`default/_global`) or a workspace profile (`<workspace>/_profile`).
     pub reserved_global: bool,
+    /// The project is a private per-operator profile (`_profile.<user_id>`).
+    pub private_profile: bool,
+    /// Whether ordinary `restricted` project grants apply to this caller.
+    pub subject_to_project_grants: bool,
 }
 
 impl ProjectAuthz {
     /// Decide whether the caller may perform `need` in this project.
     ///
     /// - A deployment that does not distinguish operators skips the gate.
-    /// - A write to the reserved global scope needs root or a `write` grant,
-    ///   in either mode; its creator gets nothing extra.
+    /// - A write to the reserved global scope needs root or a `write` grant
+    ///   on that project, in either mode; its creator gets nothing extra, and
+    ///   neither does a workspace grant: a workspace profile reaches every
+    ///   user of the workspace, so writing it stays a per-project decision.
     /// - An `open` project admits everyone (today's behaviour).
     /// - A `restricted` project admits root and the creator unconditionally;
-    ///   otherwise a read needs any grant and a write needs a `write` grant.
-    ///   Anyone else — including an anonymous caller — is [`AuthzError::Forbidden`].
+    ///   for private profiles (`_profile.*`) this is always enforced, while
+    ///   for ordinary restricted projects it honors
+    ///   [`Self::subject_to_project_grants`]. Otherwise a read needs any grant
+    ///   and a write needs a `write` grant, held on the project or on its
+    ///   workspace. Anyone else — including an anonymous caller — is
+    ///   [`AuthzError::Forbidden`].
     ///
     /// # Errors
     /// [`AuthzError::Forbidden`] when a restricted project refuses the caller.
@@ -221,13 +317,21 @@ impl ProjectAuthz {
         match self.access_mode {
             AccessMode::Open => Ok(()),
             AccessMode::Restricted => {
+                if !self.private_profile && !self.subject_to_project_grants {
+                    return Ok(());
+                }
                 if self.is_root || self.is_creator {
                     return Ok(());
                 }
+                // A project grant and a workspace grant both count; the
+                // higher level decides.
                 let admitted = match need {
                     // A read or write grant both admit a read.
-                    ProjectAccess::Read => self.grant.is_some(),
-                    ProjectAccess::Write => self.grant == Some(GrantLevel::Write),
+                    ProjectAccess::Read => self.grant.is_some() || self.workspace_grant.is_some(),
+                    ProjectAccess::Write => {
+                        self.grant == Some(GrantLevel::Write)
+                            || self.workspace_grant == Some(GrantLevel::Write)
+                    }
                 };
                 if admitted {
                     Ok(())
@@ -253,6 +357,7 @@ struct ProjectRow {
     access_mode: AccessMode,
     creator: Option<UserId>,
     reserved_global: bool,
+    private_profile: bool,
 }
 
 /// Read `projects.access_mode`, `projects.created_by` and whether the project
@@ -276,11 +381,13 @@ fn read_project_row(conn: &Connection, project_id: ProjectId) -> StoreResult<Pro
             access_mode: AccessMode::from_db(mode.as_deref()),
             creator: creator.and_then(|raw| UserId::from_slice(&raw).ok()),
             reserved_global: is_reserved_global(&workspace, &project),
+            private_profile: is_private_profile(&project),
         }),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ProjectRow {
             access_mode: AccessMode::Open,
             creator: None,
             reserved_global: false,
+            private_profile: false,
         }),
         Err(err) => Err(err.into()),
     }
@@ -321,6 +428,7 @@ fn read_project_row_strict(
         access_mode,
         creator: creator.map(|raw| UserId::from_slice(&raw)).transpose()?,
         reserved_global: is_reserved_global(&workspace, &project),
+        private_profile: is_private_profile(&project),
     })
 }
 
@@ -331,6 +439,12 @@ fn is_reserved_global(workspace: &str, project: &str) -> bool {
     (workspace == ai_memory_core::DEFAULT_WORKSPACE_NAME
         && project == ai_memory_core::GLOBAL_SCOPE_PROJECT)
         || project == ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT
+}
+
+/// A private per-operator profile (`_profile.<user_id>`). Always enforced even
+/// for callers not subject to ordinary per-project grants.
+fn is_private_profile(project: &str) -> bool {
+    project.starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX)
 }
 
 /// Look up a caller's grant on a project. Returns the failure so the caller can
@@ -345,6 +459,37 @@ fn read_grant(
         .query_row(
             "SELECT level FROM project_grants \
              WHERE workspace_id = ?1 AND project_id = ?2 AND user_id = ?3",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                user_id.as_bytes()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(level.as_deref().and_then(GrantLevel::from_db))
+}
+
+/// Look up a caller's grant on the whole workspace a project lives in
+/// (`workspace_grants`, V115).
+///
+/// The join is on the project's own `workspace_id`, and the caller's
+/// `workspace_id` must equal it: a grant on one workspace never admits a
+/// project of another, whatever pair of ids a request carries. Private
+/// per-operator profile scopes (`_profile.<user_id>`) are excluded: a
+/// workspace grant never reaches another operator's private profile.
+fn read_workspace_grant(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    user_id: UserId,
+) -> rusqlite::Result<Option<GrantLevel>> {
+    let level: Option<String> = conn
+        .query_row(
+            "SELECT wg.level FROM workspace_grants wg \
+               JOIN projects p ON p.workspace_id = wg.workspace_id \
+              WHERE p.id = ?2 AND wg.workspace_id = ?1 AND wg.user_id = ?3 \
+                AND p.name NOT LIKE '\\_profile.%' ESCAPE '\\'",
             params![
                 workspace_id.as_bytes(),
                 project_id.as_bytes(),
@@ -428,6 +573,7 @@ fn resolve(
         access_mode,
         creator,
         reserved_global,
+        private_profile,
     } = match resolution {
         Resolution::Compatible => read_project_row(conn, project_id)?,
         Resolution::Strict => {
@@ -471,13 +617,37 @@ fn resolve(
     } else {
         None
     };
+    // Only a restricted project consults grants for entry; the reserved
+    // scopes' write gate deliberately ignores the workspace grant.
+    let workspace_grant = match principal.user_id {
+        Some(user_id) if access_mode == AccessMode::Restricted => {
+            match read_workspace_grant(conn, workspace_id, project_id, user_id) {
+                Ok(grant) => grant,
+                Err(err) if resolution == Resolution::Strict => return Err(err.into()),
+                // Same degraded mode as the project grant above: no grant is
+                // invented for a table that cannot be read.
+                Err(err) if reserved_global => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not read workspace_grants for a shared scope; admitting no workspace grant",
+                    );
+                    None
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        _ => None,
+    };
     Ok(ProjectAuthz {
         distinguishes_operators,
         access_mode,
         is_root: principal.is_root,
         is_creator,
         grant,
+        workspace_grant,
         reserved_global,
+        private_profile,
+        subject_to_project_grants: principal.subject_to_project_grants,
     })
 }
 
@@ -498,8 +668,104 @@ mod tests {
             is_root,
             is_creator,
             grant,
+            workspace_grant: None,
             reserved_global: false,
+            private_profile: false,
+            subject_to_project_grants: true,
         }
+    }
+
+    /// GHSA-v4vw-rf7v-cxgf: a non-root trusted-proxy caller has no database
+    /// user id, but must still be refused writes to `default/_global` and
+    /// `<ws>/_profile`, and refused private profiles `_profile.<user_id>`,
+    /// while keeping reads on shared scopes and writes on ordinary projects.
+    #[tokio::test]
+    async fn proxy_user_cannot_write_reserved_global_or_workspace_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(tmp.path()).unwrap();
+        let global = crate::create_global_scope(&store.writer).await.unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let ws_profile = store
+            .writer
+            .get_or_create_project(ws, ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT, None)
+            .await
+            .unwrap();
+        let ordinary = store
+            .writer
+            .get_or_create_project(ws, "api", None)
+            .await
+            .unwrap();
+        let alice = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let private_profile = crate::create_profile_scope(
+            &store.reader,
+            &store.writer,
+            ai_memory_core::profile::EffectiveProfileShare::User,
+            ws,
+            Some(alice),
+        )
+        .await
+        .unwrap();
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let proxy = ProjectPrincipal::proxy_user();
+        let root = ProjectPrincipal::root();
+
+        for (label, target_ws, target_proj) in [
+            ("default/_global", global.workspace_id, global.project_id),
+            ("acme/_profile", ws, ws_profile),
+        ] {
+            let authz = resolve_project_authz(&conn, target_ws, target_proj, &proxy, true).unwrap();
+            assert_eq!(
+                authz.authorize(ProjectAccess::Write),
+                Err(AuthzError::Forbidden(GLOBAL_SCOPE_WRITE_FORBIDDEN)),
+                "proxy user must be refused Write on {label}"
+            );
+            assert!(
+                authz.authorize(ProjectAccess::Read).is_ok(),
+                "control: proxy user may Read {label}"
+            );
+            let root_authz =
+                resolve_project_authz(&conn, target_ws, target_proj, &root, true).unwrap();
+            assert!(
+                root_authz.authorize(ProjectAccess::Write).is_ok(),
+                "control: root may Write {label}"
+            );
+        }
+
+        // Control: ordinary open project admits proxy user writes.
+        let ordinary_authz = resolve_project_authz(&conn, ws, ordinary, &proxy, true).unwrap();
+        assert!(ordinary_authz.authorize(ProjectAccess::Write).is_ok());
+
+        // Private profile: proxy user refused both Read and Write.
+        let private_authz = resolve_project_authz(
+            &conn,
+            private_profile.workspace_id,
+            private_profile.project_id,
+            &proxy,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            private_authz.authorize(ProjectAccess::Read),
+            Err(AuthzError::Forbidden(RESTRICTED_PROJECT_FORBIDDEN))
+        );
+        assert_eq!(
+            private_authz.authorize(ProjectAccess::Write),
+            Err(AuthzError::Forbidden(RESTRICTED_PROJECT_FORBIDDEN))
+        );
     }
 
     /// The strict resolution managed-run mutations use is the canonical

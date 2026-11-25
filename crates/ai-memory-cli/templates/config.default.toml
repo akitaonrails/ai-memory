@@ -257,6 +257,16 @@ log_level = "info"
 # it. Env equivalent: `AI_MEMORY_PI_TOOL_EXPOSURE`.
 # pi_tool_exposure = "direct"
 
+# Optional list of ai-memory MCP tool names to keep directly exposed in the
+# generated Pi extension while deferring all other ai-memory tools behind Pi's
+# `tool_search` (`exposure: "deferred"`). Unset by default (every tool follows
+# `pi_tool_exposure`). Set to `[]` to defer all ai-memory tools and activate
+# `tool_search`. Mutually exclusive with `pi_tool_exposure = "codemode"`.
+# Re-run `ai-memory install-hooks --agent pi --apply` and restart Pi after
+# changing it. Env equivalent: `AI_MEMORY_PI_DIRECT_TOOLS` (JSON array, e.g.
+# `["memory_query","memory_briefing"]`).
+# pi_direct_tools = ["memory_query", "memory_briefing"]
+
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above
 # the min and below the max are flagged; at or above the max they count as
@@ -323,7 +333,9 @@ log_level = "info"
 # enables on the next start), and existing pages are backfilled
 # automatically at startup. For non-English wikis, set embedding_model to
 # "intfloat/multilingual-e5-small" (or alias "multilingual-e5-small", ~470 MB,
-# 384-dim, automatic "query: " / "passage: " prefixes). See docs/local-embeddings.md.
+# 384-dim, automatic "query: " / "passage: " prefixes). With no provider set,
+# any other embedding_model is ignored with a startup warning and the default
+# model runs. See docs/local-embeddings.md.
 #   embedding_provider = "none"           # opt out (FTS + entity + graph only)
 #   embedding_provider = "openai"         # or voyage | google | gemini |
 #                                         # openai-compat | local | copilot | none
@@ -745,6 +757,22 @@ brief_on_project_change = false
 # Env equivalent: `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS`.
 # [hook_spool]
 # max_attempts = 8
+
+# Client-side hook capture settings.
+#
+# antigravity_transcript_roots adds operator-owned root directories where
+# Antigravity hooks may read a conversation's transcript
+# (`<root>/<conversationId>/.system_generated/logs/transcript.jsonl` or
+# `transcript_full.jsonl`), for Antigravity ACP agents whose brain root lives
+# outside `~/.gemini/<app>/brain`. Empty by default (only the built-in
+# `~/.gemini/<app>/brain` roots are accepted). Each entry must be absolute (or
+# `~`-prefixed), contain no `.` or `..` components, canonicalize to a real
+# directory, and at most 16 roots are checked; symlink escapes inside a root
+# are refused. Never read from `.ai-memory.toml` or hook payloads. Env
+# equivalent: `AI_MEMORY_ANTIGRAVITY_TRANSCRIPT_ROOTS` (OS path-list
+# separated: `:` on Unix, `;` on Windows).
+# [capture]
+# antigravity_transcript_roots = []
 
 # Session handoff delivery and creation. These settings apply to every operator
 # on the server.

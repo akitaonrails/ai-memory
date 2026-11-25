@@ -186,10 +186,10 @@ carries over from each tool and what you gain:
 |---|---|---|
 | **Mem0 / fact extractors** (LangMem) | Automatic per-turn capture | Memory compiles into readable **pages** you own and edit, not opaque fact rows; retrieval fuses FTS + entity + graph (+ local vectors) with no cloud API key |
 | **Zep / Graphiti** (temporal KG) | Temporal reasoning, typed relations | Bi-temporal-lite (`as_of`, version-filtered search) and typed edges without standing up a graph database, in one binary |
-| **mcp-memory-service** (fact rows, SQLite) | SQLite + local embeddings, hook capture, typed edges, honest numbers, and, on 2.4, per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access reinforcement, and contradiction flagging | Human-editable markdown **pages** instead of fact-rows, cross-agent claim-once handoffs, and the same aging machinery done **zero-LLM by default, reversibly** (supersede-not-delete + `restore-page`), and **off by default** |
+| **mcp-memory-service** (fact rows, SQLite) | SQLite + local embeddings, hook capture, typed edges, honest numbers, per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access reinforcement, and contradiction flagging | Human-editable markdown **pages** instead of fact-rows, cross-agent claim-once handoffs, and the same aging machinery done **zero-LLM by default, reversibly** (supersede-not-delete + `restore-page`), and **off by default** |
 | **basic-memory** (file-first markdown) | Markdown-on-disk as the source of truth | Automatic lifecycle capture and a derived FTS/entity/graph index on top, cross-agent handoffs, and multi-user sharing built in |
 | **Claude Code built-in memory** | "Remember my project" convenience, zero setup | Synced across machines and agents, searchable, team-capable, and captures tool lifecycle, unlike a machine-local `MEMORY.md` index per repository |
-| **Hindsight / OpenViking** (LLM or VLM in the loop) | Living pages / document memory with a background consolidation loop, plus, on 2.4, belief-strength confidence plus an opt-in LLM "dream" rewrite of cold clusters | A self-contained binary that runs zero-LLM by default and keeps memory in markdown files that are the source of truth, not a mirror; claim-once handoffs; the dream/belief features are **opt-in, off by default, and never delete a source** (vs a mandatory LLM loop) |
+| **Hindsight / OpenViking** (LLM or VLM in the loop) | Living pages / document memory with a background consolidation loop, belief-strength confidence, and an opt-in LLM "dream" rewrite of cold clusters | A self-contained binary that runs zero-LLM by default and keeps memory in markdown files that are the source of truth, not a mirror; claim-once handoffs; the dream/belief features are **opt-in, off by default, and never delete a source** (vs a mandatory LLM loop) |
 | **Supermemory / LiquidLM** (hosted memory API) | A managed second brain with automatic ingestion | Git-versioned markdown you own, no required API spend, offline operation, and per-project team sharing; ai-memory remembers *this repo*, not a general vault |
 
 Across all of these, ai-memory gives you files you own (git-backed markdown),
@@ -269,7 +269,7 @@ sign in, with no console window, and restarts if it fails. Details and the
 other Windows setups (WSL2, Docker Desktop, a real Windows service) are in
 [`docs/windows.md`](docs/windows.md).
 
-With [Scoop](https://scoop.sh) (ai-memory 3.4.0 or later):
+With [Scoop](https://scoop.sh):
 
 ```powershell
 scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
@@ -467,7 +467,7 @@ remote servers, is [`docs/install.md`](docs/install.md).
 
 Two agents in the same project at once, or teammates on one server, work
 out of the box: the "current project" pointer is isolated per caller
-by default (v1.39+). See [`docs/auto-scope.md`](docs/auto-scope.md) for the
+by default. See [`docs/auto-scope.md`](docs/auto-scope.md) for the
 optional session-aware Claude Code bridge and the details.
 
 **If in doubt, start your harness with `ai-memory run`.** It is the preferred
@@ -484,6 +484,7 @@ Pass `--require-server` to fail closed instead.
 ```bash
 ai-memory run claude
 ai-memory run codex --yolo   # same workstream + local Claude history dossier
+ai-memory run gemini         # Gemini CLI managed workstream + read-only transcript import
 ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
 # after a dead launcher left its lease behind (same operator only)
@@ -520,11 +521,6 @@ one-line notice that names that session. The agent then reads its newest prompts
 tool results with `memory_read_session_observations`. The same session is
 listed first in `memory_briefing`'s `recent_sessions`, and `memory_handoff_list`
 names it as `newer_unended_session`.
-
-If that variable is absent on a real same-machine switch, run
-`type -a ai-memory` and `ai-memory --version` in the launching shell. This path
-requires the 3.1.0 or newer host client; a stale Cargo or package-manager binary
-earlier in `PATH` can shadow an updated wrapper.
 
 In `resume`, type to search, use Up/Down to select a workstream, and Left/Right
 to choose its harness. Enter launches the selection; Escape clears a search,
@@ -635,13 +631,14 @@ readable wiki pages; the next session starts with a handoff.
   `tier: "procedural"`.
 - List the newest pages in one family with `memory_recent` and a literal
   `path_prefix`, such as `decisions/`.
-- Inspect content-free per-workload LLM call, outcome, latency, and usage
-  telemetry with `ai-memory status --json`; it diagnoses the configured
-  provider but does not route different workloads to different models.
 - Ask "catch me up" for a prose digest of recent project activity, or run
   `ai-memory recent` (`--global` for every project) to list the newest pages.
-- Search Chinese, Japanese and Korean text without spaces: zero-LLM search
-  matches unspaced Han, Kana and Hangul substrings.
+- Search Chinese, Japanese, Korean, and Arabic text with zero-LLM normalization:
+  unspaced Han, Kana and Hangul substrings, plus Arabic diacritic/letter-variant
+  folding and Arabic-Indic numerals.
+- Trim MCP tool context in Pi with `pi_direct_tools` (keep a chosen list of
+  tools `direct` and defer the rest behind Pi's `tool_search`) or
+  `pi_tool_exposure = "codemode"`.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
@@ -656,7 +653,7 @@ readable wiki pages; the next session starts with a handoff.
   [Investigate token usage](docs/usage.md#investigate-token-usage-in-the-dashboard)
   for capture coverage, cache accounting and the investigation flags. You can
   drill down from a project to an agent, its sessions and individual responses.
-  The updated Pi extension reports session totals only, not response-ledger rows.
+  The Pi extension reports session totals only, not response-ledger rows.
   The web [agent inbox](docs/agent-messaging.md#in-the-web-ui) lets an operator
   queue requests for registered agents and read the received and sent history.
   Token filters run on the full authorized ledger, with native turn and tool
@@ -667,6 +664,10 @@ readable wiki pages; the next session starts with a handoff.
   `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
   `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only
   after reviewing the active skills, plugins, instructions, and destinations.
+  Set `GEMINI_CLI_HOME` when backing up or restoring a relocated Gemini CLI
+  profile so each command uses that home for global settings and skills.
+  `GROK_HOME` and `KIRO_HOME` do the same for Grok's global `config.toml` and
+  skills and for Kiro CLI's `settings/mcp.json` and agent configs.
 
 Search modes, entities, feedback, briefings, and the web API are covered in [`docs/usage.md`](docs/usage.md) and
 [`docs/use-cases.md`](docs/use-cases.md).
@@ -683,7 +684,11 @@ for configuration, translation boundaries and contributor instructions.
 Run the server somewhere reachable, such as a homelab box or a LAN host, and
 point every machine and every teammate at it. Knowledge is shared per
 project; personal handoffs stay personal; every write is attributed and
-audited. Multi-user auth (passwords, API credentials) is built in.
+audited. Multi-user auth (passwords, API credentials), per-project grants, and
+workspace-wide grants (`ai-memory user grant --all-projects`, keeping other
+operators' private profiles isolated) are built in. Server-wide session-start
+delivery defaults (`[handoff]` / `[recovery]` `deliver_on_session_start`) can
+be set in `config.toml` and overridden per repository in `.ai-memory.toml`.
 
 Start with [`docs/users.md`](docs/users.md) for accounts and ownership,
 and [`docs/deploy.md`](docs/deploy.md) for the server itself. It includes
@@ -708,8 +713,12 @@ quick-start) runs without auth until `ai-memory auth enable`, and
 token for the LAN, per-user accounts, OIDC device auth for hooks, TLS via
 a reverse proxy. Capture is sanitized at a typed privacy boundary before
 anything is stored, and per-repository `[capture]` rules can exclude
-paths or invert to allowlist mode. A repository can also route its capture
-to a different server than the one the hooks were installed against.
+paths or invert to allowlist mode. Observations and compiled pages carry an
+immutable origin trust class (`operator_authored`, `tool_result`,
+`model_generated`), and consolidation and auto-improve refuse to emit standing
+`_rules/` supported solely by uncorroborated `tool_result` data. A repository
+can also route its capture to a different server than the one the hooks were
+installed against.
 Human login beyond loopback requires an HTTPS posture by default. Operators
 who explicitly accept plaintext passwords, cookies, credentials, and memory
 traffic on a private LAN can opt in with `serve --allow-insecure-human-auth`;
@@ -728,9 +737,12 @@ Optional. Everything works with zero LLM calls; adding a provider
 upgrades session summaries and enables semantic search. Anthropic,
 OpenAI (including OAuth), Codex CLI credential reuse, GitHub Copilot, Gemini
 (through AI Studio or Vertex AI), OpenCode (Go and Zen), the Cursor Agent CLI (`cursor`), and
-any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
-for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
-endpoints for embeddings. Configuration lives in
+any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, with optional rotating
+`llm_api_key_file`) are supported for consolidation; local in-process
+(`all-MiniLM-L6-v2` default or checksum-pinned `multilingual-e5-small`),
+OpenAI, Voyage, Gemini, and keyless OpenAI-compatible endpoints for embeddings;
+and optional post-fusion reranking via `llm` or the native OpenAI Decisions
+Choice backend (`reranker = "decisions-choice"`). Configuration lives in
 [`docs/llm-providers.md`](docs/llm-providers.md).
 
 For optional synthesized query answers, operators can set
@@ -749,7 +761,7 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 ├── wiki/    # markdown source of truth, git-versioned
 ├── raw/     # immutable sanitized managed-workstream transcript segments
 ├── db/      # SQLite indexes, including FTS5, entities, and embeddings
-├── models/  # reserved for local embedding models
+├── models/  # cached local embedding models (all-MiniLM-L6-v2, multilingual-e5-small)
 └── logs/    # rolling tracing output
 ```
 

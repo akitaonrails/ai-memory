@@ -1723,6 +1723,10 @@ mod tests {
         let obs = vec![
             obs(
                 ObservationKind::UserPrompt,
+                "<agent-message from=\"worker-1\">\n[Subagent hand-back] finished",
+            ),
+            obs(
+                ObservationKind::UserPrompt,
                 "<teammate-message teammate_id=\"team-lead\" summary=\"heads up\">rollout note",
             ),
             obs(ObservationKind::UserPrompt, "fix the auth bug"),
@@ -1749,6 +1753,10 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(prompts.trim(), "1. fix the auth bug");
+        assert!(
+            body.contains("<agent-message"),
+            "subagent hand-backs remain in raw session history"
+        );
     }
 
     #[test]

@@ -103,7 +103,7 @@
   }
   document.addEventListener("keydown", function (event) {
     var tag = (event.target && event.target.tagName) || "";
-    if (tag === "INPUT" || tag === "TEXTAREA" || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || event.metaKey || event.ctrlKey || event.altKey) return;
     var first = parseInt(items[0].getAttribute("data-position"), 10);
     var last = parseInt(items[items.length - 1].getAttribute("data-position"), 10);
     if (event.key === "j" || event.key === "ArrowRight") {

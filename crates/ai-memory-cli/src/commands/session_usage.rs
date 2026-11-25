@@ -709,6 +709,198 @@ pub fn locate_claude_code_transcript(
     path.is_file().then_some(path)
 }
 
+/// Maximum bytes read from a cached Antigravity CLI usage snapshot.
+const MAX_ANTIGRAVITY_USAGE_SNAPSHOT_BYTES: u64 = 16 * 1024;
+/// Maximum cached per-session Antigravity CLI usage snapshot files retained
+/// under `<data_dir>/antigravity-usage/`.
+const MAX_ANTIGRAVITY_USAGE_SNAPSHOTS: usize = 512;
+/// Maximum bytes retained for a reported model name in an Antigravity snapshot.
+const MAX_ANTIGRAVITY_MODEL_BYTES: usize = 64;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AntigravityUsageSnapshot {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+    #[serde(default)]
+    cache_read_tokens: u64,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Path to the cached cumulative usage snapshot for one Antigravity CLI session:
+/// `<data_dir>/antigravity-usage/<sha256(session_id)>.json`.
+#[must_use]
+pub fn antigravity_usage_snapshot_path(data_dir: &Path, session_id: &str) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+    data_dir
+        .join("antigravity-usage")
+        .join(format!("{:x}.json", Sha256::digest(session_id.as_bytes())))
+}
+
+/// Parse measured cumulative session token usage from an Antigravity CLI
+/// `statusLine` JSON payload (<https://antigravity.google/docs/cli/statusline/>).
+///
+/// Reads only explicit non-negative integer counters under `context_window`
+/// (`total_input_tokens`, `total_output_tokens`, and optional cache totals).
+/// Never estimates tokens from `used_percentage`, `remaining_percentage`, or
+/// `context_window_size`. Returns `None` when the session id is missing or
+/// every measured counter is absent, invalid, or zero.
+#[must_use]
+pub fn parse_antigravity_statusline_usage(
+    raw: &serde_json::Value,
+) -> Option<(String, SessionUsage)> {
+    let session_id = raw
+        .get("session_id")
+        .or_else(|| raw.get("conversation_id"))
+        .or_else(|| raw.get("conversationId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= 128)?
+        .to_owned();
+    let context_window = raw.get("context_window")?.as_object()?;
+    let read_counter = |keys: &[&str]| -> Option<u64> {
+        for key in keys {
+            if let Some(value) = context_window.get(*key) {
+                return value.as_u64().map(|n| n.min(1_000_000_000));
+            }
+        }
+        Some(0)
+    };
+    let input_tokens = read_counter(&["total_input_tokens"])?;
+    let output_tokens = read_counter(&["total_output_tokens"])?;
+    let cache_read_tokens = read_counter(&[
+        "total_cache_read_tokens",
+        "cache_read_tokens",
+        "cached_input_tokens",
+    ])?;
+    let cache_write_tokens = read_counter(&[
+        "total_cache_write_tokens",
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+    ])?;
+    if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && cache_write_tokens == 0
+    {
+        return None;
+    }
+    let model = raw
+        .get("model")
+        .and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .get("id")
+                    .or_else(|| value.get("display_name"))
+                    .and_then(serde_json::Value::as_str)
+            })
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut end = s.len().min(MAX_ANTIGRAVITY_MODEL_BYTES);
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s[..end].to_owned()
+        });
+    Some((
+        session_id,
+        SessionUsage {
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            model,
+        },
+    ))
+}
+
+fn load_antigravity_snapshot(path: &Path) -> Option<AntigravityUsageSnapshot> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ANTIGRAVITY_USAGE_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_ANTIGRAVITY_USAGE_SNAPSHOT_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Observe an Antigravity CLI `statusLine` payload and atomically update the
+/// bounded per-session snapshot under `<data_dir>/antigravity-usage/`, keeping
+/// `MAX` per counter. Returns `true` if a nonzero snapshot was persisted.
+pub fn record_antigravity_statusline_usage(data_dir: &Path, raw: &serde_json::Value) -> bool {
+    let Some((session_id, reported)) = parse_antigravity_statusline_usage(raw) else {
+        return false;
+    };
+    let path = antigravity_usage_snapshot_path(data_dir, &session_id);
+    let existing = load_antigravity_snapshot(&path).unwrap_or_default();
+    let merged = AntigravityUsageSnapshot {
+        input_tokens: existing.input_tokens.max(reported.input_tokens),
+        output_tokens: existing.output_tokens.max(reported.output_tokens),
+        cache_write_tokens: existing.cache_write_tokens.max(reported.cache_write_tokens),
+        cache_read_tokens: existing.cache_read_tokens.max(reported.cache_read_tokens),
+        model: reported.model.or(existing.model),
+    };
+    let Ok(bytes) = serde_json::to_vec(&merged) else {
+        return false;
+    };
+    if ai_memory_wiki::write_atomic(&path, &bytes).is_err() {
+        return false;
+    }
+    if let Some(dir) = path.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let mut others = entries
+            .take(MAX_ANTIGRAVITY_USAGE_SNAPSHOTS * 2)
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path() != path
+                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+            })
+            .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+            .collect::<Vec<_>>();
+        others.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+        for (_, stale) in others
+            .into_iter()
+            .skip(MAX_ANTIGRAVITY_USAGE_SNAPSHOTS.saturating_sub(1))
+        {
+            let _ = std::fs::remove_file(stale);
+        }
+    }
+    true
+}
+
+/// Read the cached Antigravity CLI session usage snapshot for `session_id`,
+/// returning `None` when absent or all counters are zero.
+#[must_use]
+pub fn read_antigravity_usage(data_dir: &Path, session_id: &str) -> Option<SessionUsage> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() || session_id.len() > 128 {
+        return None;
+    }
+    let snapshot =
+        load_antigravity_snapshot(&antigravity_usage_snapshot_path(data_dir, session_id))?;
+    if snapshot.input_tokens == 0
+        && snapshot.output_tokens == 0
+        && snapshot.cache_write_tokens == 0
+        && snapshot.cache_read_tokens == 0
+    {
+        return None;
+    }
+    Some(SessionUsage {
+        input_tokens: snapshot.input_tokens,
+        output_tokens: snapshot.output_tokens,
+        cache_write_tokens: snapshot.cache_write_tokens,
+        cache_read_tokens: snapshot.cache_read_tokens,
+        model: snapshot.model,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,5 +1515,54 @@ mod tests {
         assert!(locate_claude_code_transcript(tmp.path(), "/proj", "").is_none());
         assert!(locate_claude_code_transcript(tmp.path(), "/proj", "../../etc/passwd").is_none());
         assert!(locate_claude_code_transcript(tmp.path(), "/no/such/proj", "sid").is_none());
+    }
+
+    #[test]
+    fn antigravity_statusline_usage_persists_max_and_ignores_percentage_or_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+
+        // Missing/zero/percentage-only/negative payloads must stay unknown.
+        for ignored in [
+            serde_json::json!({}),
+            serde_json::json!({"session_id": "s-zero", "context_window": {"total_input_tokens": 0, "total_output_tokens": 0}}),
+            serde_json::json!({"session_id": "s-pct", "context_window": {"used_percentage": 42.5, "remaining_percentage": 57.5, "context_window_size": 1_048_576}}),
+            serde_json::json!({"session_id": "s-neg", "context_window": {"total_input_tokens": -5, "total_output_tokens": 10}}),
+            serde_json::json!({"session_id": "s-float", "context_window": {"total_input_tokens": 12.5, "total_output_tokens": 10}}),
+            serde_json::json!({"context_window": {"total_input_tokens": 100, "total_output_tokens": 50}}),
+        ] {
+            assert!(!record_antigravity_statusline_usage(data_dir, &ignored));
+        }
+        assert!(read_antigravity_usage(data_dir, "s-zero").is_none());
+        assert!(read_antigravity_usage(data_dir, "s-pct").is_none());
+        assert!(read_antigravity_usage(data_dir, "s-neg").is_none());
+        assert!(read_antigravity_usage(data_dir, "s-float").is_none());
+
+        // Nonzero measured payload persists and keeps MAX per counter on replay/lower updates.
+        let first = serde_json::json!({
+            "session_id": "agy-sess-1",
+            "model": { "id": "Gemini 3.8 Flash (High)", "display_name": "Gemini 3.8 Flash (High)" },
+            "context_window": {
+                "total_input_tokens": 1200,
+                "total_output_tokens": 350,
+                "used_percentage": 11.74
+            }
+        });
+        assert!(record_antigravity_statusline_usage(data_dir, &first));
+        let lower_replay = serde_json::json!({
+            "session_id": "agy-sess-1",
+            "context_window": {
+                "total_input_tokens": 800,
+                "total_output_tokens": 400,
+                "total_cache_read_tokens": 90
+            }
+        });
+        assert!(record_antigravity_statusline_usage(data_dir, &lower_replay));
+        let usage = read_antigravity_usage(data_dir, "agy-sess-1").unwrap();
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.output_tokens, 400);
+        assert_eq!(usage.cache_read_tokens, 90);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.model.as_deref(), Some("Gemini 3.8 Flash (High)"));
     }
 }

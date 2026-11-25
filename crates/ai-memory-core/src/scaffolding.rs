@@ -73,7 +73,7 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
 /// Code machine turn (#1855, #2041, #2149).
 ///
 /// Claude Code routes several kinds of its own traffic through the prompt
-/// channel: agent-team and cross-session message blocks that carry attributes
+/// channel: subagent hand-backs, agent-team and cross-session message blocks that carry attributes
 /// (so [`looks_like_markup_block`], which requires a bare tag name, does not
 /// catch them), a `<task-notification>` block, the plain-text envelope the
 /// harness wraps another session's message in, and the summary it injects when
@@ -86,6 +86,7 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
 pub fn looks_like_machine_turn(candidate: &str) -> bool {
     let trimmed = candidate.trim_start();
     opens_with_tag(trimmed, "teammate-message")
+        || opens_with_tag(trimmed, "agent-message")
         || opens_with_tag(trimmed, "cross-session-message")
         || opens_with_tag(trimmed, "task-notification")
         || trimmed.starts_with("Another Claude session sent a message.")
@@ -327,6 +328,10 @@ mod tests {
         for turn in [
             "<teammate-message teammate_id=\"team-lead\" summary=\"x\">mensagem de aviso",
             "<teammate-message>bare open",
+            "<agent-message from=\"worker-1\">\n[Subagent hand-back] finished",
+            "\n\t<agent-message from=\"worker-1\">leading whitespace",
+            "<agent-message>bare open",
+            "<agent-message/>",
             "<cross-session-message from=\"abc\">hi",
             "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>",
             "Another Claude session sent a message. It is shown below.",
@@ -347,6 +352,8 @@ mod tests {
             "Another Claude session is faster than this one, why?",
             "This session is being continued manually by me, not the harness",
             "why did the cross-session-message handler drop the body?",
+            "explain the <agent-message from=\"worker\"> wrapper",
+            "<agent-message-draft from=\"user\">keep this draft",
         ] {
             assert!(!looks_like_machine_turn(prompt), "kept machine: {prompt:?}");
             assert!(!looks_like_scaffolding(prompt), "kept scaffold: {prompt:?}");

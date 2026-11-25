@@ -327,9 +327,11 @@ The server keeps answering when this happens: it runs those reads off its
 request threads with a 2-second limit. Events from a directory it cannot read
 are dropped, and `stderr.log` shows
 `inspecting cwd "<path>" did not finish within 2s` for each one. At most four
-of those reads wait at a time, so while a directory stays blocked, events from
-a project the server has not seen yet can be dropped too; projects it already
-knows keep working. If your
+of those reads wait at a time, and a blocked directory holds only one of them
+however many events come from it. While four different directories are
+blocked, events from a project the server has not seen yet can be dropped too,
+with the same line naming their own directory; projects it already knows keep
+working. If your
 agents work in one of those places, give the binary the plist runs Full Disk
 Access, then restart the agent:
 

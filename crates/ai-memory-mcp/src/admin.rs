@@ -9575,31 +9575,73 @@ async fn handle_revoke_api_credential(
 /// Names, not ids: this is what an operator types. `level` is required by
 /// grant — never defaulted — and ignored by revoke, which takes away whatever
 /// is held.
+///
+/// The target is one project (`project`) or every project of the workspace
+/// (`all_projects: true`), and exactly one of the two must be said: a request
+/// that left `project` out by mistake must not quietly become a grant on the
+/// whole workspace.
 #[derive(Debug, Deserialize)]
 struct UserGrantRequest {
     workspace: String,
-    project: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    all_projects: bool,
     #[serde(default)]
     level: Option<String>,
 }
 
-/// Resolve a grant's user and project to the ids the table keys on.
+/// What a grant or revoke request points at.
+#[derive(Debug, Clone, Copy)]
+enum GrantTarget {
+    /// One project's grant (`project_grants`).
+    Project(ProjectId),
+    /// The workspace grant covering every project of it (`workspace_grants`).
+    Workspace(WorkspaceId),
+}
+
+/// Resolve a grant's user and target to the ids the tables key on.
 ///
-/// The project is looked up, never created: granting access to a project that
-/// does not exist yet would be a typo that silently succeeds and then grants
-/// nothing anyone can reach.
+/// The project or workspace is looked up, never created: granting access to
+/// one that does not exist yet would be a typo that silently succeeds and then
+/// grants nothing anyone can reach.
 async fn grant_target(
     state: &AdminState,
     username: &str,
     request: &UserGrantRequest,
-) -> Result<(ai_memory_core::UserId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(ai_memory_core::UserId, GrantTarget), (StatusCode, Json<serde_json::Value>)> {
+    let project = request
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|project| !project.is_empty());
+    if project.is_some() && request.all_projects {
+        return Err(validation_error(
+            "pass project for one project or all_projects for the whole workspace, not both".into(),
+        ));
+    }
+    if project.is_none() && !request.all_projects {
+        return Err(validation_error(
+            "project is required; pass all_projects: true to cover every project of the workspace"
+                .into(),
+        ));
+    }
     let user = lookup_user_by_username(state, username.trim()).await?;
-    let (_, project) =
-        lookup_ws_proj_no_create(state, request.workspace.trim(), request.project.trim()).await?;
-    Ok((user.id, project))
+    let target = match project {
+        Some(project) => {
+            let (_, project) =
+                lookup_ws_proj_no_create(state, request.workspace.trim(), project).await?;
+            GrantTarget::Project(project)
+        }
+        None => GrantTarget::Workspace(lookup_ws_no_create(state, request.workspace.trim()).await?),
+    };
+    Ok((user.id, target))
 }
 
-fn grants_json(grants: Vec<ai_memory_store::GrantListing>) -> Json<serde_json::Value> {
+fn grants_json(
+    grants: Vec<ai_memory_store::GrantListing>,
+    workspace_grants: Vec<ai_memory_store::WorkspaceGrantListing>,
+) -> Json<serde_json::Value> {
     let grants: Vec<_> = grants
         .into_iter()
         .map(|g| {
@@ -9611,11 +9653,23 @@ fn grants_json(grants: Vec<ai_memory_store::GrantListing>) -> Json<serde_json::V
             })
         })
         .collect();
-    Json(serde_json::json!({ "grants": grants }))
+    // A separate list, not rows with a null project: every existing reader of
+    // `grants` keeps the shape it parses.
+    let workspace_grants: Vec<_> = workspace_grants
+        .into_iter()
+        .map(|g| {
+            serde_json::json!({
+                "username": g.username,
+                "workspace": g.workspace,
+                "level": g.level.as_str(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "grants": grants, "workspace_grants": workspace_grants }))
 }
 
-/// `GET /admin/users/{username}/grants` — every project one user holds a
-/// grant on.
+/// `GET /admin/users/{username}/grants` — every project and every workspace
+/// one user holds a grant on.
 async fn handle_list_user_grants(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -9628,7 +9682,12 @@ async fn handle_list_user_grants(
         .list_grants(ai_memory_store::GrantFilter::User(user.id))
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    Ok((StatusCode::OK, grants_json(grants)))
+    let workspace_grants = state
+        .reader
+        .list_workspace_grants(ai_memory_store::WorkspaceGrantFilter::User(user.id))
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((StatusCode::OK, grants_json(grants, workspace_grants)))
 }
 
 /// Query of `GET /admin/projects/grants`: both names for one project, or
@@ -9640,19 +9699,29 @@ struct ProjectGrantsQuery {
 }
 
 /// `GET /admin/projects/grants[?workspace=&project=]` — who holds a grant on
-/// one project, or every grant on the server.
+/// one project, or every grant on the server. For one project,
+/// `workspace_grants` lists the grants on its workspace, which reach it too —
+/// except for a private `_profile.<user_id>` scope, which workspace grants
+/// never reach.
 async fn handle_list_project_grants(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
     Query(query): Query<ProjectGrantsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
-    let filter = match (query.workspace.as_deref(), query.project.as_deref()) {
-        (None, None) => ai_memory_store::GrantFilter::All,
+    let (filter, workspace_filter) = match (query.workspace.as_deref(), query.project.as_deref()) {
+        (None, None) => (
+            ai_memory_store::GrantFilter::All,
+            Some(ai_memory_store::WorkspaceGrantFilter::All),
+        ),
         (Some(workspace), Some(project)) => {
-            let (_, project) =
-                lookup_ws_proj_no_create(&state, workspace.trim(), project.trim()).await?;
-            ai_memory_store::GrantFilter::Project(project)
+            let trimmed_project = project.trim();
+            let (workspace, project_id) =
+                lookup_ws_proj_no_create(&state, workspace.trim(), trimmed_project).await?;
+            let ws_filter = (!trimmed_project
+                .starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX))
+            .then_some(ai_memory_store::WorkspaceGrantFilter::Workspace(workspace));
+            (ai_memory_store::GrantFilter::Project(project_id), ws_filter)
         }
         _ => {
             return Err(validation_error(
@@ -9665,11 +9734,19 @@ async fn handle_list_project_grants(
         .list_grants(filter)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    Ok((StatusCode::OK, grants_json(grants)))
+    let workspace_grants = match workspace_filter {
+        Some(workspace_filter) => state
+            .reader
+            .list_workspace_grants(workspace_filter)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?,
+        None => Vec::new(),
+    };
+    Ok((StatusCode::OK, grants_json(grants, workspace_grants)))
 }
 
-/// `POST /admin/users/{username}/grant` — give a user a level on a project, or
-/// change the level they hold.
+/// `POST /admin/users/{username}/grant` — give a user a level on a project or
+/// on every project of a workspace, or change the level they hold.
 ///
 /// Returns what actually happened, so "already had that" is not reported as a
 /// change.
@@ -9692,17 +9769,23 @@ async fn handle_user_grant(
             ai_memory_store::GrantLevel::from_db(raw.trim())
                 .ok_or_else(|| validation_error(format!("unknown level {raw:?}: read or write")))
         })?;
-    let (user, project) = grant_target(&state, &username, &request).await?;
-    let outcome = state
-        .writer
-        .grant_memory(
-            user,
-            project,
-            grant_level,
-            operator.map(|axum::Extension(id)| id),
-        )
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
+    let (user, target) = grant_target(&state, &username, &request).await?;
+    let operator = operator.map(|axum::Extension(id)| id);
+    let outcome = match target {
+        GrantTarget::Project(project) => {
+            state
+                .writer
+                .grant_memory(user, project, grant_level, operator)
+                .await
+        }
+        GrantTarget::Workspace(workspace) => {
+            state
+                .writer
+                .grant_workspace(user, workspace, grant_level, operator)
+                .await
+        }
+    }
+    .map_err(|e| internal_err(e.to_string()))?;
     let (changed, previous) = match outcome {
         ai_memory_store::GrantOutcome::Granted => (true, None),
         ai_memory_store::GrantOutcome::LevelChanged { from } => (true, Some(from.as_str())),
@@ -9713,7 +9796,8 @@ async fn handle_user_grant(
         Json(serde_json::json!({
             "username": username.trim(),
             "workspace": request.workspace.trim(),
-            "project": request.project.trim(),
+            "project": request.project.as_deref().map(str::trim),
+            "all_projects": request.all_projects,
             "level": grant_level.as_str(),
             "changed": changed,
             "previous": previous,
@@ -9722,7 +9806,8 @@ async fn handle_user_grant(
 }
 
 /// `POST /admin/users/{username}/revoke` — take away whatever a user holds on
-/// a project.
+/// a project, or their grant on a whole workspace. Revoking the workspace
+/// grant leaves the user's project grants inside it in force.
 async fn handle_user_revoke(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -9731,18 +9816,25 @@ async fn handle_user_revoke(
     Json(request): Json<UserGrantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
-    let (user, project) = grant_target(&state, &username, &request).await?;
-    let revoked = state
-        .writer
-        .revoke_memory(user, project, operator.map(|axum::Extension(id)| id))
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
+    let (user, target) = grant_target(&state, &username, &request).await?;
+    let operator = operator.map(|axum::Extension(id)| id);
+    let revoked = match target {
+        GrantTarget::Project(project) => state.writer.revoke_memory(user, project, operator).await,
+        GrantTarget::Workspace(workspace) => {
+            state
+                .writer
+                .revoke_workspace(user, workspace, operator)
+                .await
+        }
+    }
+    .map_err(|e| internal_err(e.to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "username": username.trim(),
             "workspace": request.workspace.trim(),
-            "project": request.project.trim(),
+            "project": request.project.as_deref().map(str::trim),
+            "all_projects": request.all_projects,
             "revoked": revoked,
         })),
     ))
@@ -9767,6 +9859,7 @@ struct ProjectAccessRequest {
 async fn handle_project_access(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    operator: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(request): Json<ProjectAccessRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
@@ -9799,7 +9892,7 @@ async fn handle_project_access(
     let (_, project_id) = lookup_ws_proj_no_create(&state, workspace, project).await?;
     let previous = state
         .writer
-        .set_access_mode(project_id, mode)
+        .set_access_mode_as(project_id, mode, operator.map(|axum::Extension(id)| id))
         .await
         .map_err(|e| internal_err(e.to_string()))?
         .ok_or_else(|| {
@@ -17020,6 +17113,143 @@ mod tests {
         assert_eq!(json["revoked"], false, "revoking twice reports honestly");
     }
 
+    /// A workspace grant over HTTP, as `ai-memory user grant --all-projects`
+    /// drives it. The target is said, never inferred: a body with no
+    /// `project` is refused instead of widening to the whole workspace.
+    #[tokio::test]
+    async fn a_workspace_grant_is_explicit_listed_apart_and_revoked_by_itself() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_human_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        write_fixture_page(&router, "acme", "api", "notes/a.md").await;
+        let grant = |body: serde_json::Value| {
+            let router = router.clone();
+            async move {
+                admin_call(
+                    &router,
+                    "POST",
+                    "/admin/users/alice/grant",
+                    "root-token",
+                    Some(body),
+                )
+                .await
+            }
+        };
+
+        // The violation this guards: no `project` and no `all_projects` must
+        // not become a workspace grant, and nothing is written by the refusal.
+        let (status, _) = grant(serde_json::json!({"workspace": "acme", "level": "write"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = grant(serde_json::json!({
+            "workspace": "acme", "project": "  ", "level": "write",
+        }))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an empty project is not all projects"
+        );
+        let (status, _) = grant(serde_json::json!({
+            "workspace": "acme", "project": "api", "all_projects": true, "level": "write",
+        }))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "one project and all of them"
+        );
+        let (_, listing) =
+            admin_call(&router, "GET", "/admin/projects/grants", "root-token", None).await;
+        assert_eq!(listing["grants"], serde_json::json!([]));
+        assert_eq!(listing["workspace_grants"], serde_json::json!([]));
+
+        // A typo in the workspace is a 404 and does not create it.
+        for _ in 0..2 {
+            let (status, _) = grant(serde_json::json!({
+                "workspace": "acmee", "all_projects": true, "level": "read",
+            }))
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        // A level is still required. (`only_root_may_touch_grants` covers the
+        // caller: the root check runs before the body is read.)
+        let (status, _) =
+            grant(serde_json::json!({"workspace": "acme", "all_projects": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The legitimate request.
+        let (status, json) = grant(serde_json::json!({
+            "workspace": "acme", "all_projects": true, "level": "read",
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["changed"], true);
+        assert_eq!(json["all_projects"], true);
+        assert!(json["project"].is_null());
+        let (_, json) = grant(serde_json::json!({
+            "workspace": "acme", "all_projects": true, "level": "write",
+        }))
+        .await;
+        assert_eq!(json["previous"], "read");
+
+        // Listed apart from the project grants, from every angle, so the
+        // `grants` array keeps the shape its readers parse.
+        let expected = serde_json::json!([{
+            "username": "alice", "workspace": "acme", "level": "write",
+        }]);
+        for uri in [
+            "/admin/projects/grants",
+            "/admin/users/alice/grants",
+            "/admin/projects/grants?workspace=acme&project=api",
+        ] {
+            let (status, json) = admin_call(&router, "GET", uri, "root-token", None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(json["grants"], serde_json::json!([]), "{uri}");
+            assert_eq!(json["workspace_grants"], expected, "{uri}");
+        }
+        // A project of another workspace does not list it.
+        write_fixture_page(&router, "default", "client-work", "notes/a.md").await;
+        let (_, json) = admin_call(
+            &router,
+            "GET",
+            "/admin/projects/grants?workspace=default&project=client-work",
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(json["workspace_grants"], serde_json::json!([]));
+
+        // Revoking one project's grant does not touch the workspace grant;
+        // revoking the workspace grant does, once.
+        let revoke = |body: serde_json::Value| {
+            let router = router.clone();
+            async move {
+                admin_call(
+                    &router,
+                    "POST",
+                    "/admin/users/alice/revoke",
+                    "root-token",
+                    Some(body),
+                )
+                .await
+                .1
+            }
+        };
+        let json = revoke(serde_json::json!({"workspace": "acme", "project": "api"})).await;
+        assert_eq!(json["revoked"], false);
+        let (_, listing) =
+            admin_call(&router, "GET", "/admin/projects/grants", "root-token", None).await;
+        assert_eq!(listing["workspace_grants"], expected);
+        let json = revoke(serde_json::json!({"workspace": "acme", "all_projects": true})).await;
+        assert_eq!(json["revoked"], true);
+        let json = revoke(serde_json::json!({"workspace": "acme", "all_projects": true})).await;
+        assert_eq!(json["revoked"], false);
+    }
+
     async fn write_fixture_page(router: &Router, workspace: &str, project: &str, path: &str) {
         let (status, json) = admin_call(
             router,
@@ -17213,8 +17443,77 @@ mod tests {
         let (_, json) = call("root-token", restrict.clone()).await;
         assert_eq!(json["changed"], false, "repeating a mode is not a change");
 
-        let (status, _) = call("not-root", restrict).await;
+        let (status, _) = call(
+            "not-root",
+            serde_json::json!({"workspace": "default", "project": "client-work", "mode": "open"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        let db = rusqlite::Connection::open(_tmp.path().join("db/memory.sqlite")).unwrap();
+        let (mode, audit_count): (String, i64) = db.query_row(
+            "SELECT access_mode, (SELECT COUNT(*) FROM audit_log WHERE op = 'set_project_access') \
+             FROM projects WHERE name = 'client-work'",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(
+            mode, "restricted",
+            "the non-root request must not reopen the project"
+        );
+        assert_eq!(
+            audit_count, 1,
+            "repeats and refused requests do not record a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_access_records_the_authenticated_operator() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let operator = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "operator".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::Root,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let router = router.layer(axum::Extension(operator));
+        write_fixture_page(&router, "team", "client-work", "notes/a.md").await;
+        let (status, json) = admin_call(
+            &router, "POST", "/admin/projects/access", "root-token",
+            Some(serde_json::json!({"workspace": "team", "project": "client-work", "mode": "restricted"})),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let (actor, workspace, project, detail) = db
+            .query_row(
+                "SELECT a.author_id, w.name, p.name, a.detail FROM audit_log a \
+             JOIN projects p ON p.id = a.project_id \
+             JOIN workspaces w ON w.id = a.workspace_id \
+             WHERE a.op = 'set_project_access'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(actor, operator.as_bytes());
+        assert_eq!(workspace, "team");
+        assert_eq!(project, "client-work");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&detail).unwrap(),
+            serde_json::json!({"previous": "open", "mode": "restricted"})
+        );
     }
 
     #[tokio::test]

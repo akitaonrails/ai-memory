@@ -42,6 +42,8 @@ enum RewriteOp {
     HooksJson(HookConfigShape),
     /// Antigravity CLI named hook group under top-level `ai-memory`.
     AntigravityHooksJson,
+    /// Antigravity CLI `statusLine` observer in `~/.gemini/antigravity-cli/settings.json`.
+    AntigravityStatusLineJson,
     /// Zero hooks.json — `hooks` array entries whose `id` carries the
     /// `ai-memory-` prefix.
     ZeroHooksJson,
@@ -409,6 +411,19 @@ fn build_plan(
                 antigravity,
                 removal.removed_events,
                 RewriteOp::AntigravityHooksJson,
+            );
+        }
+
+        let antigravity_settings = install_hooks::antigravity_settings_path()?;
+        if antigravity_settings.exists() {
+            let content = std::fs::read_to_string(&antigravity_settings)
+                .with_context(|| format!("reading {}", antigravity_settings.display()))?;
+            let removal = strip_antigravity_statusline(&content)?;
+            push_rewrite(
+                &mut plan,
+                antigravity_settings,
+                removal.removed_events,
+                RewriteOp::AntigravityStatusLineJson,
             );
         }
 
@@ -859,6 +874,9 @@ fn apply_change(
                         }
                         RewriteOp::AntigravityHooksJson => {
                             strip_antigravity_hooks(&out)?.new_content
+                        }
+                        RewriteOp::AntigravityStatusLineJson => {
+                            strip_antigravity_statusline(&out)?.new_content
                         }
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
                         RewriteOp::ZcodeHooksJson => strip_zcode_hooks(&out)?.new_content,
@@ -1749,7 +1767,51 @@ fn strip_antigravity_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
-/// Remove ai-memory's `[[hooks]]` rules from Kimi Code's config.toml. The
+/// Remove ai-memory's Antigravity CLI `statusLine` observer from
+/// `~/.gemini/antigravity-cli/settings.json`.
+///
+/// - If `statusLine.command` wraps a pre-existing user command via
+///   `--chain-command-b64`, restores `statusLine.command` to the exact original
+///   command and leaves all other `statusLine` fields untouched.
+/// - If `statusLine.command` is an unchained ai-memory observer, removes
+///   `statusLine` completely.
+/// - If `statusLine.command` is not owned by ai-memory, leaves it untouched.
+fn strip_antigravity_statusline(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(command) = root
+            .get("statusLine")
+            .and_then(|v| v.get("command"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Ok(());
+        };
+        let Some(chained) = install_hooks::parse_antigravity_statusline_command(&command) else {
+            return Ok(());
+        };
+        match chained {
+            Some(original) => {
+                if let Some(obj) = root
+                    .get_mut("statusLine")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    obj.insert("command".to_string(), serde_json::Value::String(original));
+                    removed_events.push("statusLine (restored)".to_string());
+                }
+            }
+            None => {
+                root.remove("statusLine");
+                removed_events.push("statusLine".to_string());
+            }
+        }
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
 /// same file holds the user's providers/model settings and any third-party
 /// rules, so ownership is proven by the hook command signature alone and
 /// everything else round-trips untouched.
@@ -3283,6 +3345,68 @@ mod tests {
         let inner = v["ai-memory"]["Stop"][0]["hooks"].as_array().unwrap();
         assert_eq!(inner.len(), 1);
         assert_eq!(inner[0]["command"].as_str(), Some("/usr/bin/user-stop"));
+    }
+
+    #[test]
+    fn strip_antigravity_statusline_restores_chained_removes_unchained_and_keeps_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+
+        // 1. Unchained ai-memory statusLine is removed completely.
+        let unchained_path = tmp.path().join("unchained.json");
+        install_hooks::merge_antigravity_statusline(&data_dir, &unchained_path, false).unwrap();
+        let unchained_raw = std::fs::read_to_string(&unchained_path).unwrap();
+        let removed = strip_antigravity_statusline(&unchained_raw).unwrap();
+        assert_eq!(removed.removed_events, vec!["statusLine".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&removed.new_content).unwrap();
+        assert!(v.get("statusLine").is_none());
+
+        // 2. Chained user statusLine is restored verbatim with all sibling fields kept.
+        let chained_path = tmp.path().join("chained.json");
+        let user_cmd = "~/.gemini/antigravity-cli/custom.sh --fmt 'compact'";
+        std::fs::write(
+            &chained_path,
+            serde_json::json!({
+                "theme": "nord",
+                "statusLine": {
+                    "type": "command",
+                    "command": user_cmd,
+                    "enabled": true,
+                    "stack_with_default": false,
+                    "padding": 1
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        install_hooks::merge_antigravity_statusline(&data_dir, &chained_path, false).unwrap();
+        let chained_raw = std::fs::read_to_string(&chained_path).unwrap();
+        let restored = strip_antigravity_statusline(&chained_raw).unwrap();
+        assert_eq!(
+            restored.removed_events,
+            vec!["statusLine (restored)".to_string()]
+        );
+        let rv: serde_json::Value = serde_json::from_str(&restored.new_content).unwrap();
+        assert_eq!(rv["theme"].as_str(), Some("nord"));
+        assert_eq!(rv["statusLine"]["command"].as_str(), Some(user_cmd));
+        assert_eq!(
+            rv["statusLine"]["stack_with_default"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(rv["statusLine"]["padding"].as_u64(), Some(1));
+
+        // 3. Unrelated user statusLine is untouched.
+        let untouched_raw = serde_json::json!({
+            "statusLine": { "type": "command", "command": "/usr/local/bin/my-bar" }
+        })
+        .to_string();
+        let untouched = strip_antigravity_statusline(&untouched_raw).unwrap();
+        assert!(untouched.removed_events.is_empty());
+        let uv: serde_json::Value = serde_json::from_str(&untouched.new_content).unwrap();
+        assert_eq!(
+            uv["statusLine"]["command"].as_str(),
+            Some("/usr/local/bin/my-bar")
+        );
     }
 
     #[test]

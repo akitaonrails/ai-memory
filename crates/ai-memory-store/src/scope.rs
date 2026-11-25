@@ -14,7 +14,7 @@ use ai_memory_core::{
 };
 
 use crate::error::{AmbiguousProjectHolders, StoreError};
-use crate::project_authz::{GrantLevel, ProjectAccess, ProjectPrincipal};
+use crate::project_authz::{GrantLevel, ProjectAccess, ProjectPrincipal, ScopeCaller};
 use crate::{ReaderPool, WriterHandle};
 
 /// Canonical error for partial explicit scope arguments.
@@ -484,13 +484,34 @@ fn refusal_message(project: &str, held: Option<GrantLevel>, need: ProjectAccess)
     }
 }
 
-/// Authorize a scope resolved outside a [`ScopeResolver`] for `viewer` (#708).
+/// Authorize a scope resolved outside a [`ScopeResolver`] for `caller` (#708).
 ///
 /// For routes that name a project directly — admin, web, hook captures — and
-/// so have no current-project default to resolve through. `viewer` is the
-/// database user the request authenticated as; `None` (the root token, or an
-/// install with no database users) skips the check, as a resolver with no
-/// principal attached does.
+/// so have no current-project default to resolve through.
+///
+/// # Errors
+/// [`ScopeResolutionError::Forbidden`] when the gate refuses the caller; store
+/// failures otherwise.
+pub async fn authorize_scope_for_caller(
+    reader: &ReaderPool,
+    writer: Option<&WriterHandle>,
+    scope: ResolvedScope,
+    caller: ScopeCaller,
+    need: ProjectAccess,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let principal = match caller {
+        ScopeCaller::Unrestricted => return Ok(scope),
+        ScopeCaller::User(viewer) => ProjectPrincipal::user(viewer),
+        ScopeCaller::ProxyUser => ProjectPrincipal::proxy_user(),
+    };
+    decide_scope(reader, writer, scope, &principal, true, need).await?;
+    Ok(scope)
+}
+
+/// Authorize a scope resolved outside a [`ScopeResolver`] for `viewer` (#708).
+///
+/// Convenience wrapper over [`authorize_scope_for_caller`] for callers that
+/// only distinguish a database user from an unrestricted caller.
 ///
 /// # Errors
 /// [`ScopeResolutionError::Forbidden`] when a restricted project refuses the
@@ -502,19 +523,22 @@ pub async fn authorize_scope_for(
     viewer: Option<UserId>,
     need: ProjectAccess,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
-    let Some(viewer) = viewer else {
-        return Ok(scope);
-    };
-    decide_scope(
-        reader,
-        writer,
-        scope,
-        &ProjectPrincipal::user(viewer),
-        true,
-        need,
-    )
-    .await?;
-    Ok(scope)
+    authorize_scope_for_caller(reader, writer, scope, ScopeCaller::from(viewer), need).await
+}
+
+/// [`lookup_existing_scope`], authorized for `caller` at `need`.
+///
+/// # Errors
+/// As [`lookup_existing_scope`] and [`authorize_scope_for_caller`].
+pub async fn lookup_existing_scope_guarded_for_caller(
+    reader: &ReaderPool,
+    workspace: &str,
+    project: &str,
+    caller: ScopeCaller,
+    need: ProjectAccess,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let scope = lookup_existing_scope(reader, workspace, project).await?;
+    authorize_scope_for_caller(reader, None, scope, caller, need).await
 }
 
 /// [`lookup_existing_scope`], authorized for `viewer` at `need`.
@@ -528,8 +552,50 @@ pub async fn lookup_existing_scope_guarded(
     viewer: Option<UserId>,
     need: ProjectAccess,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
-    let scope = lookup_existing_scope(reader, workspace, project).await?;
-    authorize_scope_for(reader, None, scope, viewer, need).await
+    lookup_existing_scope_guarded_for_caller(
+        reader,
+        workspace,
+        project,
+        ScopeCaller::from(viewer),
+        need,
+    )
+    .await
+}
+
+/// Resolve an existing ID inside the named workspace, then authorize it for
+/// `caller`. Never creates a workspace/project or falls back to a name on
+/// refusal.
+///
+/// # Errors
+/// Missing coordinates, insufficient access, or a store failure.
+pub async fn lookup_project_id_guarded_for_caller(
+    reader: &ReaderPool,
+    workspace: &str,
+    project_id: ProjectId,
+    caller: ScopeCaller,
+    need: ProjectAccess,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let workspace_id = lookup_existing_workspace(reader, workspace).await?;
+    let Some(project) = reader.project_name_by_id(workspace_id, project_id).await? else {
+        return Err(ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: workspace.to_owned(),
+            project: project_id.to_string(),
+        });
+    };
+    if need == ProjectAccess::Write {
+        refuse_foreign_profile_name(Some(workspace), &project, caller)?;
+    }
+    authorize_scope_for_caller(
+        reader,
+        None,
+        ResolvedScope {
+            workspace_id,
+            project_id,
+        },
+        caller,
+        need,
+    )
+    .await
 }
 
 /// Resolve an existing ID inside the named workspace, then authorize it.
@@ -544,27 +610,32 @@ pub async fn lookup_project_id_guarded(
     viewer: Option<UserId>,
     need: ProjectAccess,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
-    let workspace_id = lookup_existing_workspace(reader, workspace).await?;
-    let Some(project) = reader.project_name_by_id(workspace_id, project_id).await? else {
-        return Err(ScopeResolutionError::ProjectNotFoundInWorkspace {
-            workspace: workspace.to_owned(),
-            project: project_id.to_string(),
-        });
-    };
-    if need == ProjectAccess::Write {
-        refuse_foreign_profile_name(Some(workspace), &project, viewer)?;
-    }
-    authorize_scope_for(
+    lookup_project_id_guarded_for_caller(
         reader,
-        None,
-        ResolvedScope {
-            workspace_id,
-            project_id,
-        },
-        viewer,
+        workspace,
+        project_id,
+        ScopeCaller::from(viewer),
         need,
     )
     .await
+}
+
+/// [`create_explicit_scope`] on behalf of `caller`, authorized for a write.
+///
+/// # Errors
+/// As [`create_explicit_scope`] and [`authorize_scope_for_caller`].
+pub async fn create_explicit_scope_guarded_for_caller(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    workspace: &str,
+    project: &str,
+    caller: ScopeCaller,
+) -> Result<ResolvedWriteScope, ScopeResolutionError> {
+    let _ = reader;
+    refuse_foreign_profile_name(Some(workspace), project, caller)?;
+    let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
+    create_project_in_workspace_guarded(writer, workspace_id, workspace, project, caller, true)
+        .await
 }
 
 /// [`create_explicit_scope`] on behalf of `viewer`, authorized for a write.
@@ -587,11 +658,14 @@ pub async fn create_explicit_scope_guarded(
     project: &str,
     viewer: Option<UserId>,
 ) -> Result<ResolvedWriteScope, ScopeResolutionError> {
-    let _ = reader;
-    refuse_foreign_profile_name(Some(workspace), project, viewer)?;
-    let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
-    create_project_in_workspace_guarded(writer, workspace_id, workspace, project, viewer, true)
-        .await
+    create_explicit_scope_guarded_for_caller(
+        reader,
+        writer,
+        workspace,
+        project,
+        ScopeCaller::from(viewer),
+    )
+    .await
 }
 
 /// Refusal for an explicit write that names a profile project it does not own.
@@ -599,11 +673,13 @@ pub const PROFILE_NAME_RESERVED: &str = "profile projects are reserved: write pr
      with scope \"profile\", which resolves your own profile";
 
 /// A database user may name exactly one profile project explicitly: their own
-/// private profile, `default/_profile.<their id>`. Any other `_profile` or
-/// `_profile.*` name is refused before anything is created, so a user cannot
-/// create (squat) another operator's private profile and lock its owner out,
-/// nor create a workspace profile outside the profile path. A caller with no
-/// database user (root, or a single-user server) may, for repair.
+/// private profile, `default/_profile.<their id>`. A non-root trusted-proxy
+/// caller has no private profile and is refused all `_profile` and `_profile.*`
+/// names. Any other `_profile` or `_profile.*` name is refused before anything
+/// is created, so a user cannot create (squat) another operator's private
+/// profile and lock its owner out, nor create a workspace profile outside the
+/// profile path. An unrestricted caller (root, or a single-user server) may,
+/// for repair.
 ///
 /// `workspace` is the name the caller gave; `None` (the workspace inferred
 /// from the active project or the server default) never matches, so a user
@@ -611,42 +687,47 @@ pub const PROFILE_NAME_RESERVED: &str = "profile projects are reserved: write pr
 fn refuse_foreign_profile_name(
     workspace: Option<&str>,
     project: &str,
-    viewer: Option<UserId>,
+    caller: ScopeCaller,
 ) -> Result<(), ScopeResolutionError> {
     if !ai_memory_core::profile::is_profile_project(project) {
         return Ok(());
     }
-    let Some(viewer) = viewer else {
-        return Ok(());
-    };
-    if workspace == Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
-        && project == ai_memory_core::profile::user_profile_project(viewer)
-    {
-        return Ok(());
+    match caller {
+        ScopeCaller::Unrestricted => Ok(()),
+        ScopeCaller::User(viewer)
+            if workspace == Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
+                && project == ai_memory_core::profile::user_profile_project(viewer) =>
+        {
+            Ok(())
+        }
+        ScopeCaller::User(_) | ScopeCaller::ProxyUser => Err(ScopeResolutionError::Forbidden(
+            PROFILE_NAME_RESERVED.to_owned(),
+        )),
     }
-    Err(ScopeResolutionError::Forbidden(
-        PROFILE_NAME_RESERVED.to_owned(),
-    ))
 }
 
-/// [`create_explicit_scope_guarded`] for a workspace already resolved by id.
-/// `workspace` is that workspace's name, used only in error messages.
+/// [`create_explicit_scope_guarded_for_caller`] for a workspace already resolved
+/// by id. `workspace` is that workspace's name, used only in error messages.
 async fn create_project_in_workspace_guarded(
     writer: &WriterHandle,
     workspace_id: WorkspaceId,
     workspace: &str,
     project: &str,
-    viewer: Option<UserId>,
+    caller: ScopeCaller,
     promote: bool,
 ) -> Result<ResolvedWriteScope, ScopeResolutionError> {
-    let principal = viewer.map(ProjectPrincipal::user);
+    let (principal, distinguishes_operators) = match caller {
+        ScopeCaller::Unrestricted => (None, false),
+        ScopeCaller::User(viewer) => (Some(ProjectPrincipal::user(viewer)), true),
+        ScopeCaller::ProxyUser => (Some(ProjectPrincipal::proxy_user()), true),
+    };
     let resolved = if promote {
         writer
             .resolve_project_name_for_write(
                 workspace_id,
                 project.to_owned(),
                 principal,
-                viewer.is_some(),
+                distinguishes_operators,
             )
             .await
     } else {
@@ -655,7 +736,7 @@ async fn create_project_in_workspace_guarded(
                 workspace_id,
                 project.to_owned(),
                 principal,
-                viewer.is_some(),
+                distinguishes_operators,
             )
             .await
     }
@@ -739,23 +820,24 @@ pub async fn lookup_profile_scope(
     }
 }
 
-/// Create or fetch the caller's profile scope for a write, authorized.
+/// Create or fetch the caller's profile scope for a write, authorized for
+/// `caller`.
 ///
 /// The shared scopes (`global`, `workspace`) go through the reserved-scope
-/// write gate: on a server with database users only root or a `write` grant
-/// on that scope may write it. A private profile is created restricted, with
-/// the caller as its creator, so only they (and root) can use it.
+/// write gate: on a server that distinguishes operators only root or a `write`
+/// grant on that scope may write it. A private profile is created restricted,
+/// with the caller as its creator, so only they (and root) can use it.
 ///
 /// # Errors
 /// [`ScopeResolutionError::Forbidden`] when the gate refuses the caller or a
 /// private profile is requested without a database user; store failures
 /// otherwise.
-pub async fn create_profile_scope(
+pub async fn create_profile_scope_for_caller(
     reader: &ReaderPool,
     writer: &WriterHandle,
     share: ai_memory_core::profile::EffectiveProfileShare,
     workspace_id: WorkspaceId,
-    viewer: Option<UserId>,
+    caller: ScopeCaller,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
     use ai_memory_core::profile::{EffectiveProfileShare, WORKSPACE_PROFILE_PROJECT};
     match share {
@@ -768,7 +850,7 @@ pub async fn create_profile_scope(
                 workspace_id,
                 ai_memory_core::DEFAULT_WORKSPACE_NAME,
                 ai_memory_core::GLOBAL_SCOPE_PROJECT,
-                viewer,
+                caller,
                 false,
             )
             .await
@@ -784,14 +866,14 @@ pub async fn create_profile_scope(
                 workspace_id,
                 &workspace,
                 WORKSPACE_PROFILE_PROJECT,
-                viewer,
+                caller,
                 false,
             )
             .await
             .map(|resolved| resolved.scope)
         }
         EffectiveProfileShare::User => {
-            let Some(viewer) = viewer else {
+            let Some(viewer) = caller.user_id() else {
                 return Err(ScopeResolutionError::Forbidden(
                     PRIVATE_PROFILE_NEEDS_USER.to_owned(),
                 ));
@@ -804,13 +886,56 @@ pub async fn create_profile_scope(
                 workspace_id,
                 ai_memory_core::DEFAULT_WORKSPACE_NAME,
                 &ai_memory_core::profile::user_profile_project(viewer),
-                Some(viewer),
+                ScopeCaller::User(viewer),
                 false,
             )
             .await
             .map(|resolved| resolved.scope)
         }
     }
+}
+
+/// Create or fetch the caller's profile scope for a write, authorized.
+///
+/// Convenience wrapper over [`create_profile_scope_for_caller`].
+///
+/// # Errors
+/// [`ScopeResolutionError::Forbidden`] when the gate refuses the caller or a
+/// private profile is requested without a database user; store failures
+/// otherwise.
+pub async fn create_profile_scope(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    share: ai_memory_core::profile::EffectiveProfileShare,
+    workspace_id: WorkspaceId,
+    viewer: Option<UserId>,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    create_profile_scope_for_caller(
+        reader,
+        writer,
+        share,
+        workspace_id,
+        ScopeCaller::from(viewer),
+    )
+    .await
+}
+
+/// [`resolve_many_existing_scopes`], every scope authorized for `caller`.
+///
+/// # Errors
+/// As [`resolve_many_existing_scopes`] and [`authorize_scope_for_caller`].
+pub async fn resolve_many_existing_scopes_guarded_for_caller(
+    reader: &ReaderPool,
+    scopes: &[ScopeName],
+    max: usize,
+    caller: ScopeCaller,
+    need: ProjectAccess,
+) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
+    let resolved = resolve_many_existing_scopes(reader, scopes, max).await?;
+    for scope in &resolved {
+        authorize_scope_for_caller(reader, None, *scope, caller, need).await?;
+    }
+    Ok(resolved)
 }
 
 /// [`resolve_many_existing_scopes`], every scope authorized for `viewer`.
@@ -829,11 +954,14 @@ pub async fn resolve_many_existing_scopes_guarded(
     viewer: Option<UserId>,
     need: ProjectAccess,
 ) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
-    let resolved = resolve_many_existing_scopes(reader, scopes, max).await?;
-    for scope in &resolved {
-        authorize_scope_for(reader, None, *scope, viewer, need).await?;
-    }
-    Ok(resolved)
+    resolve_many_existing_scopes_guarded_for_caller(
+        reader,
+        scopes,
+        max,
+        ScopeCaller::from(viewer),
+        need,
+    )
+    .await
 }
 
 /// Look up the reserved global preferences scope
@@ -972,6 +1100,18 @@ impl<'a> ScopeResolver<'a> {
         self.authz = Some(principal);
         self.distinguishes_operators = distinguishes_operators;
         self
+    }
+
+    fn caller_from_authz(&self) -> ScopeCaller {
+        match self.authz.as_ref() {
+            None => ScopeCaller::Unrestricted,
+            Some(principal) if principal.is_root => ScopeCaller::Unrestricted,
+            Some(principal) => match principal.user_id {
+                Some(user_id) => ScopeCaller::User(user_id),
+                None if !principal.subject_to_project_grants => ScopeCaller::ProxyUser,
+                None => ScopeCaller::Unrestricted,
+            },
+        }
     }
 
     /// Run the resolved scope through the authorization choke point (#708).
@@ -1296,8 +1436,11 @@ impl<'a> ScopeResolver<'a> {
                     error @ (ScopeResolutionError::WorkspaceNotFound { .. }
                     | ScopeResolutionError::ProjectNotFoundInWorkspace { .. }),
                 ) => {
-                    let creator = self.authz.as_ref().and_then(|principal| principal.user_id);
-                    refuse_foreign_profile_name(Some(label_workspace), label_project, creator)?;
+                    refuse_foreign_profile_name(
+                        Some(label_workspace),
+                        label_project,
+                        self.caller_from_authz(),
+                    )?;
                     self.resolve_explicit_pair(label_workspace, label_project, ProjectAccess::Write)
                         .await
                         .map_err(|_| error)?
@@ -1315,8 +1458,11 @@ impl<'a> ScopeResolver<'a> {
                 .map(|(workspace_id, _)| workspace_id)
                 .unwrap_or(self.default_workspace_id),
         };
-        let creator = self.authz.as_ref().and_then(|principal| principal.user_id);
-        refuse_foreign_profile_name(trimmed_opt(explicit_workspace), project, creator)?;
+        refuse_foreign_profile_name(
+            trimmed_opt(explicit_workspace),
+            project,
+            self.caller_from_authz(),
+        )?;
         let resolved = writer
             .resolve_project_name_for_write(
                 workspace_id,
