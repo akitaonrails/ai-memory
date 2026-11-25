@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+
+- Bypassed the `cap + 64 KiB` pre-scrub prefix window in hook `durable_body`
+  whenever `[sanitize].extra_patterns` is configured, so custom regexes that
+  depend on context past the overlap window (such as multi-line delimited
+  blocks or end-anchored `$` patterns) still redact secrets inside stored hook
+  bodies before truncation. Built-in-only deployments keep the bounded
+  `cap + 64 KiB` scrub window for multi-MiB tool responses.
+  (GHSA-qxwf-7hw8-qw28)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed

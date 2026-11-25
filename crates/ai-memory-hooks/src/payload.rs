@@ -32,14 +32,16 @@ pub const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
 pub const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 
 /// Durable body ceiling the ingest funnel applies to an event's excerpt
-/// **after** the sanitizer has scrubbed the full text.
+/// **after** the sanitizer has scrubbed it.
 ///
 /// The cap used to run inside excerpt extraction, before the sanitizer ever
 /// saw the text, so a secret straddling the cutoff was cut in half and the
 /// surviving prefix too short to match a pattern — stored unredacted (#1114),
 /// the body-side twin of the #980 title-hint leak. Extraction now returns the
-/// uncapped text and the router applies this cap to the scrubbed output,
-/// mirroring `ai_memory_core::sanitize::Sanitized::new`.
+/// uncapped text and the router scrubs first (using a bounded `cap + 64 KiB`
+/// overlap window when `[sanitize].extra_patterns` is empty, and the full
+/// excerpt when operator extra patterns are configured) before applying this
+/// cap to the redacted output, mirroring `ai_memory_core::sanitize::Sanitized::new`.
 #[must_use]
 pub fn durable_body_cap(event: HookEvent) -> usize {
     match event {
