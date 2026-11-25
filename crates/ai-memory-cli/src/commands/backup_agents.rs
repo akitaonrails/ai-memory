@@ -468,6 +468,15 @@ pub fn discover_assets(
                 "GEMINI.md",
                 "project/GEMINI.md",
             );
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Project,
+                &cwd.join(".gemini").join("skills"),
+                ".gemini/skills",
+                "project/gemini/skills",
+            )?;
         }
     }
 

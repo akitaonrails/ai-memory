@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `backup-agents` to archive Gemini CLI project skills from the
+  repository's `.gemini/skills`, which `restore-agents` already wrote back.
+  (#2472)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
