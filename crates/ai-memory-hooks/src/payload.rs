@@ -1329,6 +1329,20 @@ fn claude_code_tool_text(raw: &serde_json::Value) -> Option<Option<String>> {
                 .join("\n");
             Some((!output.is_empty()).then_some(output))
         }
+        // Discriminated on `type`: a text read keeps the file's text; an
+        // image, a PDF or its extracted pages keep no bytes, and an unchanged
+        // file returns no content. A notebook keeps the generic reading.
+        "Read" => {
+            let file = response.get("file")?.as_object()?;
+            match response.get("type")?.as_str()? {
+                "text" => {
+                    let content = file.get("content")?.as_str()?;
+                    Some((!content.is_empty()).then(|| content.to_owned()))
+                }
+                "image" | "pdf" | "parts" | "file_unchanged" => Some(None),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
