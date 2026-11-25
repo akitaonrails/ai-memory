@@ -35,6 +35,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `O_NOFOLLOW | O_NONBLOCK` opens, and are never read from repository
   `.ai-memory.toml` files or hook payloads. (#2453)
 
+### Fixed
+
+- Completed the English and Brazilian Portuguese help and installer
+  diagnostics for Antigravity CLI status line setup. (#2486)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
