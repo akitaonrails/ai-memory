@@ -30,6 +30,12 @@ version in [`docs/changelog/`](docs/changelog/):
   the default `~/.grok` or `~/.kiro` in their place, and a restore writes the
   entries back under the destination's home. (#2467)
 
+### Fixed
+
+- Fixed `backup-agents` to archive OpenCode global skills from
+  `~/.config/opencode/skills`, which `restore-agents` already restored to the
+  OpenCode config root. (#2469)
+
 ## [3.6.1] - 2026-11-24
 
 ### Fixed
