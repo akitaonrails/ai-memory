@@ -23,8 +23,9 @@ use crate::openai::{
 use crate::openai_compat::OpenAiCompatProvider;
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited};
+use crate::types::ResponsesUsage;
 use crate::types::{
-    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, StructuredResponse,
 };
 
 /// Primary OpenCode Go OpenAI-compatible base URL.
@@ -194,10 +195,23 @@ impl LlmProvider for OpenCodeProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, Some(operation_id))
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
+        let operation_id = operation_id.unwrap_or_default();
         match self.api() {
             OpenCodeApi::ChatCompletions => {
                 self.chat_completions
-                    .complete_structured_raw_with_operation_id(request, schema, operation_id)
+                    .complete_structured_with_usage(request, schema, Some(operation_id))
                     .await
             }
             OpenCodeApi::Responses => {
@@ -207,7 +221,7 @@ impl LlmProvider for OpenCodeProvider {
             }
             OpenCodeApi::AnthropicMessages => {
                 self.anthropic_messages
-                    .complete_structured_raw_with_operation_id(request, schema, operation_id)
+                    .complete_structured_with_usage(request, schema, Some(operation_id))
                     .await
             }
         }
@@ -382,10 +396,7 @@ impl OpenCodeResponsesProvider {
             .await?;
         Ok(ChatResponse {
             text: extract_output_text(&response).unwrap_or_default(),
-            usage: response.usage.map(|usage| Usage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-            }),
+            usage: response.usage.and_then(ResponsesUsage::reported),
             model: response.model,
         })
     }
@@ -395,7 +406,7 @@ impl OpenCodeResponsesProvider {
         request: ChatRequest,
         mut schema: serde_json::Value,
         operation_id: LlmOperationId,
-    ) -> LlmResult<serde_json::Value> {
+    ) -> LlmResult<StructuredResponse> {
         enforce_strict_object_schemas(&mut schema);
         let text = ResponsesText {
             format: ResponsesTextFormat::JsonSchema {
@@ -420,7 +431,10 @@ impl OpenCodeResponsesProvider {
         {
             return Err(LlmError::TruncatedResponse {
                 model: self.model.clone(),
-                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+                completion_tokens: response
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens),
             });
         }
         // No content at all is a distinct terminal failure, not a JSON parse
@@ -432,7 +446,10 @@ impl OpenCodeResponsesProvider {
                 model: self.model.clone(),
             });
         };
-        serde_json::from_str(&text).map_err(LlmError::from)
+        Ok(StructuredResponse {
+            value: serde_json::from_str(&text)?,
+            usage: response.usage.and_then(ResponsesUsage::reported),
+        })
     }
 
     fn build_request<'a>(
@@ -569,14 +586,6 @@ struct ResponsesOutputItem {
 struct ResponsesOutputContent {
     #[serde(default)]
     text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ResponsesUsage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
 }
 
 fn extract_output_text(response: &ResponsesResponse) -> Option<String> {
@@ -809,6 +818,7 @@ mod tests {
                             OpenCodeApi::AnthropicMessages if body.get("tools").is_some() => {
                                 json!({
                                     "content": [{"type": "tool_use", "input": {"ok": true}}],
+                                    "usage": {"input_tokens": 1, "output_tokens": 1},
                                 })
                             }
                             OpenCodeApi::AnthropicMessages => {
@@ -847,14 +857,12 @@ mod tests {
                 assert_eq!(response.model, model);
                 let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
                 let result = provider
-                    .complete_structured_raw_with_operation_id(
-                        request,
-                        schema,
-                        operation_id.clone(),
-                    )
+                    .complete_structured_with_usage(request, schema, Some(operation_id.clone()))
                     .await
                     .unwrap();
-                assert_eq!(result, json!({"ok": true}));
+                assert_eq!(result.value, json!({"ok": true}));
+                let usage = result.usage.unwrap();
+                assert_eq!((usage.input_tokens, usage.output_tokens), (1, 1));
                 let requests = server.received_requests().await.unwrap();
                 assert_eq!(requests.len(), 2, "{model} at {catalogue}");
                 for (index, request) in requests.iter().enumerate() {

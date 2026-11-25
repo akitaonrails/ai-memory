@@ -281,6 +281,42 @@ pub struct Usage {
     pub output_tokens: u32,
 }
 
+/// Token fields of an OpenAI Responses API usage object.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesUsage {
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+}
+
+impl ResponsesUsage {
+    pub(crate) fn reported(self) -> Option<Usage> {
+        Usage::from_counts(self.input_tokens, self.output_tokens)
+    }
+}
+
+/// Parsed structured output and any token counts reported with that response.
+#[derive(Debug)]
+pub struct StructuredResponse {
+    /// The same decoded JSON returned by the raw structured API.
+    pub value: serde_json::Value,
+    /// Token counts from the successful provider response, when present.
+    pub usage: Option<Usage>,
+}
+
+impl Usage {
+    // Health totals count each side independently. An empty usage object
+    // contributes no report, while an explicitly reported zero does.
+    pub(crate) fn from_counts(input: Option<u32>, output: Option<u32>) -> Option<Self> {
+        if input.is_none() && output.is_none() {
+            return None;
+        }
+        Some(Self {
+            input_tokens: input.unwrap_or_default(),
+            output_tokens: output.unwrap_or_default(),
+        })
+    }
+}
+
 /// Provider-neutral response.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatResponse {

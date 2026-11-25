@@ -14,7 +14,8 @@ use crate::openai_compat::{first_json_object, strip_reasoning_blocks};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited};
 use crate::types::{
-    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, StructuredResponse,
+    Usage,
 };
 
 /// Default Anthropic API base.
@@ -244,6 +245,15 @@ struct AnthropicUsage {
     output_tokens: u32,
 }
 
+impl From<AnthropicUsage> for Usage {
+    fn from(usage: AnthropicUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        }
+    }
+}
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &'static str {
@@ -277,10 +287,7 @@ impl LlmProvider for AnthropicProvider {
             .join("\n");
         Ok(ChatResponse {
             text,
-            usage: response.usage.map(|u| Usage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-            }),
+            usage: response.usage.map(Usage::from),
             model: response.model,
         })
     }
@@ -300,6 +307,19 @@ impl LlmProvider for AnthropicProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, Some(operation_id))
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
+        let operation_id = operation_id.unwrap_or_default();
         let body = self.build_request(&request, Some(schema));
         let response: AnthropicResponse = self.post(&body, operation_id).await?;
         // A `max_tokens` stop on the structured path means the model ran out
@@ -318,11 +338,17 @@ impl LlmProvider for AnthropicProvider {
                 completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
             });
         }
+        let usage = response.usage.map(Usage::from);
         let forced = self.forces_result_tool();
         let mut text = Vec::new();
         for c in response.content {
             match c {
-                AnthropicContent::ToolUse { input, .. } => return Ok(input),
+                AnthropicContent::ToolUse { input, .. } => {
+                    return Ok(StructuredResponse {
+                        value: input,
+                        usage,
+                    });
+                }
                 // Under `auto` the model can reply with the JSON itself
                 // instead of calling the tool.
                 AnthropicContent::Text { text: part } if !forced => text.push(part),
@@ -330,7 +356,7 @@ impl LlmProvider for AnthropicProvider {
             }
         }
         if let Some(value) = json_object_in(&text.join("\n")) {
-            return Ok(value);
+            return Ok(StructuredResponse { value, usage });
         }
         Err(LlmError::UnexpectedShape(
             "anthropic response had no tool_use block".into(),

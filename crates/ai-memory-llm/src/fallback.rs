@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 use crate::error::{FailoverClass, LlmError, LlmResult};
 use crate::health::CandidateHealth;
 use crate::provider::LlmProvider;
-use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId, StructuredResponse};
 
 /// How long a candidate's circuit stays open after a transient failure
 /// before it is eligible again. Restarting the process clears all circuit
@@ -396,38 +396,10 @@ impl LlmProvider for FallbackLlmProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        let mut attempted = 0usize;
-        let mut summary = Vec::new();
-        let mut transport_unreachable = !self.entries.is_empty();
-        for (i, entry) in self.entries.iter().enumerate() {
-            if let Some((description, skipped_for_transport)) = self.skipped_candidate(i) {
-                summary.push(description);
-                transport_unreachable &= skipped_for_transport;
-                continue;
-            }
-            attempted += 1;
-            match entry
-                .candidate
-                .inner
-                .complete_structured_raw(request.clone(), schema.clone())
-                .await
-            {
-                Ok(value) => {
-                    self.record_success(i);
-                    return Ok(value);
-                }
-                Err(err) => {
-                    let fail_over = err.should_fail_over();
-                    transport_unreachable &= err.is_transport_unreachable();
-                    summary.push(self.describe_failure(i, &err));
-                    self.record_error(i, &err);
-                    if !fail_over {
-                        return Err(err);
-                    }
-                }
-            }
-        }
-        Err(Self::exhausted(attempted, summary, transport_unreachable))
+        Ok(self
+            .complete_structured_with_usage(request, schema, None)
+            .await?
+            .value)
     }
 
     async fn complete_structured_raw_with_operation_id(
@@ -436,6 +408,18 @@ impl LlmProvider for FallbackLlmProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, Some(operation_id))
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
         let mut attempted = 0usize;
         let mut summary = Vec::new();
         let mut transport_unreachable = !self.entries.is_empty();
@@ -449,7 +433,7 @@ impl LlmProvider for FallbackLlmProvider {
             match entry
                 .candidate
                 .inner
-                .complete_structured_raw_with_operation_id(
+                .complete_structured_with_usage(
                     request.clone(),
                     schema.clone(),
                     operation_id.clone(),

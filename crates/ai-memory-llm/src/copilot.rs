@@ -27,7 +27,10 @@ use crate::openai_oauth::model_uses_default_temperature;
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited, response_text_limited};
 use crate::text::truncate_for_embedding;
-use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Usage};
+use crate::types::ResponsesUsage;
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, StructuredResponse, Usage,
+};
 
 /// GitHub Copilot's public OAuth client id used by Copilot clients.
 pub const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -453,11 +456,23 @@ impl LlmProvider for CopilotProvider {
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
-        mut schema: serde_json::Value,
+        schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, None)
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        mut schema: serde_json::Value,
+        _operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
         enforce_strict_object_schemas(&mut schema);
         let token = self.state.current_token().await?;
-        let text = match self.endpoint(&token).await? {
+        let (text, usage) = match self.endpoint(&token).await? {
             CopilotEndpoint::ChatCompletions => {
                 let response = self
                     .post_chat(
@@ -488,10 +503,10 @@ impl LlmProvider for CopilotProvider {
                         completion_tokens: response
                             .usage
                             .as_ref()
-                            .map(|usage| usage.completion_tokens),
+                            .and_then(|usage| usage.completion_tokens),
                     });
                 }
-                response
+                let text = response
                     .choices
                     .first()
                     .and_then(|c| c.message.content.as_deref())
@@ -501,19 +516,26 @@ impl LlmProvider for CopilotProvider {
                             "copilot /chat/completions returned no structured content".into(),
                         )
                     })?
-                    .to_owned()
+                    .to_owned();
+                (text, response.usage.and_then(CopilotUsage::reported))
             }
-            CopilotEndpoint::Responses => response_text(
-                &self
+            CopilotEndpoint::Responses => {
+                let response = self
                     .post_responses(
                         &token,
                         &build_responses_request(&self.model, &request, Some(schema)),
                     )
-                    .await?,
-                &self.model,
-            )?,
+                    .await?;
+                (
+                    response_text(&response, &self.model)?,
+                    response.usage.and_then(ResponsesUsage::reported),
+                )
+            }
         };
-        serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
+        Ok(StructuredResponse {
+            value: serde_json::from_str(&text)?,
+            usage,
+        })
     }
 }
 
@@ -890,7 +912,7 @@ struct CopilotResponsesResponse {
     #[serde(default)]
     output: Vec<CopilotResponsesOutput>,
     #[serde(default)]
-    usage: Option<CopilotResponsesUsage>,
+    usage: Option<ResponsesUsage>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -915,14 +937,6 @@ struct CopilotResponsesContent {
     text: Option<String>,
     #[serde(default)]
     refusal: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CopilotResponsesUsage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
 }
 
 /// Why a `/responses` answer stopped short. `error` is null on an incomplete
@@ -958,7 +972,10 @@ fn response_text(response: &CopilotResponsesResponse, model: &str) -> LlmResult<
         {
             return Err(LlmError::TruncatedResponse {
                 model: model.to_owned(),
-                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+                completion_tokens: response
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens),
             });
         }
         let detail = response
@@ -1008,10 +1025,7 @@ fn to_responses_chat_response(
     let text = response_text(&response, model)?;
     Ok(ChatResponse {
         text,
-        usage: response.usage.map(|usage| Usage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-        }),
+        usage: response.usage.and_then(ResponsesUsage::reported),
         model: response.model.unwrap_or_else(|| "copilot".into()),
     })
 }
@@ -1042,9 +1056,15 @@ struct CopilotMessageResponse {
 #[derive(Debug, Deserialize)]
 struct CopilotUsage {
     #[serde(default)]
-    prompt_tokens: u32,
+    prompt_tokens: Option<u32>,
     #[serde(default)]
-    completion_tokens: u32,
+    completion_tokens: Option<u32>,
+}
+
+impl CopilotUsage {
+    fn reported(self) -> Option<Usage> {
+        Usage::from_counts(self.prompt_tokens, self.completion_tokens)
+    }
 }
 
 fn to_chat_response(response: CopilotChatResponse) -> LlmResult<ChatResponse> {
@@ -1059,10 +1079,7 @@ fn to_chat_response(response: CopilotChatResponse) -> LlmResult<ChatResponse> {
         .to_string();
     Ok(ChatResponse {
         text,
-        usage: response.usage.map(|u| Usage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        }),
+        usage: response.usage.and_then(CopilotUsage::reported),
         model: response.model.unwrap_or_else(|| "copilot".into()),
     })
 }

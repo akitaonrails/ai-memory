@@ -418,14 +418,17 @@ async fn structured_chat_and_responses_requests_return_json() {
             })
             .mount(&server)
             .await;
-        let value = provider(&server, model)
-            .complete_structured_raw(
+        let response = provider(&server, model)
+            .complete_structured_with_usage(
                 ai_memory_llm::ChatRequest::user_prompt("json"),
                 json!({"type":"object","properties":{"ok":{"type":"boolean"}}}),
+                None,
             )
             .await
             .unwrap();
-        assert_eq!(value, json!({"ok": true}));
+        assert_eq!(response.value, json!({"ok": true}));
+        let usage = response.usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (2, 3));
     }
 }
 

@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use ai_memory_llm::fallback::{Candidate, FallbackLlmProvider};
 use ai_memory_llm::health::{ProviderHealth, ProviderHealthStatus};
 use ai_memory_llm::{
     ChatRequest, GeminiProvider, LlmError, LlmOperationId, LlmProvider, LlmWorkload,
@@ -51,6 +52,64 @@ fn request(prompt: &str) -> ChatRequest {
     ChatRequest {
         max_tokens: 2000,
         ..ChatRequest::user_prompt(prompt)
+    }
+}
+
+#[rstest::rstest]
+#[case::measured(Some(json!({"promptTokenCount": 73, "candidatesTokenCount": 19})), (1, 73, 19))]
+#[case::zero(Some(json!({"promptTokenCount": 0, "candidatesTokenCount": 0})), (1, 0, 0))]
+#[case::unreported(None, (0, 0, 0))]
+#[case::no_token_fields(Some(json!({"totalTokenCount": 92})), (0, 0, 0))]
+#[case::input_only(Some(json!({"promptTokenCount": 73})), (1, 73, 0))]
+#[tokio::test]
+async fn structured_summary_health_preserves_wire_usage(
+    #[case] metadata: Option<Value>,
+    #[case] expected: (u64, u64, u64),
+) {
+    let mut response = reply(Some(r#"{"items":["ok"]}"#), Some("STOP"));
+    match metadata {
+        Some(usage) => response["usageMetadata"] = usage,
+        None => {
+            response.as_object_mut().unwrap().remove("usageMetadata");
+        }
+    }
+    let (_server, provider) = provider(response, 2).await;
+    let chain = FallbackLlmProvider::new(vec![Candidate::new("gemini", MODEL, Arc::new(provider))]);
+    let health = ProviderHealth::default();
+    let llm = health.wrap_llm_provider(Arc::new(chain), "gemini", MODEL, None);
+    for workload in [LlmWorkload::Consolidation, LlmWorkload::Unspecified] {
+        let prompt = request("Summarize");
+        let result: Value = if workload == LlmWorkload::Unspecified {
+            ai_memory_llm::complete_structured(llm.as_ref(), prompt)
+                .await
+                .unwrap()
+        } else {
+            ai_memory_llm::complete_structured_with_operation_id(
+                llm.as_ref(),
+                prompt,
+                LlmOperationId::for_workload(workload),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(result, json!({"items":["ok"]}));
+        let snapshot = health.snapshot();
+        let row = snapshot
+            .llm_workloads
+            .iter()
+            .find(|row| row.workload == workload)
+            .unwrap();
+        assert_eq!((row.calls, row.successes, row.errors), (1, 1, 0));
+        assert_ne!(row.estimated_input_tokens, expected.1);
+        assert_ne!(row.estimated_output_tokens, expected.2);
+        assert_eq!(
+            (
+                row.usage_reported_calls,
+                row.reported_input_tokens,
+                row.reported_output_tokens
+            ),
+            expected
+        );
     }
 }
 

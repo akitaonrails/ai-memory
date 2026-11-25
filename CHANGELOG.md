@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Included provider-reported input and output tokens from successful structured
+  completions in workload health. An explicit zero counts as a usage report.
+  Providers that return only JSON continue to contribute estimates.
+
 - Reported measured session token usage for OpenCode 2 and Antigravity CLI:
   OpenCode 2's generated plugin records measured assistant message/step token
   counters keyed by native message ID (`_ai_memory_usage_calls`) on `stop` and

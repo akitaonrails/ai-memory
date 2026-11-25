@@ -21,10 +21,12 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::openai_oauth::{
     CodexResponsesRequest, CodexText, CodexTextFormat, build_request, into_chat_response,
-    require_output_text,
+    into_structured_response,
 };
 use crate::provider::LlmProvider;
-use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort};
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, StructuredResponse,
+};
 
 const MAX_JSONL_LINE_BYTES: usize = 256 * 1024;
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
@@ -193,8 +195,20 @@ impl LlmProvider for CodexProvider {
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
-        mut schema: serde_json::Value,
+        schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, None)
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        mut schema: serde_json::Value,
+        _operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
         enforce_strict_object_schemas(&mut schema);
         let response = self
             .post(&build_request(
@@ -214,8 +228,7 @@ impl LlmProvider for CodexProvider {
         // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
         // an empty string to serde, so the caller saw "EOF while parsing a value
         // at line 1 column 0", which names neither the model nor the cause.
-        let text = require_output_text(&response, &self.model)?;
-        serde_json::from_str(&text).map_err(LlmError::from)
+        into_structured_response(response, &self.model)
     }
 }
 
@@ -784,18 +797,21 @@ mod tests {
         .unwrap()
         .with_responses_url(format!("{}/responses", server.uri()));
 
-        let value = provider
-            .complete_structured_raw(
+        let response = provider
+            .complete_structured_with_usage(
                 ChatRequest::user_prompt("return JSON"),
                 json!({
                     "type": "object",
                     "properties": {"answer": {"type": "integer"}}
                 }),
+                None,
             )
             .await
             .unwrap();
 
-        assert_eq!(value, json!({"answer": 42}));
+        assert_eq!(response.value, json!({"answer": 42}));
+        let usage = response.usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
     }
 
     #[tokio::test]

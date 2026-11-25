@@ -16,7 +16,8 @@ use crate::response::{provider_error, response_json_limited};
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::types::{
-    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, StructuredResponse,
+    Usage,
 };
 
 /// Default OpenAI API base.
@@ -413,6 +414,15 @@ struct OpenAiUsage {
     completion_tokens: u32,
 }
 
+impl From<OpenAiUsage> for Usage {
+    fn from(usage: OpenAiUsage) -> Self {
+        Self {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+        }
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &'static str {
@@ -454,6 +464,19 @@ impl LlmProvider for OpenAiProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, Some(operation_id))
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
+        let operation_id = operation_id.unwrap_or_default();
         self.complete_structured(request, schema, operation_id)
             .await
     }
@@ -486,7 +509,7 @@ impl OpenAiProvider {
         request: ChatRequest,
         mut schema: serde_json::Value,
         operation_id: LlmOperationId,
-    ) -> LlmResult<serde_json::Value> {
+    ) -> LlmResult<StructuredResponse> {
         // Strict-mode normalisation is an `Official` concern — compat
         // backends typically ignore `response_format` entirely and fall
         // back to "parse the first JSON object out of the text".
@@ -536,7 +559,10 @@ impl OpenAiProvider {
                 model: self.model.clone(),
             });
         };
-        serde_json::from_str::<serde_json::Value>(text).map_err(LlmError::from)
+        Ok(StructuredResponse {
+            value: serde_json::from_str(text)?,
+            usage: response.usage.map(Usage::from),
+        })
     }
 
     fn build_request<'a>(
@@ -630,10 +656,7 @@ impl OpenAiProvider {
             .unwrap_or_default();
         ChatResponse {
             text,
-            usage: response.usage.map(|u| Usage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-            }),
+            usage: response.usage.map(Usage::from),
             model: response.model,
         }
     }

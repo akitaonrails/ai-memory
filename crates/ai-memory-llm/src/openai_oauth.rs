@@ -22,7 +22,10 @@ use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas
 use crate::provider::LlmProvider;
 use crate::stored_token::{StoredOAuthToken, credential_endpoint, refresh_grant};
 use crate::text::truncate_with_ellipsis;
-use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
+use crate::types::ResponsesUsage;
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, StructuredResponse,
+};
 
 /// OpenAI OAuth issuer used by Codex/OpenCode.
 pub const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
@@ -247,8 +250,20 @@ impl LlmProvider for OpenAiOAuthProvider {
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
-        mut schema: serde_json::Value,
+        schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, None)
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        mut schema: serde_json::Value,
+        _operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
         enforce_strict_object_schemas(&mut schema);
         let response_format = CodexText {
             format: CodexTextFormat::JsonSchema {
@@ -269,8 +284,7 @@ impl LlmProvider for OpenAiOAuthProvider {
         // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
         // an empty string to serde, so the caller saw "EOF while parsing a value
         // at line 1 column 0", which names neither the model nor the cause.
-        let text = require_output_text(&response, &self.model)?;
-        serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
+        into_structured_response(response, &self.model)
     }
 }
 
@@ -527,7 +541,7 @@ pub(crate) struct CodexResponsesResponse {
     #[serde(default)]
     output: Vec<CodexOutputItem>,
     #[serde(default)]
-    usage: Option<CodexUsage>,
+    usage: Option<ResponsesUsage>,
     #[serde(default)]
     model: Option<String>,
 }
@@ -544,12 +558,15 @@ struct CodexOutputContent {
     text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CodexUsage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
+pub(crate) fn into_structured_response(
+    response: CodexResponsesResponse,
+    model: &str,
+) -> LlmResult<StructuredResponse> {
+    let text = require_output_text(&response, model)?;
+    Ok(StructuredResponse {
+        value: serde_json::from_str(&text)?,
+        usage: response.usage.and_then(ResponsesUsage::reported),
+    })
 }
 
 pub(crate) fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
@@ -559,10 +576,7 @@ pub(crate) fn into_chat_response(response: CodexResponsesResponse) -> ChatRespon
         .unwrap_or_else(|| "openai-oauth".into());
     ChatResponse {
         text: extract_output_text(&response).unwrap_or_default(),
-        usage: response.usage.map(|u| Usage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-        }),
+        usage: response.usage.and_then(ResponsesUsage::reported),
         model,
     }
 }
@@ -584,10 +598,7 @@ pub(crate) fn extract_output_text(response: &CodexResponsesResponse) -> Option<S
         .map(ToOwned::to_owned)
 }
 
-pub(crate) fn require_output_text(
-    response: &CodexResponsesResponse,
-    model: &str,
-) -> LlmResult<String> {
+fn require_output_text(response: &CodexResponsesResponse, model: &str) -> LlmResult<String> {
     extract_output_text(response)
         .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| LlmError::EmptyContent {
@@ -816,8 +827,8 @@ mod tests {
         assert_eq!(response.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(response.output_text.as_deref(), Some("hello"));
         let usage = response.usage.expect("usage from completed event");
-        assert_eq!(usage.input_tokens, 12);
-        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(3));
     }
 
     #[test]

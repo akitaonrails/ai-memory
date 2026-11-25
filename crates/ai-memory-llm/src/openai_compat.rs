@@ -20,7 +20,7 @@ use crate::openai::{
 };
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
-use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId, StructuredResponse};
 
 // Scan reasoning tags and JSON starts in order.
 // A reasoning block consumes its draft JSON, but a JSON value encountered
@@ -313,6 +313,19 @@ impl LlmProvider for OpenAiCompatProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, Some(operation_id))
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
+        let operation_id = operation_id.unwrap_or_default();
         self.complete_structured(request, schema, operation_id)
             .await
     }
@@ -324,7 +337,7 @@ impl OpenAiCompatProvider {
         request: ChatRequest,
         schema: serde_json::Value,
         operation_id: LlmOperationId,
-    ) -> LlmResult<serde_json::Value> {
+    ) -> LlmResult<StructuredResponse> {
         // Strict mode: modern local engines
         // honour `response_format=json_schema`. Normalise the schema
         // to the strict subset (additionalProperties:false, full required, no
@@ -355,14 +368,14 @@ impl OpenAiCompatProvider {
             enforce_strict_object_schemas(&mut strict_schema);
             let strict_result = self
                 .inner
-                .complete_structured_raw_with_operation_id(
+                .complete_structured_with_usage(
                     request.clone(),
                     strict_schema,
-                    operation_id.clone(),
+                    Some(operation_id.clone()),
                 )
                 .await;
             match strict_result {
-                Ok(v) if v.is_object() => return Ok(v),
+                Ok(response) if response.value.is_object() => return Ok(response),
                 Ok(_) => {
                     debug!("compat strict: non-object response, falling back to tolerant parser");
                 }
@@ -409,8 +422,8 @@ impl OpenAiCompatProvider {
         // surrounding markdown fences) before trying to parse — otherwise
         // `first_json_object` latches onto a `{` inside the reasoning text.
         let cleaned = strip_reasoning_blocks(&res.text);
-        match serde_json::from_str::<serde_json::Value>(&cleaned) {
-            Ok(v) if v.is_object() => Ok(v),
+        let value = match serde_json::from_str::<serde_json::Value>(&cleaned) {
+            Ok(v) if v.is_object() => v,
             _ => {
                 let Some(slice) = first_json_object(&cleaned) else {
                     // Dump enough text to actually see what the model
@@ -430,9 +443,13 @@ impl OpenAiCompatProvider {
                         "openai-compat response did not contain a JSON object".into(),
                     ));
                 };
-                serde_json::from_str::<serde_json::Value>(slice).map_err(LlmError::from)
+                serde_json::from_str(slice)?
             }
-        }
+        };
+        Ok(StructuredResponse {
+            value,
+            usage: res.usage,
+        })
     }
 }
 
@@ -661,16 +678,18 @@ mod tests {
             "properties": { "ok": { "type": "boolean" } },
             "required": ["ok"],
         });
-        let value = provider
-            .complete_structured_raw_with_operation_id(
+        let response = provider
+            .complete_structured_with_usage(
                 ChatRequest::user_prompt("emit JSON"),
                 schema.clone(),
-                operation_id.clone(),
+                Some(operation_id.clone()),
             )
             .await
             .expect("the tolerant fallback parses the JSON");
 
-        assert_eq!(value, json!({ "ok": true }));
+        assert_eq!(response.value, json!({ "ok": true }));
+        let usage = response.usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (1, 1));
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 2, "strict attempt + tolerant fallback");
         let strict_body = request_body(&requests[0]);
