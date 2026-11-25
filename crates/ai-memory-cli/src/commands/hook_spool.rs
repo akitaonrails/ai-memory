@@ -4014,67 +4014,58 @@ mod tests {
 
     #[tokio::test]
     async fn drain_charges_response_timeouts_drops_poison_entry_and_drains_following() {
-        use tokio::io::AsyncWriteExt as _;
-
         // #2452: a server that accepts TCP + HTTP request and sleeps past
         // `per_event_timeout` on a poison entry must charge `attempts`, drop
-        // the poison entry at `MAX_ATTEMPTS`, and then drain subsequent
-        // entries — while a connection-refused endpoint still leaves
-        // `attempts == 0` (#493).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let slow_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let buf = read_test_http_request(&mut stream).await;
-                    let req = String::from_utf8_lossy(&buf);
-                    if req.contains("event=poison") {
-                        // Accept and hold past the client's request timeout.
-                        tokio::time::sleep(Duration::from_millis(600)).await;
-                        let _ = stream
-                            .write_all(
-                                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"accepted\":1}",
-                            )
-                            .await;
-                    } else {
-                        let _ = stream
-                            .write_all(
-                                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"accepted\":1}",
-                            )
-                            .await;
-                    }
-                });
-            }
-        });
+        // the poison entry at the limit, and then drain subsequent entries —
+        // while a connection-refused endpoint still leaves `attempts == 0`
+        // (#493). The deadline has to outlast CONNECT_TIMEOUT, or the timeout
+        // is ambiguous and deferred instead (#2465), so the drop limit is
+        // lowered here to keep the test's wall clock short; the default-limit
+        // mechanics are covered by `drain_drops_event_after_max_attempts`.
+        const LIMIT: u32 = 2;
+        let deadline = crate::commands::hook_capture::CONNECT_TIMEOUT + Duration::from_millis(100);
+
+        let poison_addr = serve_delayed_batch_hook(
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            deadline + Duration::from_millis(500),
+        )
+        .await;
+        // A separate endpoint so the poison entry is a chunk of one: a shared
+        // endpoint would make the chunk timeout scale past the poison delay.
+        let healthy_addr = serve_counting_hook(
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            "200 OK",
+        )
+        .await;
 
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
         write_spool_entry(
             &spool,
             "evt-0-poison.json",
-            format!("http://{slow_addr}/hook?event=poison"),
+            format!("http://{poison_addr}/hook?event=poison"),
         );
         write_spool_entry(
             &spool,
             "evt-1-healthy.json",
-            format!("http://{slow_addr}/hook?event=healthy"),
+            format!("http://{healthy_addr}/hook?event=healthy"),
         );
 
-        for pass in 1..=MAX_ATTEMPTS {
+        for pass in 1..=LIMIT {
             let r = drain_with_max_attempts(
                 &spool,
                 tmp.path(),
-                Duration::from_secs(2),
-                Duration::from_millis(80),
-                MaxAttempts::new(MAX_ATTEMPTS),
+                Duration::from_secs(10),
+                deadline,
+                MaxAttempts::new(LIMIT),
             )
             .await;
             assert_eq!(
                 r.dropped,
-                usize::from(pass == MAX_ATTEMPTS),
-                "poison entry must be dropped exactly at MAX_ATTEMPTS (pass {pass})"
+                usize::from(pass == LIMIT),
+                "poison entry must be dropped exactly at the limit (pass {pass})"
             );
-            if pass < MAX_ATTEMPTS {
+            if pass < LIMIT {
                 // Only the head poison entry is charged; the trailing healthy
                 // entry stays at 0 attempts.
                 assert_eq!(sorted_attempts(&spool), vec![pass, 0]);
