@@ -1048,14 +1048,15 @@ impl CapturePolicy {
             },
         };
         // A file the command changed is as much the call's as one it names:
-        // an ignored one drops the call, and a list that cannot be matched
-        // proves nothing.
+        // an ignored one drops the call, and a list that cannot be read or
+        // matched proves nothing.
         let edited = match (self.state, &extracted.edited) {
             (PolicyState::Active, Some(Ok(paths))) => match self.match_paths(paths, cwd) {
                 Ok(true) => Some(CaptureDisposition::Drop),
                 Ok(false) => None,
                 Err(()) => Some(CaptureDisposition::MetadataOnly),
             },
+            (PolicyState::Active, Some(Err(()))) => Some(CaptureDisposition::MetadataOnly),
             _ => None,
         };
         let disposition = match (disposition, edited) {
