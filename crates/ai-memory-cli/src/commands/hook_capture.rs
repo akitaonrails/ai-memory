@@ -975,6 +975,26 @@ pub fn build_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// A request deadline that does not outlast [`CONNECT_TIMEOUT`] cannot prove the
+/// request reached the server, so its timeout is deferred instead of charged
+/// (#2465).
+fn post_outcome_on_deadline_timeout(timeout: Duration) -> PostOutcome {
+    if timeout <= CONNECT_TIMEOUT {
+        return PostOutcome::Unreachable;
+    }
+
+    PostOutcome::Failed
+}
+
+/// Batch counterpart of [`post_outcome_on_deadline_timeout`].
+fn batch_outcome_on_deadline_timeout(timeout: Duration) -> BatchOutcome {
+    if timeout <= CONNECT_TIMEOUT {
+        return BatchOutcome::Unreachable;
+    }
+
+    BatchOutcome::Failed
+}
+
 /// Outcome of one spooled-event POST — enough for the drain loop to decide
 /// whether a miss should cost the entry a retry attempt. Never errors, so a
 /// hook/flush never fails the agent.
@@ -1065,11 +1085,7 @@ pub async fn post_hook(
         // while still connecting — so it is deferred without charging a retry
         // (#2465).
         Err(err) if err.is_timeout() && !err.is_connect() => {
-            if timeout <= CONNECT_TIMEOUT {
-                PostOutcome::Unreachable
-            } else {
-                PostOutcome::Failed
-            }
+            post_outcome_on_deadline_timeout(timeout)
         }
         Err(_) => PostOutcome::Unreachable,
     }
@@ -1202,11 +1218,7 @@ pub async fn post_batch(
         // have expired while still connecting — so it is deferred without
         // charging a retry (#2465).
         Err(err) if err.is_timeout() && !err.is_connect() => {
-            if timeout <= CONNECT_TIMEOUT {
-                BatchOutcome::Unreachable
-            } else {
-                BatchOutcome::Failed
-            }
+            batch_outcome_on_deadline_timeout(timeout)
         }
         Err(_) => BatchOutcome::Unreachable,
     }
