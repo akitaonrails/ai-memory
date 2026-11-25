@@ -529,6 +529,38 @@ fn gemini_assets_follow_gemini_cli_home_on_backup_and_restore() {
     assert!(!restored_home.path().join(".gemini").exists());
 }
 
+/// Gemini CLI keeps global plugins under `~/.gemini/plugins`, the second plugin
+/// root the documented matrix lists in the Antigravity/Gemini row.
+#[test]
+fn gemini_global_plugins_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let plugin = ".gemini/plugins/example/index.js";
+    let body = "export default { name: \"example\" };\n";
+    let source = home.path().join(plugin);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, body).unwrap();
+
+    let archive = project.path().join("gemini-plugins.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), project.path())
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(restored_home.path().join(plugin)).unwrap(),
+        body
+    );
+}
+
 /// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default
 /// `~/.copilot/skills`) and repository skills from `.github/skills`, the
 /// roots `install-skills --agent copilot-cli` writes:
