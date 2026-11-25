@@ -102,6 +102,17 @@ pub enum LlmError {
         /// Redacted candidate labels and error categories.
         summary: String,
     },
+
+    /// Every candidate reported exhausted quota or still has a quota circuit open.
+    #[error("llm fallback chain exhausted after {attempted} candidate(s): {summary}")]
+    FallbackQuotaExhausted {
+        /// Number of candidates actually attempted.
+        attempted: usize,
+        /// Redacted candidate labels and error categories.
+        summary: String,
+        /// Time until the first candidate is eligible again.
+        retry_after: Duration,
+    },
 }
 
 /// What a failed call means for retries and for an ordered fallback chain.
@@ -162,6 +173,7 @@ impl LlmError {
                 }
             }
             Self::Http(e) if e.is_timeout() || e.is_connect() => FailoverClass::Transient,
+            Self::FallbackQuotaExhausted { .. } => FailoverClass::QuotaExhausted,
             _ => FailoverClass::Permanent,
         }
     }
@@ -236,6 +248,7 @@ impl LlmError {
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Provider { retry_after, .. } => *retry_after,
+            Self::FallbackQuotaExhausted { retry_after, .. } => Some(*retry_after),
             _ => None,
         }
     }
@@ -259,6 +272,7 @@ impl LlmError {
             Self::Schema(_) => "schema",
             Self::AllCandidatesFailed { .. } => "all-candidates-failed",
             Self::FallbackTransportUnreachable { .. } => "fallback-transport-unreachable",
+            Self::FallbackQuotaExhausted { .. } => "fallback-quota-exhausted",
         }
     }
 }

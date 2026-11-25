@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Paused queued session consolidation when its LLM route ran out of credit
+  or quota. The pause survived restarts and kept pending jobs from spending
+  retries before the route could accept work again.
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
