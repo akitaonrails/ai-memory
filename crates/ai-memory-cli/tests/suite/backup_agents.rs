@@ -2383,25 +2383,25 @@ fn every_documented_skill_root_survives_a_backup_and_restore() {
     ];
 
     let body_for = |root: &str, file_name: &str| {
-        if file_name == "SKILL.md" {
-            format!("# parity {root}")
-        } else {
-            "{}".to_string()
+        if file_name != "SKILL.md" {
+            return "{}".to_string();
         }
+
+        format!("# parity {root}")
     };
     let asset_path = |base: &Path, root: &str, file_name: &str| {
-        if file_name == "SKILL.md" {
-            base.join(root).join("example").join(file_name)
-        } else {
-            base.join(root).join(file_name)
+        let dir = base.join(root);
+        if file_name != "SKILL.md" {
+            return dir.join(file_name);
         }
+
+        dir.join("example").join(file_name)
     };
 
     for (scope, root, file_name) in documented {
-        let base = if scope == "global" {
-            home.path()
-        } else {
-            project.path()
+        let base = match scope {
+            "global" => home.path(),
+            _ => project.path(),
         };
         let path = asset_path(base, root, file_name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2424,10 +2424,9 @@ fn every_documented_skill_root_survives_a_backup_and_restore() {
     assert_success(&restore, "restore");
 
     for (scope, root, file_name) in documented {
-        let base = if scope == "global" {
-            restored_home.path()
-        } else {
-            restored_project.path()
+        let base = match scope {
+            "global" => restored_home.path(),
+            _ => restored_project.path(),
         };
         let path = asset_path(base, root, file_name);
         assert!(
