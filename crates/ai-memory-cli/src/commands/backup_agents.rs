@@ -651,6 +651,15 @@ pub fn discover_assets(
                 ".config/opencode/plugins",
                 "opencode/plugins",
             )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::OpenCode,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &opencode_dir.join("skills"),
+                ".config/opencode/skills",
+                "opencode/skills",
+            )?;
         }
         if want_project {
             push_if_file(

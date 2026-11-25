@@ -655,6 +655,49 @@ fn copilot_cli_skills_follow_copilot_home_on_backup_and_restore() {
     );
 }
 
+#[test]
+fn opencode_global_skills_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let config = r#"{"$schema":"https://opencode.ai/config.json"}"#;
+    let skill = "# Example OpenCode skill";
+    for (path, body) in [
+        (home.path().join(".config/opencode/opencode.json"), config),
+        (
+            home.path().join(".config/opencode/skills/example/SKILL.md"),
+            skill,
+        ),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("opencode.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "opencode"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), project.path())
+        .args(restore_agents_args(&archive, "opencode"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    let restored_root = restored_home.path().join(".config/opencode");
+    assert_eq!(
+        fs::read_to_string(restored_root.join("skills/example/SKILL.md")).unwrap(),
+        skill
+    );
+    assert_eq!(
+        fs::read_to_string(restored_root.join("opencode.json")).unwrap(),
+        config
+    );
+}
+
 /// The Copilot allowlist entries cover skills only: an archive cannot use
 /// them to reach Copilot's MCP or hook configuration, or other `.github`
 /// files such as workflows. The skill paths stay restorable as a control.
