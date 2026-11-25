@@ -311,7 +311,11 @@ from hook paths.
    its usage and send a normal synthetic `SessionEnd`. This is safe even if
    the old session is still live: a later real `SessionEnd` with more
    observations than the early close saw re-runs the full end path
-   (`SessionEndDisposition::ReEndWithNewWork`, issue #152).
+   (`SessionEndDisposition::ReEndWithNewWork`, issue #152). A re-end whose
+   rows since the last end are only lifecycle boundaries (a resume closed
+   without a prompt or tool use) moves `ended_observation_count` forward and
+   stops: no page rewrite, handoff refresh or consolidation job, and
+   `ended_at` keeps the last end that had work.
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.

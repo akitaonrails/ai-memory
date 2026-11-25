@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped a resumed session that is closed again without a prompt or tool
+  call (`claude --resume`, then exit) from re-ending the whole session. The
+  second `SessionEnd` no longer rewrites the session page, refreshes the
+  automatic handoff or queues the opt-in LLM consolidation; it moves the
+  session's end watermark forward, and `ended_at` keeps the last end that had
+  work. A resume with new prompts or tool calls still re-ends as before
+  (#2504).
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

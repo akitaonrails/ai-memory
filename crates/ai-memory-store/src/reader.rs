@@ -1782,7 +1782,9 @@ pub enum SessionEndDisposition {
     /// Already ended, but the observation count exceeds the persisted end
     /// generation: the agent resumed the session under the same id — run the
     /// full end path again so the resumed work reaches the compiled page
-    /// (issue #152).
+    /// (issue #152). The hook router first asks the writer whether the rows
+    /// since that end hold any work; a boundary-only resume only moves the
+    /// watermark (`ops::end_admitted_boundary_only_reend`).
     ReEndWithNewWork,
 }
 

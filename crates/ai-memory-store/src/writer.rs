@@ -28,10 +28,10 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
-    self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IdleEndCandidate, IdleEndResult, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MergeProjectPage, MergeProjectSummary, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
+    self, AdmittedSession, BoundaryOnlyReEndOutcome, DeleteWorkspaceSummary, EmbeddingWrite,
+    HookSessionAdmission, IdleEndCandidate, IdleEndResult, IngestObservationOutcome,
+    LifecycleOnlyEndOutcome, MergeProjectPage, MergeProjectSummary, MoveSessionSummary,
+    MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -305,6 +305,10 @@ pub(crate) enum WriteCmd {
         admitted: AdmittedSession,
         occurred_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
+    },
+    EndAdmittedBoundaryOnlyReEnd {
+        admitted: AdmittedSession,
+        reply: oneshot::Sender<StoreResult<BoundaryOnlyReEndOutcome>>,
     },
     CompleteObservationIngest {
         project_id: ProjectId,
@@ -1942,6 +1946,26 @@ impl WriterHandle {
         self.send(WriteCmd::EndAdmittedLifecycleOnlySession {
             admitted,
             occurred_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Guarded hook re-end of a resume that added only lifecycle boundaries
+    /// since the session's last end: moves the end watermark forward without
+    /// a page, handoff or consolidation, or reports that the full end path
+    /// has to run (`ops::end_admitted_boundary_only_reend`).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors.
+    pub async fn end_admitted_boundary_only_reend(
+        &self,
+        admitted: AdmittedSession,
+    ) -> StoreResult<BoundaryOnlyReEndOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndAdmittedBoundaryOnlyReEnd {
+            admitted,
             reply: tx,
         })
         .await?;
@@ -4847,6 +4871,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result =
                     ops::end_admitted_lifecycle_only_session(&mut conn, &admitted, occurred_at);
                 send_or_warn(reply, result, "end_admitted_lifecycle_only_session");
+            }
+            WriteCmd::EndAdmittedBoundaryOnlyReEnd { admitted, reply } => {
+                let result = ops::end_admitted_boundary_only_reend(&mut conn, &admitted);
+                send_or_warn(reply, result, "end_admitted_boundary_only_reend");
             }
             WriteCmd::CompleteObservationIngest {
                 project_id,

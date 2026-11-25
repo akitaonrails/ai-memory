@@ -118,6 +118,17 @@ pub enum LifecycleOnlyEndOutcome {
     Substantive,
 }
 
+/// Result of [`end_admitted_boundary_only_reend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryOnlyReEndOutcome {
+    /// Every row since the last end is a lifecycle boundary and that end
+    /// wrote the session page: only the end watermark moved forward.
+    Recorded,
+    /// A prompt or tool use arrived since the last end, or the last end wrote
+    /// no session page, so the full end path has to run.
+    NewWork,
+}
+
 /// Summary returned by [`purge_project`] and exposed via
 /// [`crate::writer::WriterHandle::purge_project`].
 #[derive(Debug, Default, Clone)]
@@ -4224,6 +4235,98 @@ pub fn end_admitted_lifecycle_only_session(
     let outcome = end_lifecycle_only_session_in_tx(&tx, &admitted.session_id, occurred_at)?;
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Guarded hook re-end of a resume that added only lifecycle boundaries.
+///
+/// Resuming an ended session and leaving it without a prompt or tool use
+/// (`claude --resume`, then exit) adds a `SessionStart` and a `SessionEnd`,
+/// which is enough for admission to answer `ReEnd`. When every row since the
+/// last end is such a boundary and that end recorded the session page, there
+/// is no new work for the page, the handoff or consolidation to reflect, so
+/// only `ended_observation_count` moves forward (with a finished consolidation
+/// job carried to the new generation) and a duplicate end is `AlreadyEnded`
+/// again. `ended_at` keeps the last end that had work: the
+/// auto-improvement scheduler queues a session whose `ended_at` passes its
+/// watermark, and moving it would queue a review of nothing new.
+///
+/// The rows since the last end are the newest `COUNT(*) -
+/// ended_observation_count` by id, the same watermark admission compares.
+/// Ids are UUIDv7 minted at insert, which `Uuid::now_v7` orders by creation
+/// within the server process, so the order is ingest order, and a
+/// spooled prompt delivered late with an old `created_at` still counts as new
+/// work. A session whose last end wrote no page (a lifecycle-only end, or a
+/// page deleted since) answers [`BoundaryOnlyReEndOutcome::NewWork`] and keeps
+/// the full end path.
+pub fn end_admitted_boundary_only_reend(
+    conn: &mut Connection,
+    admitted: &AdmittedSession,
+) -> StoreResult<BoundaryOnlyReEndOutcome> {
+    let tx = conn.transaction()?;
+    validate_admitted_session(&tx, admitted)?;
+    let session = admitted.session_id.as_bytes();
+    let (ended_at, summary_page_id, ended_count): (Option<i64>, Option<Vec<u8>>, u64) = tx
+        .query_row(
+            "SELECT ended_at, summary_page_id, ended_observation_count \
+             FROM sessions WHERE id = ?1",
+            params![session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if ended_at.is_none() || summary_page_id.is_none() {
+        return Ok(BoundaryOnlyReEndOutcome::NewWork);
+    }
+    let count: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+        params![session],
+        |row| row.get(0),
+    )?;
+    let since_end = i64::try_from(count.saturating_sub(ended_count)).unwrap_or(i64::MAX);
+    if since_end == 0 {
+        return Ok(BoundaryOnlyReEndOutcome::NewWork);
+    }
+    let new_work: bool = tx.query_row(
+        &format!(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM ( \
+                     SELECT kind FROM observations WHERE session_id = ?1 \
+                     ORDER BY id DESC LIMIT ?2 \
+                 ) WHERE {} \
+             )",
+            crate::reader::SUBSTANTIVE_OBSERVATION_KIND_SQL
+        ),
+        params![session, since_end],
+        |row| row.get(0),
+    )?;
+    if new_work {
+        return Ok(BoundaryOnlyReEndOutcome::NewWork);
+    }
+    let generation = i64::try_from(count).unwrap_or(i64::MAX);
+    tx.execute(
+        "UPDATE sessions SET ended_observation_count = ?2 WHERE id = ?1",
+        params![session, generation],
+    )?;
+    // A consolidation job is keyed by observation generation, and a later
+    // duplicate end (`AlreadyEnded`) re-enqueues a generation with no job as
+    // a lost one. Carry a finished job forward: the boundary rows added
+    // nothing for the compile to read, so the consolidated page already
+    // covers this generation. An unfinished or failed newest job is left as
+    // it is, so its own retry or recovery still runs.
+    let now = Timestamp::now().as_microsecond();
+    tx.execute(
+        "INSERT OR IGNORE INTO session_consolidation_jobs \
+         (session_id, workspace_id, project_id, generation, state, requested_at, \
+          next_attempt_at, started_at, completed_at, attempts, claim_id, last_error) \
+         SELECT session_id, workspace_id, project_id, ?2, 'completed', ?3, \
+                ?3, NULL, ?3, 0, NULL, NULL \
+         FROM session_consolidation_jobs \
+         WHERE session_id = ?1 AND state = 'completed' \
+           AND generation = ( \
+               SELECT MAX(generation) FROM session_consolidation_jobs WHERE session_id = ?1 \
+           )",
+        params![session, generation, now],
+    )?;
+    tx.commit()?;
+    Ok(BoundaryOnlyReEndOutcome::Recorded)
 }
 
 /// Guarded hook end plus automatic handoff in one transaction.
@@ -21939,6 +22042,10 @@ pub(crate) mod tests {
             end_admitted_session(&mut conn, &guard, None, None),
             Err(StoreError::SessionCollision)
         ));
+        assert!(matches!(
+            end_admitted_boundary_only_reend(&mut conn, &guard),
+            Err(StoreError::SessionCollision)
+        ));
         begin_session(&mut conn, &session).unwrap();
         conn.execute(
             "UPDATE sessions SET actor_user = 'user:bob' WHERE id = ?1",
@@ -21947,6 +22054,10 @@ pub(crate) mod tests {
         .unwrap();
         assert!(matches!(
             end_admitted_lifecycle_only_session(&mut conn, &guard, None),
+            Err(StoreError::SessionCollision)
+        ));
+        assert!(matches!(
+            end_admitted_boundary_only_reend(&mut conn, &guard),
             Err(StoreError::SessionCollision)
         ));
         let handoff = NewHandoff {
@@ -22006,6 +22117,127 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(audit_row_for(&conn, "release_lifecycle_only_handoff").0, 1);
+    }
+
+    /// `(ended_at, ended_observation_count)` of one session row.
+    fn end_watermark(conn: &Connection, session: SessionId) -> (Option<i64>, u64) {
+        conn.query_row(
+            "SELECT ended_at, ended_observation_count FROM sessions WHERE id = ?1",
+            params![session.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn admit_kind(
+        conn: &mut Connection,
+        session: &NewSession,
+        kind: ObservationKind,
+        occurred_at: Option<i64>,
+    ) -> HookSessionAdmission {
+        let mut observation = hook_observation(session);
+        observation.kind = kind;
+        observation.occurred_at = occurred_at;
+        admit_hook_session_event(
+            conn,
+            session,
+            &observation,
+            &OwnerFilter::User("user:alice".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn boundary_only_reend_moves_only_the_end_watermark() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let guard = admitted_session(admit_kind(
+            &mut conn,
+            &session,
+            ObservationKind::UserPrompt,
+            None,
+        ));
+        admit_kind(&mut conn, &session, ObservationKind::SessionEnd, None);
+        let page_id =
+            upsert_page(&mut conn, &session_page(ws, proj, session.id, "summary")).unwrap();
+        end_admitted_session(&mut conn, &guard, Some(&page_id), None).unwrap();
+        assert!(crate::session_consolidation::enqueue(&mut conn, ws, proj, session.id).unwrap());
+        conn.execute(
+            "UPDATE session_consolidation_jobs SET state = 'completed' WHERE session_id = ?1",
+            params![session.id.as_bytes()],
+        )
+        .unwrap();
+        let (first_ended_at, first_count) = end_watermark(&conn, session.id);
+        assert_eq!(first_count, 2);
+
+        // `claude --resume`, then exit: a start and an end, nothing between.
+        admit_kind(&mut conn, &session, ObservationKind::SessionStart, None);
+        assert!(matches!(
+            admit_kind(&mut conn, &session, ObservationKind::SessionEnd, None),
+            HookSessionAdmission::ReEnd { .. }
+        ));
+        assert_eq!(
+            end_admitted_boundary_only_reend(&mut conn, &guard).unwrap(),
+            BoundaryOnlyReEndOutcome::Recorded
+        );
+        assert_eq!(
+            end_watermark(&conn, session.id),
+            (first_ended_at, 4),
+            "only the observation watermark moves; ended_at keeps the end that had work"
+        );
+        assert!(
+            !crate::session_consolidation::enqueue(&mut conn, ws, proj, session.id).unwrap(),
+            "the finished job is carried to the new generation, so a duplicate end's \
+             recovery finds it covered and queues no consolidation"
+        );
+        assert!(matches!(
+            admit_kind(&mut conn, &session, ObservationKind::SessionEnd, None),
+            HookSessionAdmission::AlreadyEnded { .. }
+        ));
+
+        // A prompt spooled during the resume and delivered late carries an
+        // event time older than every end, and is still new work.
+        let late = first_ended_at.unwrap() - 60_000_000;
+        admit_kind(&mut conn, &session, ObservationKind::UserPrompt, Some(late));
+        assert!(matches!(
+            admit_kind(&mut conn, &session, ObservationKind::SessionEnd, None),
+            HookSessionAdmission::ReEnd { .. }
+        ));
+        assert_eq!(
+            end_admitted_boundary_only_reend(&mut conn, &guard).unwrap(),
+            BoundaryOnlyReEndOutcome::NewWork
+        );
+        assert_eq!(
+            end_watermark(&conn, session.id),
+            (first_ended_at, 4),
+            "new work leaves the watermark for the full end path to move"
+        );
+    }
+
+    #[test]
+    fn boundary_only_reend_keeps_the_full_end_when_no_page_was_written() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let guard = admitted_session(admit_kind(
+            &mut conn,
+            &session,
+            ObservationKind::UserPrompt,
+            None,
+        ));
+        admit_kind(&mut conn, &session, ObservationKind::SessionEnd, None);
+        end_admitted_session(&mut conn, &guard, None, None).unwrap();
+
+        admit_kind(&mut conn, &session, ObservationKind::SessionStart, None);
+        admit_kind(&mut conn, &session, ObservationKind::SessionEnd, None);
+        assert_eq!(
+            end_admitted_boundary_only_reend(&mut conn, &guard).unwrap(),
+            BoundaryOnlyReEndOutcome::NewWork,
+            "an end that wrote no session page leaves the re-end to write it"
+        );
+        assert_eq!(end_watermark(&conn, session.id).1, 2);
     }
 
     /// Token-cost visibility: the harness reports cumulative totals,

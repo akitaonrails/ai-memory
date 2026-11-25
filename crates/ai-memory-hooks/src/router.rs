@@ -5925,6 +5925,7 @@ async fn process_authorized(
             })
             .ok()
     });
+    let re_end = matches!(admission, HookSessionAdmission::ReEnd { .. });
     let (admitted, ingest) = match admission {
         HookSessionAdmission::InvalidMissingEnd => {
             info!(session = %session_id, "ignoring missing SessionEnd");
@@ -6235,6 +6236,31 @@ async fn process_authorized(
             return Ok(outcome);
         }
         let (page_ws, page_proj) = checkpoint_scope.unwrap_or((ws, proj));
+        // A resume closed again without a prompt or tool use (`claude --resume`,
+        // then exit) is admitted as a re-end on its own `SessionStart` and
+        // `SessionEnd` rows. The whole-session test below would call it
+        // substantive because of the work before the first end, and rewrite
+        // the page, refresh the handoff and queue consolidation for nothing
+        // new. The writer checks only the rows since that end, and moves the
+        // end watermark forward when they are all boundaries.
+        if re_end
+            && matches!(env.event, HookEvent::SessionEnd)
+            && state
+                .writer
+                .end_admitted_boundary_only_reend(admitted.clone())
+                .await?
+                == ai_memory_store::BoundaryOnlyReEndOutcome::Recorded
+        {
+            state.ingest_metrics.record_persisted(now_unix_ms());
+            info!(
+                session = %session_id,
+                "resumed session re-ended with no new work; page and handoff unchanged",
+            );
+            if let Some(key) = ingest_key {
+                state.writer.complete_observation_ingest(proj, key).await?;
+            }
+            return Ok(outcome);
+        }
         // A session can hold hundreds of thousands of rows, so nothing on this
         // path loads them all: the lifecycle-only decision is one existence
         // query (the writer re-checks it in the ending transaction with the
@@ -24822,6 +24848,99 @@ pub(crate) mod tests {
             disposition,
             ai_memory_store::SessionEndDisposition::AlreadyEnded,
             "after the re-end, the generation watermark must cover resumed work"
+        );
+    }
+
+    // A resume closed again without a prompt or tool use (`claude --resume`,
+    // then exit) adds only a SessionStart and a SessionEnd. It must not
+    // rewrite the page of the work before the first end; a later resume with
+    // real work still re-ends.
+    #[tokio::test]
+    async fn boundary_only_resume_leaves_the_session_page_alone() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "44444444-4444-4444-4444-444444444444";
+        let session_id: SessionId = sid.parse().unwrap();
+        let fire = |event: &str, tool: Option<&str>| {
+            let mut body = serde_json::json!({ "session_id": sid });
+            if let Some(tool) = tool {
+                body["tool_name"] = serde_json::Value::String(tool.into());
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let st = &state;
+        let session_page = move || async move {
+            st.reader
+                .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|p| p.path.as_str().starts_with("sessions/"))
+                .expect("the session page exists")
+        };
+        let disposition = move || async move {
+            st.reader
+                .session_end_disposition(
+                    session_id,
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                )
+                .await
+                .unwrap()
+        };
+
+        for (event, tool) in [
+            ("session-start", None),
+            ("post-tool-use", Some("Bash")),
+            ("session-end", None),
+        ] {
+            process(&state, fire(event, tool), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        let page_after_work = session_page().await;
+
+        for event in ["session-start", "session-end"] {
+            process(&state, fire(event, None), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session_page().await.id,
+            page_after_work.id,
+            "a resume with no prompt or tool use must not rewrite the page"
+        );
+        assert_eq!(
+            disposition().await,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
+            "the boundary-only re-end moves the watermark, so a duplicate end drops"
+        );
+
+        for (event, tool) in [
+            ("session-start", None),
+            ("post-tool-use", Some("Edit")),
+            ("session-end", None),
+        ] {
+            process(&state, fire(event, tool), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        assert_ne!(
+            session_page().await.id,
+            page_after_work.id,
+            "a resume with real work still re-ends and rewrites the page"
+        );
+        assert_eq!(
+            disposition().await,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded
         );
     }
 

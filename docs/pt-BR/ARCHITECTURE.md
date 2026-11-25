@@ -306,7 +306,12 @@ a partir dos caminhos de hooks.
    seu uso e enviar um `SessionEnd` sintético normal. Isso é seguro mesmo se a
    sessão antiga ainda estiver ativa: um `SessionEnd` real posterior com mais
    observações do que o encerramento antecipado viu executa o caminho de encerramento completo
-   (`SessionEndDisposition::ReEndWithNewWork`, issue #152).
+   (`SessionEndDisposition::ReEndWithNewWork`, issue #152). Um reencerramento
+   cujas linhas desde o último encerramento são só limites de ciclo de vida
+   (uma retomada fechada sem prompt nem uso de ferramenta) avança
+   `ended_observation_count` e para aí: sem regravar a página, renovar o
+   handoff nem criar trabalho de consolidação, e `ended_at` mantém o último
+   encerramento que teve trabalho.
 8. Backups: `ai-memory backup --to <tarball>` usa a API de backup online do
    SQLite para que a origem permaneça gravável; `ai-memory restore`
    reverte. Ou: `git push` no diretório da wiki + `rsync` no diretório de dados.
