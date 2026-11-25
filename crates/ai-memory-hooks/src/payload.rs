@@ -1346,6 +1346,16 @@ fn claude_code_tool_text(raw: &serde_json::Value) -> Option<Option<String>> {
         // The patch, never `originalFile`: the whole file before the edit,
         // which filled the excerpt ahead of the change itself.
         "Edit" => structured_patch_text(response),
+        // A new file keeps what was written; an overwrite keeps its patch,
+        // or the new content when Claude Code took no diff.
+        "Write" => match response.get("type")?.as_str()? {
+            "update" => match structured_patch_text(response)? {
+                Some(patch) => Some(Some(patch)),
+                None => Some(text("content")),
+            },
+            "create" => Some(text("content")),
+            _ => None,
+        },
         _ => None,
     }
 }
