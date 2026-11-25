@@ -1343,8 +1343,41 @@ fn claude_code_tool_text(raw: &serde_json::Value) -> Option<Option<String>> {
                 _ => None,
             }
         }
+        // The patch, never `originalFile`: the whole file before the edit,
+        // which filled the excerpt ahead of the change itself.
+        "Edit" => structured_patch_text(response),
         _ => None,
     }
+}
+
+/// A Claude Code Edit or Write `structuredPatch` as unified diff text: each
+/// hunk's `@@` header, then its lines, which already carry their `-`, `+` or
+/// space. `None` when there is no patch array; `Some(None)` when it is empty.
+fn structured_patch_text(
+    response: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Option<String>> {
+    let hunks = response.get("structuredPatch")?.as_array()?;
+    let mut lines = Vec::new();
+    for hunk in hunks {
+        let number = |key: &str| hunk.get(key).and_then(serde_json::Value::as_u64);
+        if let (Some(old_start), Some(old_lines), Some(new_start), Some(new_lines)) = (
+            number("oldStart"),
+            number("oldLines"),
+            number("newStart"),
+            number("newLines"),
+        ) {
+            lines.push(format!(
+                "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@"
+            ));
+        }
+        let hunk_lines = hunk.get("lines").and_then(serde_json::Value::as_array);
+        for line in hunk_lines.into_iter().flatten() {
+            if let Some(line) = line.as_str() {
+                lines.push(line.to_owned());
+            }
+        }
+    }
+    Some((!lines.is_empty()).then(|| lines.join("\n")))
 }
 
 /// Cursor's `postToolUseFailure` has no `tool_output`; what went wrong is in
