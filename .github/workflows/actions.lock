@@ -31,6 +31,9 @@ workflows:
         - 'actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1'
         - 'astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2'
         - 'swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31'
+    '.github/workflows/plumber.yml':
+        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        - 'getplumber/plumber@ec8cb3a7edd6a324b33e85109b627b2df6023d94'
     '.github/workflows/release.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
@@ -112,9 +115,22 @@ dependencies:
         commit: 'sha1-3c6349835b2b7b196a839186cb8b78e02f7b5f25'
         owner_id: 44887257
         repo_id: 228054692
+    'getplumber/plumber@ec8cb3a7edd6a324b33e85109b627b2df6023d94':
+        ref: 'v0.7.23'
+        commit: 'sha1-ec8cb3a7edd6a324b33e85109b627b2df6023d94'
+        owner_id: 255179076
+        repo_id: 1137327132
+        uses:
+            - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
+            - 'github/codeql-action@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee'
     'github/codeql-action@33d7b85da1a04171e211befe2c739303b9a4c066':
         ref: 'v4.39.3'
         commit: 'sha1-33d7b85da1a04171e211befe2c739303b9a4c066'
+        owner_id: 9919
+        repo_id: 259445878
+    'github/codeql-action@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee':
+        ref: 'v4.39.0'
+        commit: 'sha1-6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee'
         owner_id: 9919
         repo_id: 259445878
     'gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e':
