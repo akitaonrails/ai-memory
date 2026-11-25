@@ -145,6 +145,7 @@ cli-help-root-workstream-search-about = { "Search the complete visible event led
 cli-help-root-workstream-search-query-help = { "Natural-language or FTS query. Omit to show the newest events" }
 cli-help-root-workstream-search-workstream-id-help = { "Workstream to search. Managed child processes receive this through the environment, so agents normally do not need to pass it" }
 cli-help-root-workstream-search-limit-help = { "Maximum events to return" }
+cli-help-root-workstream-search-before-sequence-help = { "Return the page of events older than this sequence. Cannot be combined with a text query" }
 cli-help-root-workstream-search-json-help = { "Emit JSON instead of readable event blocks" }
 cli-help-root-audit-contamination-about = { "Audit the store for likely cross-project contamination (read-only, SQL-only). Flags sessions whose cwd resolves to a different project and observations whose project disagrees with their session" }
 cli-help-root-audit-contamination-workspace-help = { "Restrict the audit to one workspace (use together with `--project`)" }
