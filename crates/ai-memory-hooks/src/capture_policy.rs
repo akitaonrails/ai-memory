@@ -1575,7 +1575,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         powershell: name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh"),
         inline_code: family == ToolFamily::NonFile
             && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
-        edited: (agent == AgentKind::ClaudeCode)
+        edited: (agent == AgentKind::ClaudeCode && family == ToolFamily::NonFile)
             .then(|| bash_edit_diff_paths(object))
             .flatten(),
         call_id,
@@ -7552,6 +7552,78 @@ mod tests {
                 &bash_edit_diff("make gen", json!({"changedFiles": [7]}))
             ),
             Some(vec!["/work/b".to_owned()])
+        );
+    }
+
+    /// `tool_response.bashEditDiff` is only defined for Claude Code shell
+    /// calls (`ToolFamily::NonFile`). Non-shell Claude Code tools (`File`,
+    /// `SearchList`, `Unknown`) carrying a malformed `bashEditDiff` must not
+    /// be downgraded to `MetadataOnly` (and `SearchList` must never emit an
+    /// illegal `(Active, SearchList, MetadataOnly)` protocol).
+    #[test]
+    fn claude_code_non_shell_tools_ignore_bash_edit_diff() {
+        let policy = shell_policy();
+        let malformed = json!({"changedFiles": "docs/adr/0001.md"});
+
+        let read = json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/repo/src/lib.rs"},
+            "tool_use_id": "call-read",
+            "tool_response": {"bashEditDiff": malformed},
+        });
+        let read_protocol = policy
+            .inspect(AgentKind::ClaudeCode, &read, "/repo")
+            .protocol()
+            .clone();
+        assert_eq!(read_protocol.tool_family(), ToolFamily::File);
+        assert_eq!(read_protocol.disposition(), CaptureDisposition::Keep);
+
+        let grep = json!({
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "TODO", "path": "/repo/src"},
+            "tool_use_id": "call-grep",
+            "tool_response": {"bashEditDiff": malformed},
+        });
+        let grep_protocol = policy
+            .inspect(AgentKind::ClaudeCode, &grep, "/repo")
+            .protocol()
+            .clone();
+        assert_eq!(grep_protocol.tool_family(), ToolFamily::SearchList);
+        assert_eq!(grep_protocol.disposition(), CaptureDisposition::Drop);
+        assert_ne!(
+            grep_protocol.disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+
+        let unknown = json!({
+            "tool_name": "mcp__srv__tool",
+            "tool_input": {"query": "status"},
+            "tool_use_id": "call-mcp",
+            "tool_response": {"bashEditDiff": malformed},
+        });
+        let unknown_protocol = policy
+            .inspect(AgentKind::ClaudeCode, &unknown, "/repo")
+            .protocol()
+            .clone();
+        assert_eq!(unknown_protocol.tool_family(), ToolFamily::Unknown);
+        assert_eq!(unknown_protocol.disposition(), CaptureDisposition::Keep);
+
+        let grep_with_diff = json!({
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "TODO", "path": "/work/b/src"},
+            "tool_use_id": "call-grep-2",
+            "tool_response": {
+                "bashEditDiff": {"changedFiles": ["/work/a/secrets.env"]},
+            },
+        });
+        assert_eq!(
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &grep_with_diff,
+                "/work/b",
+                None,
+            )),
+            Some(vec!["/work/b/src".to_owned()])
         );
     }
 
