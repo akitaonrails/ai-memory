@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `storedItems` for handoff lists. Both stay `undefined` when nothing was cut.
   (#2411)
 - `recent` accepts `pathPrefix` (sent as `path_prefix`), matching the server's
-  new `memory_recent` argument that lists one page family before the limit.
+  new `memory_recent` argument that lists one page family before the limit. (#2501)
 
 ### Fixed
 

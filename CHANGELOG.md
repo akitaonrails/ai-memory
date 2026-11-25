@@ -97,7 +97,7 @@ version in [`docs/changelog/`](docs/changelog/):
   page family, such as `decisions/`, newest first, and applies before the
   `limit` cut, so newer pages elsewhere no longer crowd the family out; it
   narrows the cross-project `default_global` listing too. The TypeScript SDK
-  sends it from `recent` as `pathPrefix`.
+  sends it from `recent` as `pathPrefix`. (#2501)
 
 ### Fixed
 
