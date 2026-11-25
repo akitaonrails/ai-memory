@@ -172,6 +172,37 @@ async fn an_object_shaped_tool_result_without_a_secret_is_stored_whole() {
     );
 }
 
+/// Claude Code's Bash result is stored as the text it printed, so a secret in
+/// it is redacted as plain text and the lines after it keep their real line
+/// breaks. Control: a harmless result is stored as printed.
+#[tokio::test]
+async fn a_claude_code_bash_result_is_redacted_as_the_text_it_carries() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let printed =
+        |stdout: String| serde_json::json!({"stdout": stdout, "stderr": "", "interrupted": false});
+    let body = stored_tool_body(
+        &state,
+        "claude-code",
+        printed(format!("DB_HOST=x\nSTRIPE_SECRET={SECRET}\nPORT=5432\n")),
+    )
+    .await;
+    assert!(
+        !body.contains(SECRET) && body.contains("[REDACTED:"),
+        "secret stored verbatim: {body:?}"
+    );
+    assert!(body.contains("---\nDB_HOST=x\n"), "{body:?}");
+    assert!(body.contains("\nPORT=5432"), "{body:?}");
+    assert!(!body.contains("\"stdout\""), "{body:?}");
+
+    let harmless = "{\"name\": \"something-long-value\"}\nsecond line";
+    let body = stored_tool_body(&state, "claude-code", printed(harmless.to_owned())).await;
+    assert!(
+        body.ends_with(&format!("---\n{harmless}")),
+        "harmless result must be stored as printed: {body:?}"
+    );
+}
+
 async fn stored_selected_lifecycle_body(
     state: &HookState,
     agent: ai_memory_core::AgentKind,

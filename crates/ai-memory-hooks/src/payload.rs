@@ -4835,6 +4835,99 @@ mod tests {
         assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
     }
 
+    /// The result part of the body a Claude Code PostToolUse for `tool` with
+    /// this `tool_response` stores, read as `agent`.
+    fn tool_result_as(agent: &str, tool: &str, response: serde_json::Value) -> String {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some(agent.into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool,
+                "tool_input": {},
+                "tool_use_id": "toolu_1",
+                "tool_response": response,
+            }),
+        );
+        let body = env.body_excerpt.expect("post-tool body");
+        let (_, result) = body
+            .split_once(TOOL_BODY_SEPARATOR)
+            .expect("a result after the separator");
+        result.to_owned()
+    }
+
+    fn claude_result(tool: &str, response: serde_json::Value) -> String {
+        tool_result_as("claude-code", tool, response)
+    }
+
+    /// Claude Code's Bash (and PowerShell) result is `{stdout, stderr,
+    /// interrupted, isImage, ...}` (hooks reference; SDK `BashOutput`). The
+    /// body keeps the output text with its real line breaks, so full-text
+    /// search splits every line, and never the `bashEditDiff` of the files
+    /// the command changed nor its `gitOperation`. Controls: a failed call's
+    /// error string, an object without `stdout`, and the same object from
+    /// another agent keep the generic reading.
+    #[test]
+    fn claude_code_bash_result_keeps_its_output_text() {
+        let output = "running 2 tests\ntest b ... FAILED\n\nfailures:\n    b\n";
+        for tool in ["Bash", "PowerShell"] {
+            let result = claude_result(
+                tool,
+                serde_json::json!({
+                    "stdout": output,
+                    "stderr": "Shell cwd was reset to /repo",
+                    "interrupted": false,
+                    "isImage": false,
+                    "noOutputExpected": false,
+                    "bashEditDiff": {
+                        "changedFiles": ["/repo/src/gen.rs"],
+                        "files": [{"filePath": "/repo/src/gen.rs", "hunks": [{
+                            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+                            "lines": ["-SENTINEL_DIFF_OLD", "+SENTINEL_DIFF_NEW"],
+                        }]}],
+                        "moreFiles": 0,
+                    },
+                    "gitOperation": {"commit": {"sha": "SENTINEL_SHA", "kind": "committed"}},
+                }),
+            );
+            assert_eq!(
+                result,
+                format!("{output}\nShell cwd was reset to /repo"),
+                "{tool}"
+            );
+        }
+        let quiet = serde_json::json!({"stdout": "", "stderr": "", "interrupted": false});
+        assert_eq!(claude_result("Bash", quiet), "(no output captured)");
+        let image = serde_json::json!({
+            "stdout": "data:image/png;base64,iVBORw0KGgoSENTINEL",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": true,
+        });
+        assert_eq!(claude_result("Bash", image), "(no output captured)");
+
+        let failed = serde_json::json!("Exit code 2\nMARKER_FAILED_CALL");
+        assert_eq!(
+            claude_result("Bash", failed),
+            "Exit code 2\nMARKER_FAILED_CALL"
+        );
+        let unmodeled = serde_json::json!({"output": "MARKER_UNMODELED"});
+        assert_eq!(
+            claude_result("Bash", unmodeled),
+            r#"{"output":"MARKER_UNMODELED"}"#
+        );
+        let other = tool_result_as(
+            "command-code",
+            "Bash",
+            serde_json::json!({"stdout": "MARKER_OTHER_AGENT", "stderr": ""}),
+        );
+        assert!(other.contains("\"stdout\""), "{other:?}");
+    }
+
     /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
     /// with `outcome: error` and the error text, never the tool's arguments.
     #[test]
