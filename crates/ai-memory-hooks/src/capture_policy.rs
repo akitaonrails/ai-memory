@@ -7358,6 +7358,89 @@ mod tests {
         assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
     }
 
+    /// A Claude Code `Bash` PostToolUse whose `tool_response.bashEditDiff`
+    /// says what the command changed.
+    fn bash_edit_diff(command: &str, diff: Value) -> Value {
+        json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_use_id": "call-1",
+            "tool_response": {
+                "stdout": "generated\n",
+                "stderr": "",
+                "interrupted": false,
+                "bashEditDiff": diff,
+            },
+        })
+    }
+
+    /// Claude Code lists the files a shell command changed, with their diffs,
+    /// in `bashEditDiff` (v2.1.269+). Adversarial: a command that names no
+    /// ignored path but changed one, listed in `changedFiles` or only as a
+    /// diff's `filePath`, under the marker or `~/`, drops. Controls: the same
+    /// command changing other files, with no diff, with a skipped one, under
+    /// another agent, or with no policy keeps.
+    #[test]
+    fn claude_code_shell_call_that_changed_an_ignored_file_drops() {
+        let policy = shell_policy();
+        let decide = |agent, policy: &CapturePolicy, raw: &Value| {
+            policy.inspect(agent, raw, "/repo").protocol().disposition()
+        };
+        for diff in [
+            json!({"changedFiles": ["/repo/src/gen.rs", "/repo/docs/adr/0001.md"], "files": [], "moreFiles": 0}),
+            json!({"files": [{"filePath": "/repo/docs/adr/0001.md", "hunks": [{"lines": ["-old", "+new"]}]}]}),
+            json!({"changedFiles": ["/home/me/notes/today.md"], "moreFiles": 1}),
+            json!({"changedFiles": ["docs/adr/0002.md"]}),
+        ] {
+            let raw = bash_edit_diff("make gen", diff.clone());
+            assert_eq!(
+                decide(AgentKind::ClaudeCode, &policy, &raw),
+                CaptureDisposition::Drop,
+                "{diff}"
+            );
+        }
+        let other = json!({
+            "changedFiles": ["/repo/src/gen.rs"],
+            "files": [{"filePath": "/repo/src/gen.rs", "hunks": []}],
+            "moreFiles": 0,
+        });
+        let ignored = json!({"changedFiles": ["/repo/docs/adr/0001.md"]});
+        for (agent, policy, raw) in [
+            (
+                AgentKind::ClaudeCode,
+                &policy,
+                bash_edit_diff("make gen", other),
+            ),
+            (AgentKind::ClaudeCode, &policy, bash("make gen")),
+            (
+                AgentKind::ClaudeCode,
+                &policy,
+                bash_edit_diff("make gen", Value::Null),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                &policy,
+                bash_edit_diff("git stash", json!({"skipped": true})),
+            ),
+            (
+                AgentKind::Codex,
+                &policy,
+                bash_edit_diff("make gen", ignored.clone()),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                &CapturePolicy::resolve(CaptureSource::Absent, "/repo", None),
+                bash_edit_diff("make gen", ignored),
+            ),
+        ] {
+            assert_eq!(
+                decide(agent, policy, &raw),
+                CaptureDisposition::Keep,
+                "{agent:?} {raw}"
+            );
+        }
+    }
+
     /// The drop/keep tables live in the shared fixture so the generated
     /// TypeScript matcher runs the very same vectors (#961).
     /// The shared Windows-spelling vectors. Adversarial: every Git Bash,
