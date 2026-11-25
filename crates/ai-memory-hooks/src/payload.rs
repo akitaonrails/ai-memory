@@ -4942,6 +4942,55 @@ mod tests {
         assert!(other.contains("\"stdout\""), "{other:?}");
     }
 
+    /// Claude Code's Read result is discriminated on `type` (SDK
+    /// `FileReadOutput`). A text read keeps the file's text; an image, a PDF
+    /// and its extracted pages keep no base64, and an unchanged file has no
+    /// content. Control: a notebook keeps the generic reading.
+    #[test]
+    fn claude_code_read_result_keeps_the_file_text_and_no_bytes() {
+        let content = "pub struct Cache;\nfn evict() {}\nREAD_LINE3_MARKER\n";
+        let text = serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": "/repo/src/cache.rs",
+                "content": content,
+                "numLines": 3,
+                "startLine": 1,
+                "totalLines": 3,
+            },
+        });
+        assert_eq!(claude_result("Read", text), content);
+        let empty = serde_json::json!({
+            "type": "text",
+            "file": {"filePath": "/repo/empty", "content": "", "numLines": 0, "startLine": 1, "totalLines": 0},
+        });
+        assert_eq!(claude_result("Read", empty), "(no output captured)");
+        for binary in [
+            serde_json::json!({"type": "image", "file": {
+                "base64": "iVBORw0KGgoAAAANSUhEUgSENTINEL", "type": "image/png", "originalSize": 2048,
+                "dimensions": {"originalWidth": 64, "originalHeight": 64},
+            }}),
+            serde_json::json!({"type": "pdf", "file": {
+                "filePath": "/repo/spec.pdf", "base64": "JVBERi0xSENTINEL", "originalSize": 4096,
+            }}),
+            serde_json::json!({"type": "parts", "file": {
+                "filePath": "/repo/spec.pdf", "originalSize": 4096, "count": 2, "outputDir": "/tmp/SENTINEL_PAGES",
+            }}),
+            serde_json::json!({"type": "file_unchanged", "file": {"filePath": "/repo/SENTINEL_SAME.md"}}),
+        ] {
+            assert_eq!(
+                claude_result("Read", binary.clone()),
+                "(no output captured)",
+                "{binary}"
+            );
+        }
+        let notebook = serde_json::json!({
+            "type": "notebook",
+            "file": {"filePath": "/repo/a.ipynb", "cells": [{"cell_type": "code", "source": "MARKER_NOTEBOOK"}]},
+        });
+        assert!(claude_result("Read", notebook).contains("MARKER_NOTEBOOK"));
+    }
+
     /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
     /// with `outcome: error` and the error text, never the tool's arguments.
     #[test]
