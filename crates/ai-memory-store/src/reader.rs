@@ -5105,37 +5105,57 @@ impl ReaderPool {
         project_id: ProjectId,
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
+        self.recent_pages_for_project_filtered(
+            workspace_id,
+            project_id,
+            limit,
+            PageFilter::default(),
+        )
+        .await
+    }
+
+    /// [`Self::recent_pages_for_project`] returning only pages `filter` keeps,
+    /// before the cut to `limit`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_pages_for_project_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+        filter: PageFilter<'_>,
+    ) -> StoreResult<Vec<PageHit>> {
+        let (kept, kept_params) = filter.sql("pages", numbered_placeholders(5));
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT id, path, title, \
                         {descriptor} AS snip, \
                         CAST(updated_at AS REAL) AS rank, trust_class \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired}{kept} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
                 descriptor = page_descriptor_expr("body", "frontmatter_json"),
                 not_expired = not_expired("pages", "?4"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    limit as i64,
-                    now_us()
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let path: String = row.get(1)?;
-                    let title: String = row.get(2)?;
-                    let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
-                    let rank: f64 = row.get(4)?;
-                    let trust_class: String = row.get(5)?;
-                    Ok((id_bytes, path, title, snippet, rank, trust_class))
-                },
-            )?;
+            let mut sql_params = vec![
+                Value::Blob(workspace_id.as_bytes().to_vec()),
+                Value::Blob(project_id.as_bytes().to_vec()),
+                Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+                Value::Integer(now_us()),
+            ];
+            sql_params.extend(kept_params);
+            let rows = stmt.query_map(params_from_iter(sql_params), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                let rank: f64 = row.get(4)?;
+                let trust_class: String = row.get(5)?;
+                Ok((id_bytes, path, title, snippet, rank, trust_class))
+            })?;
             let mut hits = Vec::new();
             for row in rows {
                 let (id_bytes, path, title, snippet, rank, trust_class) = row?;
@@ -5175,9 +5195,26 @@ impl ReaderPool {
         limit: usize,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
+        self.recent_pages_global_filtered(limit, viewer, PageFilter::default())
+            .await
+    }
+
+    /// [`Self::recent_pages_global`] returning only pages `filter` keeps. The
+    /// filter narrows the pages `viewer` may read and never replaces that
+    /// check; both apply before the cut to `limit`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_pages_global_filtered(
+        &self,
+        limit: usize,
+        viewer: Option<UserId>,
+        filter: PageFilter<'_>,
+    ) -> StoreResult<Vec<PageHitWithMeta>> {
+        let (visible, visible_params) = readable_repository_filter("pages.project_id", viewer, 3);
+        let (kept, kept_params) =
+            filter.sql("pages", numbered_placeholders(3 + visible_params.len()));
         self.with_conn(move |conn| {
-            let (visible, visible_params) =
-                readable_repository_filter("pages.project_id", viewer, 3);
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
@@ -5185,7 +5222,7 @@ impl ReaderPool {
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages.is_latest = 1{not_expired}{visible} \
+                 WHERE pages.is_latest = 1{not_expired}{visible}{kept} \
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
                 descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
@@ -5195,6 +5232,7 @@ impl ReaderPool {
             #[allow(clippy::cast_possible_wrap)]
             let mut bound = vec![Value::Integer(limit as i64), Value::Integer(now_us())];
             bound.extend(visible_params);
+            bound.extend(kept_params);
             let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;

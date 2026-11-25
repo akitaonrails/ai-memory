@@ -74,6 +74,9 @@ reach another project's inbox (send a report, notify, leave a message for
 that project's agent). A wiki page written into the target project is NOT a
 message and is never surfaced as one.
 
+The installed retrieval skill documents the literal `path_prefix` filter for
+recent-page listings. The filter applies before the result limit.
+
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
 and reports that active stream without per-hit RRF details. The installed

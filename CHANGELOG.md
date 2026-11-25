@@ -93,6 +93,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory install-hooks --agent <agent> --apply` to send the opt-in (see
   `docs/install.md#hook-files-after-an-update`). (#1621, #1865)
 
+- Added an optional literal `path_prefix` to `memory_recent`. It lists one
+  page family, such as `decisions/`, newest first, and applies before the
+  `limit` cut, so newer pages elsewhere no longer crowd the family out; it
+  narrows the cross-project `default_global` listing too. The TypeScript SDK
+  sends it from `recent` as `pathPrefix`.
+
 ### Fixed
 
 - Applied the container wrapper's host-file UID and SELinux handling to

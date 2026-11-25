@@ -1045,7 +1045,7 @@ export class AiMemoryClient {
     const scope = this.#core.scope(a.scope, where);
     const decoded = await this.#core.invoke(
       "memory_recent",
-      wire({ ...scopeWire(scope), limit: a.limit }),
+      wire({ ...scopeWire(scope), limit: a.limit, path_prefix: a.pathPrefix }),
       false,
       options,
     );
