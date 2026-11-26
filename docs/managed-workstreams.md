@@ -967,7 +967,7 @@ The default executable is `command-code` on Unix and `cmdc` on native Windows;
 The experimental unsandboxed Mod API is not used.
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
-Codex's `resume`, Antigravity's `--conversation` / `--continue`, Copilot's
+Codex's `resume`, Antigravity's `--conversation` / `--resume` / `-r` / `--continue`, Copilot's
 `--resume` / `--continue` / `--session-id` / `--connect`, or Gemini's
 `--resume` / `-r` / `--session-id` / `--session-file` wins.
 ai-memory links the selected native session and resets an unrelated adapter
@@ -1257,8 +1257,9 @@ conversation started one level up is not offered inside a subdirectory.
 
 `agy` accepts no caller-chosen id for a new conversation, so a fresh launch
 injects no selector and the id is linked by the hooks or discovered after exit; a
-linked resume passes `--conversation <id>`. `--continue` / `-c` is treated as an
-explicit user choice and is never overridden. `--yolo` maps to
+linked resume passes `--conversation <id>`. `--resume` / `-r` (aliases of
+`--conversation`) and `--continue` / `-c` are treated as explicit user choices
+and are never overridden. `--yolo` maps to
 `--dangerously-skip-permissions`. Step payloads are undocumented, unversioned
 protobuf blobs, so ai-memory does not decode conversation text: the visible-event
 ledger for this harness comes from lifecycle-hook capture, and transcript export
