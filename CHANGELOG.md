@@ -24,6 +24,20 @@ version in [`docs/changelog/`](docs/changelog/):
   descriptions; works orthogonally with `pi_tool_exposure` and
   `pi_direct_tools`, and leaves output byte-identical when unset. (#2493)
 
+- Added an optional literal `path_prefix` to `memory_recent`. It lists one
+  page family, such as `decisions/`, newest first, and applies before the
+  `limit` cut, so newer pages elsewhere no longer crowd the family out; it
+  narrows the cross-project `default_global` listing too. The TypeScript SDK
+  sends it from `recent` as `pathPrefix`. (#2501)
+
+- Added `workstream-search --before-sequence` and the `before_sequence` query
+  parameter on `GET /workstream/{id}/events`, so a ledger can be read backwards
+  without a text query. (#2491)
+
+- Added optional `kind`, `tier`, `path_prefix` and `tag` filters to
+  `GET`/`POST /api/v1/search`, applied before ranking and only with an explicit
+  project or scope. (#2492)
+
 - Reported measured session token usage for OpenCode 2 and Antigravity CLI:
   OpenCode 2's generated plugin records measured assistant message/step token
   counters keyed by native message ID (`_ai_memory_usage_calls`) on `stop` and
@@ -50,24 +64,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Completed the English and Brazilian Portuguese help and installer
   diagnostics for Antigravity CLI status line setup. (#2486)
-
-- Added an optional literal `path_prefix` to `memory_recent`. It lists one
-  page family, such as `decisions/`, newest first, and applies before the
-  `limit` cut, so newer pages elsewhere no longer crowd the family out; it
-  narrows the cross-project `default_global` listing too. The TypeScript SDK
-  sends it from `recent` as `pathPrefix`. (#2501)
-
-### Added
-
-- Added `workstream-search --before-sequence` and the `before_sequence` query
-  parameter on `GET /workstream/{id}/events`, so a ledger can be read backwards
-  without a text query. (#2491)
-
-### Added
-
-- Added optional `kind`, `tier`, `path_prefix` and `tag` filters to
-  `GET`/`POST /api/v1/search`, applied before ranking and only with an explicit
-  project or scope. (#2492)
 
 ## [3.6.3] - 2026-11-26
 
