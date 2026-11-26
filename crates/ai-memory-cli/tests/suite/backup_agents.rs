@@ -2567,6 +2567,13 @@ fn every_documented_skill_root_survives_a_backup_and_restore() {
         format!("# parity {root}")
     };
     let asset_path = |base: &Path, root: &str, file_name: &str| {
+        // Devin's user config lives in %APPDATA%\devin on Windows, which
+        // `command_with_env` points at home/AppData/Roaming.
+        let root = if cfg!(windows) && root == ".config/devin/skills" {
+            "AppData/Roaming/devin/skills"
+        } else {
+            root
+        };
         let dir = base.join(root);
         if file_name != "SKILL.md" {
             return dir.join(file_name);

@@ -20,7 +20,9 @@ use tracing::info;
 
 use crate::cli::{AgentBackupScope, BackupAgentsArgs, McpClient};
 use crate::commands::backup::human_bytes;
-use crate::commands::path_util::{agent_config_home, claude_config_dir, home_dir};
+use crate::commands::path_util::{
+    agent_config_home, claude_config_dir, devin_user_config_dir_in, home_dir,
+};
 use crate::config::{Config, RuntimeEnv};
 
 const MAX_BACKUP_ASSET_BYTES: u64 = 128 * 1024 * 1024;
@@ -704,7 +706,10 @@ pub fn discover_assets(
     // 6. Devin
     if filter_agent(AgentKind::Devin) {
         if want_global {
-            let devin_dir = home.join(".config").join("devin");
+            // Devin reads its user config from %APPDATA%\devin on Windows, where
+            // the installers write it; `.config/devin/` stays the archive path.
+            let devin_dir = devin_user_config_dir_in(env.var_os("APPDATA"), None, cfg!(windows))
+                .unwrap_or_else(|| home.join(".config").join("devin"));
             push_if_file(
                 &mut assets,
                 AgentKind::Devin,
