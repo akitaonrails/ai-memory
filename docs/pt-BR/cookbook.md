@@ -678,9 +678,9 @@ com três consequências em um servidor solo:
   `aim_` e `--no-autowire`, enquanto comandos admin e execuções comuns
   continuam usando `bearer_token_file`. Passar `--no-autowire` impede que o
   re-exec dentro do home privado do `ai-jail` (onde
-  `<data_dir>/autowire-state` fica oculto) rode o auto-wire novamente com a
-  chave `aim_` inline e troque uma entrada `mcp-bridge` por um cabeçalho fixo;
-  configure cada harness uma vez fora da `--jail` (ou com
+  `<data_dir>/autowire-state` fica oculto) rode o auto-wire novamente a cada
+  execução na jail e sobrescreva entradas MCP HTTP estáticas com a chave `aim_`
+  inline; configure cada harness uma vez fora da `--jail` (ou com
   `ai-memory install-mcp --client <harness> --apply`) para que sessões sem
   jail mantenham acesso root e sessões na jail usem `AI_MEMORY_AUTH_TOKEN`.
 
