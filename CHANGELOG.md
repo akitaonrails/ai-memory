@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- File-based imports reject a `--manifest-out` path that resolves to one of
+  their input files. A dry run could otherwise replace the source document,
+  conversation, export, mapping file, or SQLite database with its manifest.
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

@@ -232,6 +232,7 @@ pub(crate) async fn run(args: DocumentArgs) -> Result<()> {
         }
     }
 
+    crate::validate_manifest_destination(args.manifest_out.as_deref(), &[&args.file])?;
     let workspace = args
         .workspace
         .clone()
@@ -2454,6 +2455,38 @@ mod tests {
         write_zip(&file, &[("word/document.xml", &"x".repeat(65))]);
         let bytes = fs::read(file).unwrap();
         assert!(preflight_zip_with_limits(&bytes, 10, 64, 128).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_cannot_replace_the_source_document() {
+        let temp = TempDir::new().unwrap();
+        let source_dir = temp.path().join("input");
+        fs::create_dir(&source_dir).unwrap();
+        let file = source_dir.join("report.txt");
+        let original = b"Original research notes.\n";
+        fs::write(&file, original).unwrap();
+        let alias_dir = temp.path().join("alias");
+        std::os::unix::fs::symlink(&source_dir, &alias_dir).unwrap();
+
+        let server = MockServer::start(&[("w", "p")]);
+        for (manifest, apply) in [(&file, false), (&alias_dir.join("report.txt"), true)] {
+            let mut args = apply_args(&file, &server.url, manifest);
+            args.apply = apply;
+            let error = run(args).await.unwrap_err();
+            assert!(error.to_string().contains("--manifest-out"), "{error:#}");
+            assert_eq!(fs::read(&file).unwrap(), original);
+        }
+        assert!(server.state().requests.is_empty());
+
+        let manifest = temp.path().join("manifest.json");
+        let mut args = apply_args(&file, &server.url, &manifest);
+        args.apply = false;
+        run(args).await.unwrap();
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(recorded["status"], "planned");
+        assert_eq!(fs::read(&file).unwrap(), original);
     }
 
     #[tokio::test]
