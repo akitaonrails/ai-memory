@@ -938,4 +938,57 @@ mod tests {
         assert_eq!(fs::read(existing).unwrap(), b"old");
         assert!(!created.exists());
     }
+
+    /// Devin's user config moves to `%APPDATA%\devin` only on Windows
+    /// (<https://docs.devin.ai/cli/reference/configuration/global-vs-local>),
+    /// so `run` sets `overrides.devin` there and nowhere else.
+    #[test]
+    fn devin_user_config_entries_follow_the_windows_root() {
+        let home = Path::new("/home/alice");
+        let cwd = Path::new("/repo");
+        let appdata_devin = Path::new("/appdata/devin");
+        let entry = |scope, target_relative: &str| AgentBackupEntry {
+            agent: AgentKind::Devin,
+            asset_kind: ai_memory_core::agent_backup::AgentAssetKind::McpConfig,
+            scope,
+            archive_path: "devin/asset".to_string(),
+            target_relative: target_relative.to_string(),
+            sanitized: false,
+            sha256: None,
+            mode: None,
+        };
+        let resolve = |scope, target_relative, devin| {
+            let overrides = TargetOverrides {
+                claude: None,
+                codex: None,
+                copilot: None,
+                devin,
+                gemini: None,
+                grok: None,
+                kiro: None,
+            };
+            resolve_target(&entry(scope, target_relative), home, cwd, overrides).unwrap()
+        };
+        let global = AgentAssetScope::Global;
+        let windows = Some(appdata_devin);
+
+        let (base, target) = resolve(global, ".config/devin/mcp_config.json", windows);
+        assert_eq!(base, appdata_devin);
+        assert_eq!(target, appdata_devin.join("mcp_config.json"));
+        let (base, target) = resolve(global, ".config/devin/skills/demo/SKILL.md", windows);
+        assert_eq!(base, appdata_devin);
+        assert_eq!(target, appdata_devin.join("skills/demo/SKILL.md"));
+
+        // Controls: no Windows root, a legacy `.devin/` entry, a project entry.
+        let (base, target) = resolve(global, ".config/devin/mcp_config.json", None);
+        assert_eq!(base, home);
+        assert_eq!(target, home.join(".config/devin/mcp_config.json"));
+        let (base, target) = resolve(global, ".devin/config.json", windows);
+        assert_eq!(base, home);
+        assert_eq!(target, home.join(".devin/config.json"));
+        let project = AgentAssetScope::Project;
+        let (base, target) = resolve(project, ".devin/skills/demo/SKILL.md", windows);
+        assert_eq!(base, cwd);
+        assert_eq!(target, cwd.join(".devin/skills/demo/SKILL.md"));
+    }
 }
