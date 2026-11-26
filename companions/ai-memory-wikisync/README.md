@@ -13,7 +13,8 @@ team's shared memory can live as reviewable markdown in git:
 - `sync --check` is a read-only CI gate, and `install-hook` runs `sync`
   after every git merge.
 
-`sync --apply` needs ai-memory 3.0 or later: every write and delete is
+`sync --apply` supports both HTTP transport modes, including
+`serve --http-stateful`. It needs ai-memory 3.0 or later: every write and delete is
 conditional on the page version the plan saw, and an older server would
 ignore that condition, so `sync` refuses to write to one.
 

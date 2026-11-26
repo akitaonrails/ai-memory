@@ -11,10 +11,13 @@
 //! refused by the server instead of overwritten.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
+use tokio::sync::OnceCell;
 use url::Url;
 
 use crate::page_file::PageMeta;
@@ -26,6 +29,8 @@ const ERROR_PREVIEW: usize = 300;
 const INVALID_REQUEST: i64 = -32600;
 /// The server release that added conditional writes and deletes.
 const MIN_SERVER: &str = "3.0";
+const MCP_SESSION_ID: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
 /// What a conditional write requires of the server's current page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +88,8 @@ pub struct McpClient {
     http: reqwest::Client,
     url: Url,
     token: Option<String>,
+    session_id: OnceCell<Option<HeaderValue>>,
+    next_request_id: AtomicU64,
 }
 
 impl McpClient {
@@ -98,7 +105,13 @@ impl McpClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| anyhow!("cannot build HTTP client: {e}"))?;
-        Ok(Self { http, url, token })
+        Ok(Self {
+            http,
+            url,
+            token,
+            session_id: OnceCell::new(),
+            next_request_id: AtomicU64::new(2),
+        })
     }
 
     /// Refuse a server that predates conditional writes. It would accept
@@ -192,12 +205,69 @@ impl McpClient {
 
     /// One JSON-RPC request; its `result`, or the error it answered with.
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let request = json!({
+        let session_id = self
+            .session_id
+            .get_or_try_init(|| self.initialize())
+            .await?;
+        let response = self
+            .post(
+                method,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": self.next_request_id.fetch_add(1, Ordering::Relaxed),
+                    "method": method,
+                    "params": params,
+                }),
+                session_id.as_ref(),
+            )
+            .await?;
+        rpc_result(method, response).await
+    }
+
+    async fn initialize(&self) -> Result<Option<HeaderValue>> {
+        let response = self.post("initialize", json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": method,
-            "params": params,
-        });
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "ai-memory-wikisync", "version": env!("CARGO_PKG_VERSION")}
+            }
+        }), None).await?;
+        let session_id = response.headers().get(MCP_SESSION_ID).cloned();
+        let result = rpc_result("initialize", response).await?;
+        if result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            bail!("MCP initialize answered without a protocol version");
+        }
+        if let Some(session_id) = &session_id {
+            let bytes = session_id.as_bytes();
+            if bytes.is_empty() || !bytes.iter().all(|b| (0x21..=0x7e).contains(b)) {
+                bail!("MCP initialize returned an invalid session id");
+            }
+            self.post(
+                "notifications/initialized",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }),
+                Some(session_id),
+            )
+            .await?;
+        }
+        Ok(session_id)
+    }
+
+    async fn post(
+        &self,
+        method: &str,
+        request: Value,
+        session_id: Option<&HeaderValue>,
+    ) -> Result<reqwest::Response> {
         let mut builder = self
             .http
             .post(self.url.clone())
@@ -212,6 +282,9 @@ impl McpClient {
         if let Some(token) = &self.token {
             builder = builder.bearer_auth(token);
         }
+        if let Some(session_id) = session_id {
+            builder = builder.header(MCP_SESSION_ID, session_id);
+        }
         let response = builder
             .send()
             .await
@@ -223,26 +296,34 @@ impl McpClient {
                  point --server at the ai-memory server itself, not a proxy or login portal"
             );
         }
-        let text = response
-            .text()
-            .await
-            .map_err(|e| anyhow!("reading the MCP {method} response failed: {e}"))?;
         if !status.is_success() {
+            let text = response
+                .text()
+                .await
+                .map_err(|e| anyhow!("reading the MCP {method} response failed: {e}"))?;
             bail!("MCP {method} returned HTTP {status}: {}", preview(&text));
         }
-        let mut message = json_rpc_message(&text)
-            .ok_or_else(|| anyhow!("MCP {method} answered with no JSON-RPC message"))?;
-        if let Some(error) = message.get("error") {
-            if let Some(failed) = precondition_failure(error) {
-                return Err(anyhow::Error::new(failed));
-            }
-            bail!("MCP {method} failed: {}", preview(&error.to_string()));
-        }
-        message
-            .get_mut("result")
-            .map(Value::take)
-            .ok_or_else(|| anyhow!("MCP {method} answered with no result"))
+        Ok(response)
     }
+}
+
+async fn rpc_result(method: &str, response: reqwest::Response) -> Result<Value> {
+    let text = response
+        .text()
+        .await
+        .map_err(|e| anyhow!("reading the MCP {method} response failed: {e}"))?;
+    let mut message = json_rpc_message(&text)
+        .ok_or_else(|| anyhow!("MCP {method} answered with no JSON-RPC message"))?;
+    if let Some(error) = message.get("error") {
+        if let Some(failed) = precondition_failure(error) {
+            return Err(anyhow::Error::new(failed));
+        }
+        bail!("MCP {method} failed: {}", preview(&error.to_string()));
+    }
+    message
+        .get_mut("result")
+        .map(Value::take)
+        .ok_or_else(|| anyhow!("MCP {method} answered with no result"))
 }
 
 /// The explicit scope every call carries.
