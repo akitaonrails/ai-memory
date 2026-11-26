@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `backup-agents` and `restore-agents` on Windows to use Devin's
+  `%APPDATA%\devin` for its global `config.json`, `mcp_config.json` and skills,
+  where `install-mcp`, `install-hooks` and `install-skills` write them. A backup
+  no longer reads `%USERPROFILE%\.config\devin` in their place, and a restore
+  writes the entries back under the destination's `%APPDATA%\devin`. (#2530)
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
