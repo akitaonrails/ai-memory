@@ -2617,8 +2617,8 @@ fn every_documented_skill_root_survives_a_backup_and_restore() {
         );
     }
 
-    // Keep the table above honest: a root the doc no longer lists, or one the
-    // test forgot, surfaces here instead of silently growing stale.
+    // Keep the table above honest: every root tested here must still appear in
+    // the design doc, so a renamed or removed matrix entry surfaces here.
     let doc = include_str!("../../../../docs/design-backup-agent-assets.md");
     for (_, root, _) in documented {
         assert!(
