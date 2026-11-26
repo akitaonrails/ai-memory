@@ -1005,6 +1005,9 @@ pub struct WorkstreamSearchArgs {
     /// Maximum events to return.
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub limit: u8,
+    /// Return the page of events older than this sequence. Cannot be combined with a text query.
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub before_sequence: Option<i64>,
     /// Emit JSON instead of readable event blocks.
     #[arg(long)]
     pub json: bool,

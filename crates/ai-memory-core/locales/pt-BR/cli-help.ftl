@@ -145,6 +145,7 @@ cli-help-root-workstream-search-about = { "Pesquisar todo o registro de eventos 
 cli-help-root-workstream-search-query-help = { "Consulta em linguagem natural ou FTS. Omita para exibir os eventos mais recentes" }
 cli-help-root-workstream-search-workstream-id-help = { "Workstream a pesquisar. Processos filhos gerenciados recebem pelo ambiente, então os agentes normalmente não precisam informar" }
 cli-help-root-workstream-search-limit-help = { "Número máximo de eventos a retornar" }
+cli-help-root-workstream-search-before-sequence-help = { "Retorna a página de eventos anteriores a esta sequência. Não pode ser combinada com uma consulta de texto" }
 cli-help-root-workstream-search-json-help = { "Emitir JSON em vez de blocos de eventos para leitura humana" }
 cli-help-root-audit-contamination-about = { "Auditar provável contaminação entre projetos no armazenamento (somente leitura e SQL). Sinaliza sessões cujo cwd resolve para outro projeto e observações cujo projeto difere do da sessão" }
 cli-help-root-audit-contamination-workspace-help = { "Restringir a auditoria a um espaço de trabalho (use junto com `--project`)" }

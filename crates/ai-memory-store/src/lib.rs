@@ -8092,6 +8092,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workstream_events_before_pages_backwards_without_gaps() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-before-sequence").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        let events = ["first", "second", "third", "fourth", "fifth"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| {
+                managed_event(
+                    &format!("ev-{index}"),
+                    AgentKind::Codex,
+                    "native-1",
+                    content,
+                )
+            })
+            .collect();
+        store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: run.run_id,
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events,
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+        let newest = store
+            .reader
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
+            .await
+            .unwrap();
+        let sequences: Vec<i64> = newest.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences.len(), 5);
+        assert!(
+            sequences.windows(2).all(|pair| pair[0] > pair[1]),
+            "newest-first read must be strictly descending: {sequences:?}"
+        );
+
+        let first_page: Vec<i64> = store
+            .reader
+            .workstream_events_before(
+                run.workstream_id,
+                sequences[2],
+                2,
+                ai_memory_core::Sanitizer::default(),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(first_page, vec![sequences[3], sequences[4]]);
+        assert!(
+            first_page[0] != first_page[1],
+            "the slice must not repeat an event"
+        );
+
+        let second_page = store
+            .reader
+            .workstream_events_before(
+                run.workstream_id,
+                first_page[1],
+                2,
+                ai_memory_core::Sanitizer::default(),
+            )
+            .await
+            .unwrap();
+        assert!(second_page.is_empty());
+    }
+
+    #[tokio::test]
     async fn finish_run_rejects_cancelled_and_unknown_runs() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();

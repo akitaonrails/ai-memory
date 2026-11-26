@@ -46,6 +46,12 @@ version in [`docs/changelog/`](docs/changelog/):
   narrows the cross-project `default_global` listing too. The TypeScript SDK
   sends it from `recent` as `pathPrefix`. (#2501)
 
+### Added
+
+- Added `workstream-search --before-sequence` and the `before_sequence` query
+  parameter on `GET /workstream/{id}/events`, so a ledger can be read backwards
+  without a text query. (#2491)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

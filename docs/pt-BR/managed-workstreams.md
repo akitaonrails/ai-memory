@@ -692,10 +692,14 @@ pesquisável de dentro de um processo de agente gerenciado:
 ```bash
 ai-memory workstream-search "scope resolver decision"
 ai-memory workstream-search --limit 50 --json "failed migration"
+ai-memory workstream-search --before-sequence 42 --limit 20
 ```
 
 `AI_MEMORY_WORKSTREAM_ID` fornece o ID automaticamente dentro do processo filho. A partir
-de outro shell, passe `--workstream-id <uuid>` explicitamente. Os resultados da pesquisa preservam
+de outro shell, passe `--workstream-id <uuid>` explicitamente. Passe
+`--before-sequence <seq>` sem uma consulta de texto para paginar para trás pelos
+eventos anteriores a `<seq>` (combinar `--before-sequence` com uma consulta de
+texto não vazia é rejeitado). Os resultados da pesquisa preservam
 o harness de origem, papel, sequência de eventos e conteúdo. A atividade histórica de ferramentas
 é rotulada como evidência concluída e nunca deve ser reproduzida como uma chamada pendente.
 

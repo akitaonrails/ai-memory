@@ -3419,6 +3419,27 @@ impl ReaderPool {
             .await
     }
 
+    /// Return the page of events strictly older than `before_sequence`, newest
+    /// first, without a text query.
+    pub async fn workstream_events_before(
+        &self,
+        workstream_id: WorkstreamId,
+        before_sequence: i64,
+        limit: usize,
+        sanitizer: ai_memory_core::Sanitizer,
+    ) -> StoreResult<Vec<WorkstreamEvent>> {
+        self.with_conn(move |conn| {
+            crate::workstream::events_before(
+                conn,
+                workstream_id,
+                before_sequence,
+                limit,
+                &sanitizer,
+            )
+        })
+        .await
+    }
+
     /// Search visible events in one managed workstream, or return its newest
     /// events when `query` is empty.
     pub async fn search_workstream_events(
