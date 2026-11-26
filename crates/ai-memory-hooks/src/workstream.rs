@@ -5913,4 +5913,213 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn search_events_before_sequence_pages_validates_and_enforces_scope() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole, WorkstreamEvent};
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let (ws, project) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
+                workspace_id: ws,
+                project_id: project,
+                repo_fingerprint: "repo-before-seq".into(),
+                worktree_fingerprint: "wt-before-seq".into(),
+                cwd: "/repo".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "launcher".into(),
+            })
+            .await
+            .unwrap();
+        let seeded: Vec<NewWorkstreamEvent> = (1..=5)
+            .map(|idx| NewWorkstreamEvent {
+                event_id: format!("before-seq-{idx}"),
+                agent: AgentKind::Codex,
+                native_session_id: "native-before-seq".into(),
+                source_record_id: Some(format!("rec-{idx}")),
+                kind: WorkstreamEventKind::Message,
+                role: Some("assistant".into()),
+                content: format!("event payload {idx} needle"),
+                occurred_at: None,
+                metadata: serde_json::Value::Null,
+            })
+            .collect();
+        let finish_resp = finish_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-before-seq".into()),
+                source_cursor: None,
+                events: seeded,
+                complete: true,
+                checkpoint: Default::default(),
+                exit_code: Some(0),
+                losses: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(finish_resp.status(), StatusCode::OK);
+
+        // (a) Happy path: page backwards by sequence without `q` (newest first).
+        let page1 = search_events(
+            State(state.clone()),
+            None,
+            None,
+            AxumPath(run.workstream_id.to_string()),
+            Query(EventQuery {
+                q: String::new(),
+                limit: 2,
+                before_sequence: Some(5),
+            }),
+        )
+        .await;
+        assert_eq!(page1.status(), StatusCode::OK);
+        let body = to_bytes(page1.into_body(), 64 * 1024).await.unwrap();
+        let events: Vec<WorkstreamEvent> = serde_json::from_slice(&body).unwrap();
+        let seqs: Vec<i64> = events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![4, 3]);
+
+        let page2 = search_events(
+            State(state.clone()),
+            None,
+            None,
+            AxumPath(run.workstream_id.to_string()),
+            Query(EventQuery {
+                q: String::new(),
+                limit: 2,
+                before_sequence: Some(3),
+            }),
+        )
+        .await;
+        assert_eq!(page2.status(), StatusCode::OK);
+        let body = to_bytes(page2.into_body(), 64 * 1024).await.unwrap();
+        let events: Vec<WorkstreamEvent> = serde_json::from_slice(&body).unwrap();
+        let seqs: Vec<i64> = events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![2, 1]);
+
+        // (b) 400 on `before_sequence` combined with a non-blank `q`.
+        let conflict = search_events(
+            State(state.clone()),
+            None,
+            None,
+            AxumPath(run.workstream_id.to_string()),
+            Query(EventQuery {
+                q: "needle".into(),
+                limit: 20,
+                before_sequence: Some(5),
+            }),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(conflict.into_body(), 64 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains("before_sequence cannot be combined with a text query"),
+            "unexpected conflict body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // (c) `before_sequence` with whitespace-only `q` succeeds.
+        let whitespace = search_events(
+            State(state.clone()),
+            None,
+            None,
+            AxumPath(run.workstream_id.to_string()),
+            Query(EventQuery {
+                q: "  \t\n ".into(),
+                limit: 2,
+                before_sequence: Some(4),
+            }),
+        )
+        .await;
+        assert_eq!(whitespace.status(), StatusCode::OK);
+        let body = to_bytes(whitespace.into_body(), 64 * 1024).await.unwrap();
+        let events: Vec<WorkstreamEvent> = serde_json::from_slice(&body).unwrap();
+        let seqs: Vec<i64> = events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![3, 2]);
+
+        // (d) Scope/auth refusal still blocks when `before_sequence` is set.
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        let carol = human("carol").await;
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .grant_memory(carol, project, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+
+        let refused = search_events(
+            State(state.clone()),
+            None,
+            Some(Extension(AuthorizedViewer(bob))),
+            AxumPath(run.workstream_id.to_string()),
+            Query(EventQuery {
+                q: String::new(),
+                limit: 2,
+                before_sequence: Some(5),
+            }),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(refused.into_body(), 64 * 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("event payload"));
+
+        let allowed = search_events(
+            State(state),
+            None,
+            Some(Extension(AuthorizedViewer(carol))),
+            AxumPath(run.workstream_id.to_string()),
+            Query(EventQuery {
+                q: String::new(),
+                limit: 2,
+                before_sequence: Some(5),
+            }),
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let body = to_bytes(allowed.into_body(), 64 * 1024).await.unwrap();
+        let events: Vec<WorkstreamEvent> = serde_json::from_slice(&body).unwrap();
+        let seqs: Vec<i64> = events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![4, 3]);
+    }
 }

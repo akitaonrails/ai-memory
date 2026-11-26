@@ -721,10 +721,14 @@ searchable from inside a managed agent process:
 ```bash
 ai-memory workstream-search "scope resolver decision"
 ai-memory workstream-search --limit 50 --json "failed migration"
+ai-memory workstream-search --before-sequence 42 --limit 20
 ```
 
 `AI_MEMORY_WORKSTREAM_ID` supplies the id automatically inside the child. From
-another shell, pass `--workstream-id <uuid>` explicitly. Search results preserve
+another shell, pass `--workstream-id <uuid>` explicitly. Pass
+`--before-sequence <seq>` without a text query to page backwards through events
+older than `<seq>` (combining `--before-sequence` with a non-blank text query is
+rejected). Search results preserve
 the source harness, role, event sequence, and content. Historical tool activity
 is labelled completed evidence and must never be replayed as a pending call.
 
