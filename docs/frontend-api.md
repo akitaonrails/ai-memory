@@ -324,6 +324,12 @@ Rules:
   only `project` to keep scoping unambiguous).
 - `scopes` (POST) is capped at `25` entries; can't be combined with
   top-level `workspace`/`project`.
+- Optional page-metadata filters `kind`, `tier`, `path_prefix` and `tag`
+  narrow the candidate set **before** ranking, on both forms. They require
+  an explicit project or scope: a global request that sets one is `400`.
+  `tier` is one of `working`, `episodic`, `semantic` or `procedural`
+  (case-insensitive; anything else is `400`). `kind`, `path_prefix` and
+  `tag` are trimmed, and an empty value means no filter.
 - `snippet` contains FTS5 HTML markers (`<mark>…</mark>`) around the
   matched terms.
 - A **global** search (no scope) is FTS5 over every project the caller may

@@ -187,3 +187,52 @@ fn pi_direct_tools_conflict_and_invalid_entries_are_rejected() {
     let stderr = String::from_utf8_lossy(&invalid.stderr);
     assert!(stderr.contains("pi_direct_tools entry"), "{stderr}");
 }
+
+#[test]
+fn preview_and_apply_follow_pi_tool_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("pi-tool-overrides.json"),
+        r#"{
+          "memory_recent": {
+            "description": "List recent pages.",
+            "params": {
+              "limit": "Max pages."
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let baseline = stdout(&install_hooks(root, "", None, false));
+    assert!(!baseline.contains("TOOL_OVERRIDES"), "{baseline}");
+
+    let cfg = "pi_tool_overrides = \"pi-tool-overrides.json\"\n";
+    let preview = stdout(&install_hooks(root, cfg, None, false));
+    assert!(preview.contains("const TOOL_OVERRIDES"), "{preview}");
+    assert!(preview.contains("List recent pages."), "{preview}");
+
+    stdout(&install_hooks(root, cfg, None, true));
+    let extension = root.join("ai-memory-pi.ts");
+    let written = std::fs::read_to_string(&extension).unwrap();
+    assert!(written.contains("const TOOL_OVERRIDES"), "{written}");
+    let again = stdout(&install_hooks(root, cfg, None, true));
+    assert!(again.contains("already up to date"), "{again}");
+
+    // Unknown tool in override file is rejected before writing anything.
+    std::fs::write(
+        root.join("bad-overrides.json"),
+        r#"{"memory_does_not_exist": {"description": "nope"}}"#,
+    )
+    .unwrap();
+    let bad = install_hooks(
+        root,
+        "pi_tool_overrides = \"bad-overrides.json\"\n",
+        None,
+        false,
+    );
+    assert!(!bad.status.success());
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(stderr.contains("unknown tool"), "{stderr}");
+}

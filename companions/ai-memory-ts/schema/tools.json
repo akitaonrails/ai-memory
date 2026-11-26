@@ -889,6 +889,12 @@
           "null"
         ]
       },
+      "path_prefix": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "project": {
         "type": [
           "null",

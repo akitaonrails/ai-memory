@@ -2694,9 +2694,46 @@ register with `exposure: "deferred"`, a concise `promptGuidelines` hint is
 attached once so the model knows to use `tool_search` for deferred memory
 tools, and `session_start` activates `tool_search` when Pi exposes
 `getActiveTools`/`setActiveTools`. Set `pi_direct_tools = []` to defer every
-ai-memory tool while still activating `tool_search`. `pi_direct_tools` is
-mutually exclusive with `pi_tool_exposure = "codemode"`. Remove the key to
+ai-memory tool while still activating `tool_search`. `pi_direct_tools` is mutually exclusive with `pi_tool_exposure = "codemode"`. Remove the key to
 return to the default extension output.
+
+#### Pi tool description and parameter overrides (`pi_tool_overrides`)
+
+To shorten the declared descriptions or trim optional parameters of chosen
+ai-memory tools in the generated Pi extension without modifying the MCP server,
+point `pi_tool_overrides` in `config.toml` (or `AI_MEMORY_PI_TOOL_OVERRIDES`)
+at a JSON file inside the config directory and regenerate the extension:
+
+```toml
+pi_tool_overrides = "pi-tool-overrides.json"
+```
+
+```json
+{
+  "memory_recent": {
+    "description": "List this project's most recently updated wiki pages, newest first.",
+    "params": {
+      "limit": "Max pages (default 10, max 100).",
+      "project": "Omit with workspace for the current project; otherwise pass both.",
+      "workspace": "Omit with project for the current project; otherwise pass both."
+    }
+  }
+}
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+For each listed tool, the bridge declares the given `description` (when set)
+and, when `params` is set, keeps only those parameters in `inputSchema.properties`
+with their replacement descriptions while preserving parameter types, enums,
+`required`, and `additionalProperties`. Unlisted tools are unchanged, and the
+server still accepts every parameter. `install-hooks` validates the file offline
+against the compiled tool catalog (rejecting path escapes, files over 64 KiB,
+unknown tools or parameters, missing required parameters, and empty or
+overlong descriptions). Works alongside `pi_tool_exposure` and
+`pi_direct_tools`. Remove the key to return to the default extension output.
 
 ### Bind mounts vs docker cp
 

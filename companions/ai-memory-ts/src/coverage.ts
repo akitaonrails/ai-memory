@@ -138,7 +138,12 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     phase: 1,
     sends: [...SCOPE, "handoff_id", "any_owner"],
   },
-  memory_recent: { status: "wrapped", methods: ["recent"], phase: 2, sends: [...SCOPE, "limit"] },
+  memory_recent: {
+    status: "wrapped",
+    methods: ["recent"],
+    phase: 2,
+    sends: [...SCOPE, "limit", "path_prefix"],
+  },
   memory_message_send: {
     status: "wrapped",
     methods: ["messages.send"],

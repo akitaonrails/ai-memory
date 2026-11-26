@@ -14,8 +14,10 @@ use anyhow::{Context, Result, bail};
 /// Longest wiki path accepted, in bytes. Stays well under the shortest
 /// common filesystem limit once joined onto a repository path.
 pub const MAX_PATH_BYTES: usize = 180;
-/// Longest single path segment accepted, in bytes.
-pub const MAX_SEGMENT_BYTES: usize = 64;
+/// Longest single path segment accepted, in bytes. Stays well under NTFS/ext4/APFS
+/// (255) and eCryptfs (143) component limits while allowing longer server-generated
+/// ASCII filenames.
+pub const MAX_SEGMENT_BYTES: usize = 128;
 /// Deepest wiki path accepted, in segments.
 pub const MAX_DEPTH: usize = 8;
 
@@ -372,6 +374,24 @@ mod tests {
         assert!(validate_page_path(&long).is_err());
         let deep = format!("{}.md", ["d"; MAX_DEPTH + 1].join("/"));
         assert!(validate_page_path(&deep).is_err());
+    }
+
+    #[test]
+    fn accepts_long_segments_up_to_limit_and_refuses_over_limit() {
+        let seg_80 = format!("{}.md", "a".repeat(77));
+        assert_eq!(seg_80.len(), 80);
+        validate_page_path(&format!("gotchas/{seg_80}")).unwrap();
+
+        let seg_128 = format!("{}.md", "a".repeat(MAX_SEGMENT_BYTES - 3));
+        assert_eq!(seg_128.len(), 128);
+        validate_page_path(&format!("gotchas/{seg_128}")).unwrap();
+
+        let seg_129 = format!("{}.md", "a".repeat(MAX_SEGMENT_BYTES - 2));
+        assert_eq!(seg_129.len(), 129);
+        let over_limit = format!("gotchas/{seg_129}");
+        assert!(over_limit.len() <= MAX_PATH_BYTES);
+        let err = validate_page_path(&over_limit).unwrap_err().to_string();
+        assert!(err.contains("non-portable path segment refused"), "{err}");
     }
 
     #[test]

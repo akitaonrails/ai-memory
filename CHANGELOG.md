@@ -18,6 +18,31 @@ version in [`docs/changelog/`](docs/changelog/):
   Providers that return only JSON continue to contribute estimates.
   ([#2498](https://github.com/akitaonrails/ai-memory/pull/2498))
 
+- Pi tool description and parameter overrides (`pi_tool_overrides` /
+  `AI_MEMORY_PI_TOOL_OVERRIDES`): operators can point to a JSON file relative
+  to the config directory (confined to that directory, max 64 KiB) to shorten
+  declared tool descriptions and/or filter declared optional parameters in the
+  generated `ai-memory-pi.ts` extension without changing the MCP server.
+  `install-hooks` validates overrides offline against the compiled MCP tool
+  catalog (`AiMemoryServer::tool_definitions()`), rejecting unknown tools or
+  parameters, missing required parameters, path escapes, and empty or overlong
+  descriptions; works orthogonally with `pi_tool_exposure` and
+  `pi_direct_tools`, and leaves output byte-identical when unset. (#2493)
+
+- Added an optional literal `path_prefix` to `memory_recent`. It lists one
+  page family, such as `decisions/`, newest first, and applies before the
+  `limit` cut, so newer pages elsewhere no longer crowd the family out; it
+  narrows the cross-project `default_global` listing too. The TypeScript SDK
+  sends it from `recent` as `pathPrefix`. (#2501)
+
+- Added `workstream-search --before-sequence` and the `before_sequence` query
+  parameter on `GET /workstream/{id}/events`, so a ledger can be read backwards
+  without a text query. (#2491)
+
+- Added optional `kind`, `tier`, `path_prefix` and `tag` filters to
+  `GET`/`POST /api/v1/search`, applied before ranking and only with an explicit
+  project or scope. (#2492)
+
 - Reported measured session token usage for OpenCode 2 and Antigravity CLI:
   OpenCode 2's generated plugin records measured assistant message/step token
   counters keyed by native message ID (`_ai_memory_usage_calls`) on `stop` and
@@ -39,6 +64,35 @@ version in [`docs/changelog/`](docs/changelog/):
   `<root>/<conversationId>/.system_generated/logs` containment plus regular-file
   `O_NOFOLLOW | O_NONBLOCK` opens, and are never read from repository
   `.ai-memory.toml` files or hook payloads. (#2453)
+
+### Fixed
+
+- Completed the English and Brazilian Portuguese help and installer
+  diagnostics for Antigravity CLI status line setup. (#2486)
+
+## [3.6.3] - 2026-11-26
+
+### Fixed
+
+- Kept repository files and their sync state when their server pages
+  reappear before `ai-memory-wikisync` applies local deletions. (#986)
+- Kept validated MCP server and tool names from Antigravity CLI tool hooks
+  while retaining the metadata-only capture policy. (#2505)
+- Raised `ai-memory-wikisync`'s per-segment filename limit (`MAX_SEGMENT_BYTES`)
+  from 64 to 128 bytes so legitimate server-generated ASCII filenames (such as
+  ~80-byte auto-improve gotcha pages) no longer abort the entire project
+  export or sync batch, while keeping `MAX_PATH_BYTES` (180), `MAX_DEPTH` (8),
+  and fail-closed rejection of unsafe paths intact. (#2488)
+- Rule-based session pages now compute `started_at` and session duration from
+  the earliest `SessionStart` observation instead of the latest one, so
+  compacted or resumed sessions no longer lose the time spent before the last
+  compaction or resume. (#2502)
+- Resuming an ended session and exiting without a user prompt or tool call no
+  longer re-ends the session, rewrites its wiki page, refreshes its
+  auto-handoff, or enqueues a duplicate LLM consolidation job. `AlreadyEnded`
+  detection now requires substantive observations past the end watermark, and
+  ended-session consolidation jobs key their generation on
+  `ended_observation_count`. (#2504)
 
 ## [3.6.2] - 2026-11-25
 
@@ -6492,7 +6546,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.3...HEAD
+[3.6.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.3
 [3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
 [3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
 [3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0

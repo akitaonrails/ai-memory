@@ -10,16 +10,19 @@ use crate::http_client::{ServerEndpoint, get_json};
 
 /// Search or tail one portable managed-workstream ledger.
 pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
+    if args.before_sequence.is_some() && !args.query.trim().is_empty() {
+        anyhow::bail!("before_sequence cannot be combined with a text query");
+    }
     let i18n = &config.i18n;
     let endpoint = ServerEndpoint::for_checkout(config).await?;
     let path = format!("/workstream/{}/events", args.workstream_id);
     let limit = args.limit.to_string();
-    let mut events: Vec<WorkstreamEvent> = get_json(
-        &endpoint,
-        &path,
-        &[("q", args.query.as_str()), ("limit", limit.as_str())],
-    )
-    .await?;
+    let before = args.before_sequence.map(|cursor| cursor.to_string());
+    let mut query: Vec<(&str, &str)> = vec![("q", args.query.as_str()), ("limit", limit.as_str())];
+    if let Some(before) = &before {
+        query.push(("before_sequence", before.as_str()));
+    }
+    let mut events: Vec<WorkstreamEvent> = get_json(&endpoint, &path, &query).await?;
     let sanitizer = Sanitizer::new(&config.sanitize)?;
     for event in &mut events {
         event.native_session_id =
@@ -76,4 +79,34 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
         println!("{}\n", terminal_body(&event.content));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ai_memory_core::WorkstreamId;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn workstream_search_rejects_before_sequence_with_query_before_endpoint_lookup() {
+        let config = Config {
+            server_url: "://unconfigured".into(),
+            ..Default::default()
+        };
+        let args = WorkstreamSearchArgs {
+            workstream_id: WorkstreamId::new(),
+            query: "migration".into(),
+            limit: 20,
+            before_sequence: Some(10),
+            json: false,
+        };
+        let err = run(&config, args)
+            .await
+            .expect_err("combining before_sequence and a non-blank query must fail locally");
+        assert!(
+            err.to_string()
+                .contains("before_sequence cannot be combined with a text query"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

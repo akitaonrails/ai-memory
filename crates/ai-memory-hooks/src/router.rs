@@ -24833,6 +24833,286 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn empty_resume_does_not_re_end_session_or_enqueue_duplicate_consolidation() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_hook_consolidator(&mut state);
+        state.consolidate_on_session_end = true;
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c02504";
+        let session_id = SessionId::from_native(sid);
+
+        let fire = |event: &str, prompt: Option<&str>, tool: Option<&str>| {
+            let mut body = serde_json::json!({ "session_id": sid });
+            if let Some(prompt) = prompt {
+                body["prompt"] = serde_json::Value::String(prompt.into());
+            }
+            if let Some(tool) = tool {
+                body["tool_name"] = serde_json::Value::String(tool.into());
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        // First life: substantive work, then SessionEnd.
+        process(&state, fire("session-start", None, None), None, Vec::new())
+            .await
+            .unwrap();
+        process(
+            &state,
+            fire("user-prompt-submit", Some("implement fix"), None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", None, Some("Bash")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(&state, fire("session-end", None, None), None, Vec::new())
+            .await
+            .unwrap();
+
+        let page_after_first_end = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path.as_str().starts_with("sessions/"))
+            .expect("first SessionEnd writes the session page");
+        let handoff_after_first_end = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .expect("first SessionEnd writes an auto-handoff");
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        let ended_count_first: u64 = db
+            .query_row(
+                "SELECT ended_observation_count FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended_count_first, 4);
+        let jobs_after_first: Vec<(u64, String)> = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT generation, state FROM session_consolidation_jobs \
+                     WHERE session_id = ?1 ORDER BY generation ASC",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![session_id.as_bytes()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(jobs_after_first, vec![(4, "pending".to_string())]);
+
+        // Empty resume: SessionStart + SessionEnd with no prompt or tool call.
+        process(&state, fire("session-start", None, None), None, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .session_end_disposition(
+                    session_id,
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                )
+                .await
+                .unwrap(),
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
+            "empty resume must classify as AlreadyEnded"
+        );
+        process(&state, fire("session-end", None, None), None, Vec::new())
+            .await
+            .unwrap();
+
+        // Verify page, handoff, watermark, SessionEnd count, and consolidation jobs are untouched.
+        let page_after_empty_resume = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path.as_str().starts_with("sessions/"))
+            .unwrap();
+        assert_eq!(
+            page_after_empty_resume.id, page_after_first_end.id,
+            "empty resume must not rewrite the session page"
+        );
+        let handoff_after_empty_resume = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            handoff_after_empty_resume.scope.id, handoff_after_first_end.scope.id,
+            "empty resume must not refresh the auto-handoff"
+        );
+        let ended_count_after_empty: u64 = db
+            .query_row(
+                "SELECT ended_observation_count FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended_count_after_empty, ended_count_first);
+        let session_end_obs_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'session-end'",
+                rusqlite::params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            session_end_obs_count, 1,
+            "empty resume must not insert a duplicate SessionEnd observation"
+        );
+        let jobs_after_empty: Vec<(u64, String)> = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT generation, state FROM session_consolidation_jobs \
+                     WHERE session_id = ?1 ORDER BY generation ASC",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![session_id.as_bytes()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            jobs_after_empty,
+            vec![(4, "pending".to_string())],
+            "empty resume must not enqueue a duplicate job or supersede the pending one"
+        );
+
+        // Crash-recovery control: if the consolidation job was lost before enqueue,
+        // AlreadyEnded recovery still enqueues generation = ended_observation_count (4).
+        db.execute(
+            "DELETE FROM session_consolidation_jobs WHERE session_id = ?1",
+            rusqlite::params![session_id.as_bytes()],
+        )
+        .unwrap();
+        process(&state, fire("session-end", None, None), None, Vec::new())
+            .await
+            .unwrap();
+        let recovered_jobs: Vec<(u64, String)> = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT generation, state FROM session_consolidation_jobs \
+                     WHERE session_id = ?1 ORDER BY generation ASC",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![session_id.as_bytes()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(recovered_jobs, vec![(4, "pending".to_string())]);
+
+        // Later real work: UserPrompt + SessionEnd must re-end, rewrite page, bump watermark,
+        // and enqueue a new consolidation generation.
+        process(
+            &state,
+            fire("user-prompt-submit", Some("follow-up prompt"), None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .session_end_disposition(
+                    session_id,
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                )
+                .await
+                .unwrap(),
+            ai_memory_store::SessionEndDisposition::ReEndWithNewWork
+        );
+        process(&state, fire("session-end", None, None), None, Vec::new())
+            .await
+            .unwrap();
+
+        let page_after_real_re_end = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path.as_str().starts_with("sessions/"))
+            .unwrap();
+        assert_ne!(
+            page_after_real_re_end.id, page_after_first_end.id,
+            "real resumed work must rewrite the session page"
+        );
+        let ended_count_after_real: u64 = db
+            .query_row(
+                "SELECT ended_observation_count FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended_count_after_real, 7);
+        let jobs_after_real: Vec<(u64, String)> = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT generation, state FROM session_consolidation_jobs \
+                     WHERE session_id = ?1 ORDER BY generation ASC",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![session_id.as_bytes()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            jobs_after_real,
+            vec![(4, "superseded".to_string()), (7, "pending".to_string())],
+            "real re-end must enqueue generation 7 and supersede generation 4"
+        );
+    }
+
+    #[tokio::test]
     async fn process_accepts_prompt_before_session_start() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
