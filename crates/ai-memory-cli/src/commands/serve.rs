@@ -22,9 +22,8 @@ use ai_memory_llm::{
 };
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
-    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
-    expire_legacy_cookie_mw, internal_auth_router, public_auth_router, require_dual_auth,
-    session_auth_router,
+    AdminState, AiMemoryServer, ScopeInvalidation, expire_legacy_cookie_mw, internal_auth_router,
+    public_auth_router, require_dual_auth, session_auth_router,
 };
 use ai_memory_store::{
     ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
@@ -1495,6 +1494,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_token_call_tool_retention_days(config.decay.token_call_tool_retention_days)
         .with_ledger_retention(config.decay.ledger_retention())
         .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_contradiction_band(config.contradiction_band_min, config.contradiction_band_max)
@@ -1767,7 +1767,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 home_dir: config.home_dir.clone(),
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
-            let admin = admin_router_with_sweep_tuning(
+            let admin = ai_memory_mcp::admin::admin_router_with_token_tool_retention(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
                     // The tool server's own instance, so /admin/metrics reads
@@ -1807,6 +1807,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
                 config.decay.ledger_retention(),
+                config.decay.token_call_tool_retention_days,
                 config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
@@ -2342,6 +2343,7 @@ async fn start_maintenance_scheduler(
                             decay.breadth_weight,
                             decay.observation_retention(),
                             decay.ledger_retention(),
+                            decay.token_call_tool_retention_days,
                             decay.compact_cold_episodic,
                             decay.cold_cluster_dedup(dedup_embedding),
                             !idle_end_enabled,
@@ -2361,6 +2363,7 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            token_call_tools_pruned = outcome.token_call_tools_pruned,
                             abandoned_sessions_closed = outcome.abandoned_sessions_closed,
                             ledgers_pruned = outcome.ledgers_pruned,
                             ledger_bytes_pruned = outcome.ledger_bytes_pruned,
@@ -2907,6 +2910,7 @@ struct ScheduledSweepTickOutcome {
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
+    token_call_tools_pruned: usize,
     ledgers_pruned: usize,
     ledger_bytes_pruned: u64,
     ledgers_undeleted: usize,
@@ -2925,6 +2929,7 @@ async fn run_scheduled_sweep_tick(
     breadth_weight: f64,
     retention: ObservationRetention,
     ledgers: ai_memory_consolidate::LedgerRetention,
+    token_call_tool_retention_days: i64,
     compact_cold_episodic: bool,
     dedup: ai_memory_consolidate::ColdClusterDedup,
     close_abandoned_sessions: bool,
@@ -2936,7 +2941,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match ai_memory_consolidate::run_sweep_with_ledgers(
+        match ai_memory_consolidate::run_sweep_with_token_tool_retention(
             reader,
             writer,
             Some(wiki),
@@ -2948,6 +2953,7 @@ async fn run_scheduled_sweep_tick(
             compact_cold_episodic,
             dedup.clone(),
             ledgers,
+            token_call_tool_retention_days,
             false,
         )
         .await
@@ -2963,6 +2969,7 @@ async fn run_scheduled_sweep_tick(
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
+                outcome.token_call_tools_pruned += report.token_call_tools_pruned;
                 outcome.ledgers_pruned += report.ledgers_pruned;
                 outcome.ledger_bytes_pruned += report.ledger_bytes_pruned;
                 outcome.ledgers_undeleted += report.ledgers_undeleted;
@@ -7340,6 +7347,7 @@ mod tests {
             0.0,
             ObservationRetention::default(),
             ai_memory_consolidate::LedgerRetention::default(),
+            0,
             false,
             ai_memory_consolidate::ColdClusterDedup::default(),
             true,

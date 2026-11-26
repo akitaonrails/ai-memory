@@ -240,6 +240,12 @@ pub struct SweepReport {
     pub observation_prune_sessions: usize,
     /// Transactions the prune spent. Makes the batching bound observable.
     pub observation_prune_batches: usize,
+    /// Tool references matching the token retention predicate at sweep start.
+    pub token_call_tools_prunable: usize,
+    /// Tool references deleted in this sweep (zero on dry-run).
+    pub token_call_tools_pruned: usize,
+    /// Number of bounded token-call-tool prune transactions.
+    pub token_call_tool_prune_batches: usize,
     /// Old hook event ledgers (`log-YYYY-MM.md`) the ledger pass matched.
     /// Reported in both modes; `0` when ledger retention is disabled (the
     /// default) or the caller has no wiki handle.
@@ -333,6 +339,9 @@ pub enum SweepError {
     /// The opt-in observation retention age was negative.
     #[error("decay observation_retention_days must be greater than or equal to zero")]
     InvalidObservationRetention,
+    /// The token call tool retention age was negative.
+    #[error("decay token_call_tool_retention_days must be greater than or equal to zero")]
+    InvalidTokenCallToolRetention,
     /// The opt-in ledger retention age was negative.
     #[error("decay ledger_retention_months must be greater than or equal to zero")]
     InvalidLedgerRetention,
@@ -580,6 +589,46 @@ pub async fn run_sweep_with_ledgers(
         compact_cold_episodic,
         dedup,
         ledgers,
+        0,
+        Timestamp::now(),
+        dry_run,
+    )
+    .await
+}
+
+/// Run a sweep with the opt-in token call tool retention age.
+///
+/// # Errors
+/// Returns an error for invalid retention or a store failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sweep_with_token_tool_retention(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: Option<&Wiki>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+    compact_cold_episodic: bool,
+    dedup: ColdClusterDedup,
+    ledgers: LedgerRetention,
+    token_call_tool_retention_days: i64,
+    dry_run: bool,
+) -> Result<SweepReport, SweepError> {
+    run_sweep_at(
+        reader,
+        writer,
+        wiki,
+        workspace_id,
+        project_id,
+        params,
+        breadth_weight,
+        retention,
+        compact_cold_episodic,
+        dedup,
+        ledgers,
+        token_call_tool_retention_days,
         Timestamp::now(),
         dry_run,
     )
@@ -613,6 +662,7 @@ pub(crate) async fn run_sweep_at(
     compact_cold_episodic: bool,
     dedup: ColdClusterDedup,
     ledgers: LedgerRetention,
+    token_call_tool_retention_days: i64,
     now: Timestamp,
     dry_run: bool,
 ) -> Result<SweepReport, SweepError> {
@@ -621,6 +671,9 @@ pub(crate) async fn run_sweep_at(
     }
     if retention.days < 0 {
         return Err(SweepError::InvalidObservationRetention);
+    }
+    if token_call_tool_retention_days < 0 {
+        return Err(SweepError::InvalidTokenCallToolRetention);
     }
     if ledgers.months < 0 {
         return Err(SweepError::InvalidLedgerRetention);
@@ -962,6 +1015,29 @@ pub(crate) async fn run_sweep_at(
         }
     }
 
+    let mut token_call_tools_prunable = 0;
+    let mut token_call_tools_pruned = 0;
+    let mut token_call_tool_prune_batches = 0;
+    if token_call_tool_retention_days > 0 && retention.batch > 0 {
+        let cutoff =
+            now_us.saturating_sub(token_call_tool_retention_days.saturating_mul(US_PER_DAY_I64));
+        token_call_tools_prunable = reader
+            .prunable_token_call_tool_count(workspace_id, project_id, cutoff)
+            .await?;
+        if !dry_run {
+            loop {
+                let n = writer
+                    .prune_token_call_tools(workspace_id, project_id, cutoff, retention.batch)
+                    .await?;
+                token_call_tools_pruned += n;
+                token_call_tool_prune_batches += 1;
+                if n < retention.batch {
+                    break;
+                }
+            }
+        }
+    }
+
     // Event ledger pass, last: files, not pages, so nothing above depends on it
     // and it depends on nothing above. Both modes list; only a real run deletes.
     let ledger_outcome = match wiki {
@@ -992,6 +1068,9 @@ pub(crate) async fn run_sweep_at(
         observations_pruned,
         observation_prune_sessions,
         observation_prune_batches,
+        token_call_tools_prunable,
+        token_call_tools_pruned,
+        token_call_tool_prune_batches,
         ledgers_prunable: ledger_outcome.matched,
         ledger_bytes_prunable: ledger_outcome.matched_bytes,
         ledgers_pruned: ledger_outcome.deleted,

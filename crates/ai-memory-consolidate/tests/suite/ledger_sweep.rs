@@ -131,6 +131,7 @@ async fn sweep(fx: &Fixture, project: ProjectId, months: i64, dry_run: bool) -> 
         false,
         ColdClusterDedup::default(),
         LedgerRetention { months },
+        0,
         now(),
         dry_run,
     )
@@ -458,6 +459,7 @@ async fn a_rejecting_admission_webhook_keeps_the_ledger_and_the_report_says_so()
         false,
         ColdClusterDedup::default(),
         LedgerRetention { months: 3 },
+        0,
         now(),
         false,
     )

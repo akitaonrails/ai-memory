@@ -5608,6 +5608,27 @@ pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "EXISTS ( \
     WHERE current.session_id = s.id \
 )";
 
+/// Delete one bounded batch of tool references for old calls in closed sessions.
+/// Calls and session totals are retained.
+///
+/// # Errors
+/// Propagates SQLite errors.
+pub fn prune_token_call_tools(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    cutoff_us: i64,
+    batch: usize,
+) -> StoreResult<usize> {
+    if batch == 0 {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    let n = tx.execute("DELETE FROM token_call_tools WHERE (session_id, call_id, tool_id, relation) IN (SELECT t.session_id, t.call_id, t.tool_id, t.relation FROM sessions s JOIN token_calls c ON c.session_id=s.id JOIN token_call_tools t ON t.session_id=c.session_id AND t.call_id=c.call_id WHERE s.workspace_id=?1 AND s.project_id=?2 AND s.ended_at IS NOT NULL AND c.observed_at < ?3 LIMIT ?4)", params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us, i64::try_from(batch).unwrap_or(i64::MAX)])?;
+    tx.commit()?;
+    Ok(n)
+}
+
 /// Permanently delete one bounded batch of raw observations belonging to
 /// sessions that were already distilled into a live summary page.
 ///
@@ -10859,6 +10880,124 @@ pub(crate) mod tests {
             rename_workspace(&mut conn, &ws, "   ").unwrap_err(),
             StoreError::InvalidWorkspaceName(_)
         ));
+    }
+
+    #[test]
+    fn token_retention_preserves_scope_boundary_tools_and_totals() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let closed = SessionId::new();
+        let open = SessionId::new();
+        let foreign = SessionId::new();
+        for (sid, project, ended) in [
+            (closed, proj, true),
+            (open, proj, false),
+            (foreign, other, true),
+        ] {
+            begin_session(&mut conn, &hook_session(sid, ws, project, None)).unwrap();
+            if ended {
+                conn.execute(
+                    "UPDATE sessions SET ended_at=1 WHERE id=?1",
+                    params![sid.as_bytes()],
+                )
+                .unwrap();
+            }
+            for (id, at) in [("old", 99_i64), ("boundary", 100)] {
+                conn.execute("INSERT INTO token_calls(session_id,call_id,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,observed_at) VALUES(?1,?2,10,2,0,0,?3)", params![sid.as_bytes(),id,at]).unwrap();
+                conn.execute("INSERT INTO token_call_tools(session_id,call_id,tool_id,tool_name,relation) VALUES(?1,?2,'t','test','requested')", params![sid.as_bytes(),id]).unwrap();
+            }
+        }
+        conn.execute("INSERT INTO session_usage(session_id,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,updated_at) VALUES(?1,25,4,0,0,1)", params![closed.as_bytes()]).unwrap();
+        assert_eq!(
+            prune_token_call_tools(&mut conn, ws, proj, 100, 1).unwrap(),
+            1
+        );
+        assert_eq!(
+            prune_token_call_tools(&mut conn, ws, proj, 100, 1).unwrap(),
+            0
+        );
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM token_calls"), 6);
+        assert_eq!(count("SELECT COUNT(*) FROM token_call_tools"), 5);
+        assert_eq!(count("SELECT input_tokens FROM session_usage"), 25);
+        for sid in [open, foreign] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM token_call_tools WHERE session_id=?1 AND call_id='old'",
+                    params![sid.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM token_call_tools WHERE session_id=?1 AND call_id='boundary'",
+                params![closed.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn token_tool_prune_then_resume_preserves_call_identity_and_totals() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        let call = |id: &str, input| ai_memory_core::TokenCall {
+            context: None,
+            call_id: id.into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            model: None,
+        };
+        let old = call("old", 20);
+        upsert_token_calls(&mut conn, sid, std::slice::from_ref(&old)).unwrap();
+        conn.execute(
+            "UPDATE token_calls SET observed_at=1 WHERE session_id=?1",
+            params![sid.as_bytes()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO token_call_tools(session_id,call_id,tool_id,tool_name,relation) VALUES(?1,'old','t','test','requested')", params![sid.as_bytes()]).unwrap();
+        conn.execute(
+            "UPDATE sessions SET ended_at=1 WHERE id=?1",
+            params![sid.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            prune_token_call_tools(&mut conn, ws, proj, 2, 1).unwrap(),
+            1
+        );
+        let n: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM session_usage WHERE session_id=?1",
+                params![sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 20);
+        let old_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM token_calls WHERE session_id=?1 AND call_id='old'",
+                params![sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_count, 1,
+            "prune must preserve the original call before replay"
+        );
+        conn.execute(
+            "UPDATE sessions SET ended_at=NULL WHERE id=?1",
+            params![sid.as_bytes()],
+        )
+        .unwrap();
+        upsert_token_calls(&mut conn, sid, &[old, call("new", 10)]).unwrap();
+        let result: (i64, i64) = conn.query_row("SELECT input_tokens,(SELECT COUNT(*) FROM token_calls WHERE session_id=?1) FROM session_usage WHERE session_id=?1", params![sid.as_bytes()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(result, (30, 2));
     }
 
     #[test]

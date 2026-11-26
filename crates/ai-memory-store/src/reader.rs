@@ -7812,6 +7812,22 @@ impl ReaderPool {
         .await
     }
 
+    /// Count tool references of old calls belonging to closed sessions in the given scope.
+    ///
+    /// # Errors
+    /// Propagates SQL errors.
+    pub async fn prunable_token_call_tool_count(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+    ) -> StoreResult<usize> {
+        self.with_conn(move |conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions s JOIN token_calls c ON c.session_id=s.id JOIN token_call_tools t ON t.session_id=c.session_id AND t.call_id=c.call_id WHERE s.workspace_id=?1 AND s.project_id=?2 AND s.ended_at IS NOT NULL AND c.observed_at < ?3", params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us], |row| row.get(0))?;
+            Ok(usize::try_from(n).unwrap_or(0))
+        }).await
+    }
+
     /// Count the observations the prune pass would delete for this scope.
     ///
     /// Same predicate as

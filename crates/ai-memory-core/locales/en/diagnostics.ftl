@@ -1050,3 +1050,5 @@ diag-verifying-redacted-config = verifying redacted config for { $value0 }
 diag-pi-direct-tools-codemode-conflict = pi_direct_tools and pi_tool_exposure = "codemode" are mutually exclusive; remove pi_direct_tools or set pi_tool_exposure = "direct"
 diag-pi-direct-tools-too-many = pi_direct_tools may list at most { $max } tools (got { $count })
 diag-pi-direct-tools-invalid-entry = pi_direct_tools entry `{ $tool }` is invalid; tool names must be non-empty, at most { $max } characters, and use only ASCII letters, digits, `_`, or `-`
+
+diag-decay-token-call-tool-retention-days-must-be-greater = decay.token_call_tool_retention_days must be greater than or equal to zero (0 disables token call tool pruning)

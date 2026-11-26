@@ -237,6 +237,10 @@ from hook paths.
    `memory_explore` (the pages it surfaces) bump the same counters through the
    same throttled, FTS-exempt path, so a page a human opens directly or the
    graph surfaces resists decay like a query hit (design-memory-aging.md C1).
+   An opt-in token call tool pass deletes tool references belonging to calls older
+   than `[decay] token_call_tool_retention_days` in closed sessions of the selected
+   scope, using observation-sized transactions. Calls and `session_usage` are
+   retained. Dry-run counts without deleting. Zero disables it.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
@@ -895,7 +899,7 @@ long-lived entry there is expected policy behavior, not a fault.
 | `memory_write_pages_batch` | destructive | Write 1-100 complete page versions atomically into one existing project, selected by `workspace` + `project` or stable `project_id`. Every entry is conditional (`create_only` or `expected_page_id`), duplicate paths are refused, each body is capped at 1 MiB and the aggregate at 8 MiB. Admission, sanitization, attribution, index updates and rollback use the same `Wiki::apply_batch_if` boundary; one mismatch returns its request index/current id and writes nothing. Intended for bounded companion imports, not routine agent notes. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`; `scope: "profile"` deletes from the caller's cross-project profile. Fires the admission chain (op=delete); idempotent. Optional `expected_page_id` deletes only if that is still the latest version (a blank one is refused, not ignored); otherwise nothing is deleted and the call returns `reason: "precondition_failed"`. |
 | `memory_restore_page` | destructive | Admin only, like `/admin/restore-page`. Without `rev`, list the git checkpoints that changed `path`. With `rev`, write that version (body and frontmatter metadata) back through the `memory_write_page` path (sanitizer, admission, slots, supersession), including a deleted page. Purged session summaries are refused before writing. Project pages only, not `scope: "profile"`. |
-| `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
+| `memory_forget_sweep` | destructive | Retention pass: hard-delete TTL-expired pages, evict cold pages through the wiki layer, purge aged tombstone ancestry, and, when opted in, prune raw observations of consolidated sessions (`observation_retention_days`), old hook event ledgers (`ledger_retention_months`) and the tool context of old token calls in closed sessions (`token_call_tool_retention_days`; calls and session totals are kept). `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM similarity candidate detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the `contradiction_band_min`–`contradiction_band_max` cosine-similarity band (default 0.4–0.75; "same topic, not a near-duplicate"; at/above the max is A3 dedup, below the min unrelated) get an advisory `similarity_candidate` finding. Similarity alone never claims contradiction or supersession; explicit `contradicts` edges still emit `contradiction`. The scan is bounded (one embeddings load over the capped cold set, capped findings, deterministic), a clean no-op with no embedder configured, and advisory-only (never deletes/edits/supersedes a page and persists no edge, invariants #13, #16, #2), so it needs no migration. On a single-language or single-domain store, background similarity between unrelated pages can sit above the default floor; raise `contradiction_band_min` (`config.toml` or `AI_MEMORY_CONTRADICTION_BAND_MIN`) to trim that review queue. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 
@@ -1368,6 +1372,7 @@ cold_threshold = 0.20              # below this → remove file + retain tombsto
 hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 observation_retention_days = 0     # 0 = never prune raw observations
+token_call_tool_retention_days = 0      # 0 = never prune tools of closed-session calls
 observation_prune_batch = 5000     # rows per prune transaction
 ledger_retention_months = 0        # 0 = never delete hook event ledgers; N > 0 =
                                    # delete a log-YYYY-MM.md N whole months after

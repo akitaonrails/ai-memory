@@ -1059,3 +1059,5 @@ diag-verifying-redacted-config = verificando configuração redigida para { $val
 diag-pi-direct-tools-codemode-conflict = pi_direct_tools e pi_tool_exposure = "codemode" são mutuamente exclusivos; remova pi_direct_tools ou defina pi_tool_exposure = "direct"
 diag-pi-direct-tools-too-many = pi_direct_tools pode listar no máximo { $max } ferramentas (recebido { $count })
 diag-pi-direct-tools-invalid-entry = a entrada `{ $tool }` em pi_direct_tools é inválida; nomes de ferramentas não podem ser vazios, devem ter no máximo { $max } caracteres e usar apenas letras ASCII, dígitos, `_` ou `-`
+
+diag-decay-token-call-tool-retention-days-must-be-greater = decay.token_call_tool_retention_days precisa ser maior ou igual a zero (0 desativa a remoção de ferramentas das chamadas de tokens)
