@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Raised `ai-memory-wikisync`'s per-segment filename limit (`MAX_SEGMENT_BYTES`)
+  from 64 to 128 bytes so legitimate server-generated ASCII filenames (such as
+  ~80-byte auto-improve gotcha pages) no longer abort the entire project
+  export or sync batch, while keeping `MAX_PATH_BYTES` (180), `MAX_DEPTH` (8),
+  and fail-closed rejection of unsafe paths intact. (#2488)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
