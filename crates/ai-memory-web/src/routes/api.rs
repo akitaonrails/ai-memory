@@ -487,11 +487,7 @@ async fn search_with_request(
     let filter = search_page_filter(&request)?;
     let hits = match scoped_search_mode(state, &request, viewer).await? {
         SearchMode::Global => {
-            let filtered = filter.kind.is_some()
-                || filter.tier.is_some()
-                || filter.path_prefix.is_some()
-                || filter.tag.is_some();
-            if filtered {
+            if filter.is_active() {
                 return Err(json_error(
                     StatusCode::BAD_REQUEST,
                     "filters require an explicit project or scope",
@@ -521,19 +517,44 @@ async fn search_with_request(
     ))
 }
 
+#[allow(clippy::result_large_err)] // the handler error is the router's `Response`.
+fn bounded_search_filter<'a>(
+    name: &str,
+    value: Option<&'a str>,
+    max_len: usize,
+) -> Result<Option<&'a str>, Response> {
+    let Some(value) = trimmed_opt(value) else {
+        return Ok(None);
+    };
+    if value.chars().take(max_len + 1).count() > max_len || value.chars().any(char::is_control) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{name} must be at most {max_len} characters and contain no control characters"
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
 /// Validate the optional page-metadata filters and borrow them from
 /// `request` for the store's pre-ranking `PageFilter`.
 #[allow(clippy::result_large_err)] // the handler error is the router's `Response`.
 fn search_page_filter(
     request: &SearchRequest,
 ) -> Result<ai_memory_store::PageFilter<'_>, Response> {
-    let kind = match trimmed_opt(request.kind.as_deref()) {
-        Some(kind) if kind.len() > ai_memory_core::page::MAX_PAGE_KIND_LEN => {
-            return Err(json_error(StatusCode::BAD_REQUEST, "kind is too long"));
-        }
-        other => other,
-    };
-    let tier = match trimmed_opt(request.tier.as_deref()) {
+    let kind = bounded_search_filter(
+        "kind",
+        request.kind.as_deref(),
+        ai_memory_core::page::MAX_PAGE_KIND_LEN,
+    )?;
+    let path_prefix = bounded_search_filter(
+        "path_prefix",
+        request.path_prefix.as_deref(),
+        MAX_QUERY_PATH_PREFIX_LEN,
+    )?;
+    let tag = bounded_search_filter("tag", request.tag.as_deref(), MAX_QUERY_TAG_LEN)?;
+    let tier = match bounded_search_filter("tier", request.tier.as_deref(), 16)? {
         Some(tier) => Some(
             ai_memory_core::Tier::ALL
                 .iter()
@@ -547,21 +568,6 @@ fn search_page_filter(
                 })?,
         ),
         None => None,
-    };
-    let path_prefix = match trimmed_opt(request.path_prefix.as_deref()) {
-        Some(path_prefix) if path_prefix.len() > MAX_SEARCH_FILTER_LEN => {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "path_prefix is too long",
-            ));
-        }
-        other => other,
-    };
-    let tag = match trimmed_opt(request.tag.as_deref()) {
-        Some(tag) if tag.len() > MAX_SEARCH_FILTER_LEN => {
-            return Err(json_error(StatusCode::BAD_REQUEST, "tag is too long"));
-        }
-        other => other,
     };
     Ok(ai_memory_store::PageFilter {
         kind,
@@ -1521,7 +1527,8 @@ fn default_limit() -> usize {
 }
 
 const MAX_SEARCH_SCOPES: usize = 25;
-const MAX_SEARCH_FILTER_LEN: usize = 512;
+const MAX_QUERY_PATH_PREFIX_LEN: usize = 1_024;
+const MAX_QUERY_TAG_LEN: usize = 128;
 
 #[derive(Debug, Deserialize)]
 struct ProjectListQuery {
