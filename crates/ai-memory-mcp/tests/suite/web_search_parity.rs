@@ -42,6 +42,7 @@ struct Seeded {
     wiki: Wiki,
     ws: WorkspaceId,
     alpha: ProjectId,
+    beta: ProjectId,
 }
 
 const ALPHA_PAGES: &[(&str, &str)] = &[
@@ -160,6 +161,7 @@ async fn seed() -> Seeded {
         wiki: wiki.without_embedder(),
         ws,
         alpha,
+        beta,
     }
 }
 
@@ -295,6 +297,33 @@ async fn api_paths(router: &Router, query: &str) -> Vec<String> {
     paths(&serde_json::from_str(&body).unwrap())
 }
 
+async fn post_json(router: &Router, uri: &str, body: Value) -> (u16, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4_000_000)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+async fn api_paths_of(router: &Router, uri: &str) -> Vec<String> {
+    let (status, body) = get(router, uri).await;
+    assert_eq!(status, 200, "{body}");
+    paths(&serde_json::from_str(&body).unwrap())
+}
+
+async fn api_post_paths(router: &Router, body: Value) -> Vec<String> {
+    let (status, resp) = post_json(router, "/api/v1/search", body).await;
+    assert_eq!(status, 200, "{resp}");
+    paths(&serde_json::from_str(&resp).unwrap())
+}
+
 /// Hit paths in page order, read from the `data-hit-path` attribute.
 fn html_paths(body: &str) -> Vec<String> {
     body.split("data-hit-path=\"")
@@ -414,6 +443,259 @@ async fn scoped_api_search_merges_scopes_like_memory_query() {
             .unwrap();
         let got = paths(&serde_json::from_slice(&bytes).unwrap());
         assert_eq!(got, expected, "{query}: scopes");
+    }
+}
+
+/// Page-metadata filters narrow the candidate set before the limit and rank,
+/// so a filtered `limit = 1` returns the best hit *inside* the filter even
+/// though the unfiltered top hit is outside it.
+#[tokio::test]
+async fn api_search_applies_metadata_filters_before_ranking() {
+    let s = seed().await;
+    let outside = "notes/zorblat.md";
+    let inside = "decisions/zorblat.md";
+    for (path, body) in [
+        (outside, "# Zorblat\n\nZorblat lives in the notes tree."),
+        (inside, "# Zorblat\n\nZorblat lives in the decisions tree."),
+    ] {
+        s.wiki
+            .write_page(write_req(s.ws, s.alpha, path, body))
+            .await
+            .unwrap();
+    }
+    let web = web(&s, None);
+    let base = "/api/v1/search?q=zorblat&workspace=default&project=alpha";
+
+    let top = api_paths_of(&web, &format!("{base}&limit=1")).await;
+    assert_eq!(top.len(), 1, "{top:?}");
+    let (higher, lower, prefix) = match top[0].as_str() {
+        path if path == outside => (outside, inside, "decisions/"),
+        path if path == inside => (inside, outside, "notes/"),
+        other => panic!("unexpected unfiltered hit: {other}"),
+    };
+
+    assert_eq!(
+        api_paths_of(&web, &format!("{base}&limit=1&path_prefix={prefix}")).await,
+        vec![lower.to_owned()],
+        "the filter must run before the limit cut, not after"
+    );
+    assert_eq!(
+        api_paths_of(&web, &format!("{base}&limit=1")).await,
+        vec![higher.to_owned()],
+        "the unfiltered request must keep returning the other page"
+    );
+
+    let (status, body) = get(&web, "/api/v1/search?q=zorblat&kind=fact").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("explicit project or scope"), "{body}");
+}
+
+#[tokio::test]
+async fn api_search_post_filters_and_validation_match_mcp() {
+    let s = seed().await;
+    let mut proc_page = write_req(
+        s.ws,
+        s.alpha,
+        "procedures/quasar.md",
+        "# Quasar runbook\n\nQuasar procedure for rotating vault keys.",
+    );
+    proc_page.tier = Tier::Procedural;
+    proc_page.frontmatter = json!({"kind": "procedure", "tags": ["ops-runbook"]});
+    s.wiki.write_page(proc_page).await.unwrap();
+
+    let mut dec_page = write_req(
+        s.ws,
+        s.alpha,
+        "decisions/quasar.md",
+        "# Quasar decision\n\nQuasar decision to keep signing keys in the vault.",
+    );
+    dec_page.tier = Tier::Semantic;
+    dec_page.frontmatter = json!({"kind": "decision", "tags": ["arch"]});
+    s.wiki.write_page(dec_page).await.unwrap();
+
+    let mut beta_page = write_req(
+        s.ws,
+        s.beta,
+        "procedures/beta-quasar.md",
+        "# Beta quasar runbook\n\nQuasar procedure for beta cluster.",
+    );
+    beta_page.tier = Tier::Procedural;
+    beta_page.frontmatter = json!({"kind": "procedure", "tags": ["ops-runbook"]});
+    s.wiki.write_page(beta_page).await.unwrap();
+
+    let web = web(&s, None);
+
+    // POST JSON body filters: kind, tier (including case-insensitive), path_prefix, tag.
+    assert_eq!(
+        api_post_paths(
+            &web,
+            json!({
+                "q": "quasar",
+                "workspace": "default",
+                "project": "alpha",
+                "kind": "decision",
+            })
+        )
+        .await,
+        vec!["decisions/quasar.md"]
+    );
+    assert_eq!(
+        api_post_paths(
+            &web,
+            json!({
+                "q": "quasar",
+                "workspace": "default",
+                "project": "alpha",
+                "tier": "SEMANTIC",
+            })
+        )
+        .await,
+        vec!["decisions/quasar.md"]
+    );
+    assert_eq!(
+        api_post_paths(
+            &web,
+            json!({
+                "q": "quasar",
+                "workspace": "default",
+                "project": "alpha",
+                "path_prefix": "procedures/",
+            })
+        )
+        .await,
+        vec!["procedures/quasar.md"]
+    );
+    assert_eq!(
+        api_post_paths(
+            &web,
+            json!({
+                "q": "quasar",
+                "workspace": "default",
+                "project": "alpha",
+                "tag": "ops-runbook",
+            })
+        )
+        .await,
+        vec!["procedures/quasar.md"]
+    );
+
+    // Multi-scope POST with filters returns matching hits across both scopes.
+    let mut multi = api_post_paths(
+        &web,
+        json!({
+            "q": "quasar",
+            "scopes": [
+                {"workspace": "default", "project": "alpha"},
+                {"workspace": "default", "project": "beta"}
+            ],
+            "tier": "PROCEDURAL",
+            "tag": "ops-runbook",
+        }),
+    )
+    .await;
+    multi.sort();
+    assert_eq!(
+        multi,
+        vec!["procedures/beta-quasar.md", "procedures/quasar.md"]
+    );
+
+    // Case-insensitive tier on GET and invalid tier -> 400 on GET and POST.
+    assert_eq!(
+        api_paths_of(
+            &web,
+            "/api/v1/search?q=quasar&workspace=default&project=alpha&tier=SEMANTIC"
+        )
+        .await,
+        vec!["decisions/quasar.md"]
+    );
+    let (status, body) = get(
+        &web,
+        "/api/v1/search?q=quasar&workspace=default&project=alpha&tier=bogus",
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = post_json(
+        &web,
+        "/api/v1/search",
+        json!({
+            "q": "quasar",
+            "workspace": "default",
+            "project": "alpha",
+            "tier": "bogus",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    // Empty/whitespace filter on global search is ignored and returns 200.
+    let (status, body) = get(&web, "/api/v1/search?q=quasar&kind=").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = get(&web, "/api/v1/search?q=quasar&kind=%20%20").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_json(
+        &web,
+        "/api/v1/search",
+        json!({
+            "q": "quasar",
+            "kind": "   ",
+            "tag": "",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Char-count bounds match MCP: multi-byte chars at exact limit succeed; limit+1 fails.
+    let exact_kind = "é".repeat(ai_memory_core::page::MAX_PAGE_KIND_LEN);
+    let (status, body) = post_json(
+        &web,
+        "/api/v1/search",
+        json!({
+            "q": "quasar",
+            "workspace": "default",
+            "project": "alpha",
+            "kind": exact_kind,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let exact_prefix = "a".repeat(1_024);
+    let (status, body) = post_json(
+        &web,
+        "/api/v1/search",
+        json!({
+            "q": "quasar",
+            "workspace": "default",
+            "project": "alpha",
+            "path_prefix": exact_prefix,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    for (field, value) in [
+        (
+            "kind",
+            "é".repeat(ai_memory_core::page::MAX_PAGE_KIND_LEN + 1),
+        ),
+        ("path_prefix", "a".repeat(1_025)),
+        ("tag", "é".repeat(129)),
+        ("kind", "fact\u{0000}x".to_owned()),
+        ("path_prefix", "notes/\u{0007}bad".to_owned()),
+        ("tag", "ops\nbad".to_owned()),
+    ] {
+        let (status, body) = post_json(
+            &web,
+            "/api/v1/search",
+            json!({
+                "q": "quasar",
+                "workspace": "default",
+                "project": "alpha",
+                field: value,
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{field} should be rejected: {body}");
     }
 }
 

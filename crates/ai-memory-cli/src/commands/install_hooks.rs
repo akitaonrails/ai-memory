@@ -1226,15 +1226,21 @@ fn run_with_hook_connection(
             AgentChoice::OpenCode2 => {
                 apply_to_opencode2_plugin(&config.i18n, &server_url, auth, &args, &capture_mode)
             }
-            AgentChoice::Pi => apply_to_pi_extension(
-                &config.i18n,
-                &server_url,
-                auth,
-                &args,
-                &capture_mode,
-                config.pi_tool_exposure,
-                config.pi_direct_tools.as_deref(),
-            ),
+            AgentChoice::Pi => {
+                let tool_overrides = config.load_pi_tool_overrides()?;
+                apply_to_pi_extension(
+                    &config.i18n,
+                    &server_url,
+                    auth,
+                    &args,
+                    &capture_mode,
+                    PiToolOptions {
+                        exposure: config.pi_tool_exposure,
+                        direct_tools: config.pi_direct_tools.as_deref(),
+                        tool_overrides: tool_overrides.as_ref(),
+                    },
+                )
+            }
             AgentChoice::Omp => {
                 apply_to_omp_extension(&config.i18n, &server_url, auth, &args, &capture_mode)
             }
@@ -1507,15 +1513,21 @@ fn run_with_hook_connection(
             &preview_capture_mode,
             args.capture_assistant,
         ),
-        AgentChoice::Pi => render_pi_extension(
-            &server_url,
-            auth,
-            strategy,
-            &preview_capture_mode,
-            args.capture_assistant,
-            config.pi_tool_exposure,
-            config.pi_direct_tools.as_deref(),
-        ),
+        AgentChoice::Pi => {
+            let tool_overrides = config.load_pi_tool_overrides()?;
+            render_pi_extension(
+                &server_url,
+                auth,
+                strategy,
+                &preview_capture_mode,
+                args.capture_assistant,
+                PiToolOptions {
+                    exposure: config.pi_tool_exposure,
+                    direct_tools: config.pi_direct_tools.as_deref(),
+                    tool_overrides: tool_overrides.as_ref(),
+                },
+            )
+        }
         AgentChoice::Omp => render_omp_extension(
             &server_url,
             auth,
@@ -6877,25 +6889,30 @@ fn resolve_omp_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
     omp_extension_path(args.profile.as_deref())
 }
 
+#[derive(Clone, Copy)]
+struct PiToolOptions<'a> {
+    exposure: PiToolExposure,
+    direct_tools: Option<&'a [String]>,
+    tool_overrides: Option<&'a std::collections::BTreeMap<String, crate::config::PiToolOverride>>,
+}
+
 fn apply_to_pi_extension(
     i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
     capture_mode: &str,
-    exposure: PiToolExposure,
-    direct_tools: Option<&[String]>,
+    tool_options: PiToolOptions<'_>,
 ) -> Result<()> {
     let path = resolve_pi_extension_path(args)?;
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_pi_extension(
+    let body = build_pi_extension_with_options(
         server_url,
         auth_token,
         strategy,
         capture_mode,
         args.capture_assistant,
-        exposure,
-        direct_tools,
+        tool_options,
     );
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -6935,8 +6952,7 @@ fn render_pi_extension(
     project_strategy: Option<&str>,
     capture_mode: &str,
     capture_assistant: bool,
-    exposure: PiToolExposure,
-    direct_tools: Option<&[String]>,
+    tool_options: PiToolOptions<'_>,
 ) -> Result<()> {
     println!(
         "// Pi extension — write to {}",
@@ -6947,14 +6963,13 @@ fn render_pi_extension(
     println!();
     println!(
         "{}",
-        build_pi_extension(
+        build_pi_extension_with_options(
             server_url,
             auth_token,
             project_strategy,
             capture_mode,
             capture_assistant,
-            exposure,
-            direct_tools,
+            tool_options,
         )
     );
     Ok(())
@@ -7029,6 +7044,7 @@ async function postPiStop(ctx: any): Promise<void> {
 }
 "#;
 
+#[cfg(test)]
 fn build_pi_extension(
     server_url: &str,
     auth_token: Option<&str>,
@@ -7038,6 +7054,30 @@ fn build_pi_extension(
     exposure: PiToolExposure,
     direct_tools: Option<&[String]>,
 ) -> String {
+    build_pi_extension_with_options(
+        server_url,
+        auth_token,
+        project_strategy,
+        capture_mode,
+        capture_assistant,
+        PiToolOptions {
+            exposure,
+            direct_tools,
+            tool_overrides: None,
+        },
+    )
+}
+
+fn build_pi_extension_with_options(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+    capture_assistant: bool,
+    tool_options: PiToolOptions<'_>,
+) -> String {
+    let exposure = tool_options.exposure;
+    let direct_tools = tool_options.direct_tools;
     // When capture is off the output is byte-identical to the pre-#2240 Pi
     // extension: no `CAPTURE_ASSISTANT`/`NATIVE_HOOK` consts, no `spawn` import,
     // no funnel, and the Stop post stays the plain direct-HTTP path.
@@ -7072,7 +7112,7 @@ fn build_pi_extension(
     let export_injection = format!(
         "{}\n{}{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
         pi_session_usage_source(),
-        pi_mcp_bridge_source(exposure, direct_tools),
+        pi_mcp_bridge_source(tool_options),
         capture_source,
     );
     let mut lifecycle = build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
@@ -7165,10 +7205,15 @@ const PI_TOOL_LABEL_LINE: &str = "          label: tool.name,\n";
 /// `deferred`, and attaches a single `promptGuidelines` discovery hint (#2428).
 /// Values per
 /// <https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure>.
-fn pi_mcp_bridge_source(exposure: PiToolExposure, direct_tools: Option<&[String]>) -> String {
+fn pi_mcp_bridge_source(options: PiToolOptions<'_>) -> String {
+    const TIMEOUT_LINE: &str = "const MCP_REQUEST_TIMEOUT_MS = 10000;\n";
+    const SCHEMA_FN_LINE: &str = "function toolInputSchema(tool: any): any {\n";
+    const REGISTER_DESC_PARAMS: &str =
+        "          description: tool.description,\n          parameters: toolInputSchema(tool),\n";
+
     let source = PI_MCP_BRIDGE_SOURCE;
     debug_assert_eq!(source.matches(PI_TOOL_LABEL_LINE).count(), 1);
-    match (exposure, direct_tools) {
+    let mut rendered = match (options.exposure, options.direct_tools) {
         (PiToolExposure::Direct, None) => source.to_string(),
         (PiToolExposure::Codemode, _) => source.replacen(
             PI_TOOL_LABEL_LINE,
@@ -7176,7 +7221,6 @@ fn pi_mcp_bridge_source(exposure: PiToolExposure, direct_tools: Option<&[String]
             1,
         ),
         (PiToolExposure::Direct, Some(tools)) => {
-            const TIMEOUT_LINE: &str = "const MCP_REQUEST_TIMEOUT_MS = 10000;\n";
             const LOOP_LINE: &str = "    for (const tool of listed?.tools ?? []) {\n";
             debug_assert_eq!(source.matches(TIMEOUT_LINE).count(), 1);
             debug_assert_eq!(source.matches(LOOP_LINE).count(), 1);
@@ -7208,7 +7252,70 @@ fn pi_mcp_bridge_source(exposure: PiToolExposure, direct_tools: Option<&[String]
                     1,
                 )
         }
+    };
+
+    if let Some(overrides) = options.tool_overrides {
+        debug_assert_eq!(rendered.matches(TIMEOUT_LINE).count(), 1);
+        debug_assert_eq!(rendered.matches(SCHEMA_FN_LINE).count(), 1);
+        debug_assert_eq!(rendered.matches(REGISTER_DESC_PARAMS).count(), 1);
+        let serialized = serde_json::to_string(overrides)
+            .expect("serializing pi_tool_overrides to JSON cannot fail");
+        const APPLY_OVERRIDES_FN: &str = r#"function applyToolOverrides(tool: any): any {
+  const override = Object.prototype.hasOwnProperty.call(TOOL_OVERRIDES, tool?.name)
+    ? TOOL_OVERRIDES[tool.name]
+    : undefined;
+  if (!override) return tool;
+  const next: any = { ...tool };
+  if (typeof override.description === "string") {
+    next.description = override.description;
+  }
+  if (override.params && next.inputSchema && typeof next.inputSchema === "object" && !Array.isArray(next.inputSchema)) {
+    const srcProps = next.inputSchema.properties;
+    if (srcProps && typeof srcProps === "object" && !Array.isArray(srcProps)) {
+      const filteredProps: Record<string, any> = {};
+      for (const [key, desc] of Object.entries(override.params)) {
+        if (Object.prototype.hasOwnProperty.call(srcProps, key)) {
+          const prop = srcProps[key];
+          filteredProps[key] = prop && typeof prop === "object" && !Array.isArray(prop)
+            ? { ...prop, description: desc }
+            : { description: desc };
+        }
+      }
+      next.inputSchema = { ...next.inputSchema, properties: filteredProps };
     }
+  }
+  return next;
+}
+
+"#;
+        const REGISTER_CALL: &str = "        pi.registerTool({\n";
+        debug_assert_eq!(rendered.matches(REGISTER_CALL).count(), 1);
+        rendered = rendered
+            .replacen(
+                TIMEOUT_LINE,
+                &format!(
+                    "{TIMEOUT_LINE}const TOOL_OVERRIDES: Record<string, {{ description?: string; params?: Record<string, string> }}> = {serialized};\n"
+                ),
+                1,
+            )
+            .replacen(
+                SCHEMA_FN_LINE,
+                &format!("{APPLY_OVERRIDES_FN}{SCHEMA_FN_LINE}"),
+                1,
+            )
+            .replacen(
+                REGISTER_CALL,
+                &format!("        const effective = applyToolOverrides(tool);\n{REGISTER_CALL}"),
+                1,
+            )
+            .replacen(
+                REGISTER_DESC_PARAMS,
+                "          description: effective.description,\n          parameters: toolInputSchema(effective),\n",
+                1,
+            );
+    }
+
+    rendered
 }
 
 const PI_MCP_BRIDGE_SOURCE: &str = r#"
@@ -18533,6 +18640,221 @@ process.stdout.write(JSON.stringify({
                 "{direct:?}"
             );
         }
+    }
+
+    /// #2493: `install-hooks --agent pi --apply` respects `pi_tool_overrides`,
+    /// is idempotent on re-run, composes orthogonally with `pi_tool_exposure`
+    /// and `pi_direct_tools`, and restores the byte-identical baseline when
+    /// `pi_tool_overrides` is unset.
+    #[test]
+    fn pi_apply_follows_pi_tool_overrides_idempotently() {
+        let home = TempDir::new().unwrap();
+        let extension = home.path().join("ai-memory-pi.ts");
+        let overrides_file = home.path().join("pi-tool-overrides.json");
+        fs::write(
+            &overrides_file,
+            r#"{
+              "memory_recent": {
+                "description": "Short recent pages.",
+                "params": {
+                  "limit": "Max pages."
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let args = || InstallHooksArgs {
+            agent: AgentChoice::Pi,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(extension.clone()),
+            ..default_hook_args()
+        };
+
+        run(&config, args()).unwrap();
+        let baseline = fs::read_to_string(&extension).unwrap();
+        assert!(!baseline.contains("TOOL_OVERRIDES"), "{baseline}");
+        assert!(!baseline.contains("applyToolOverrides"), "{baseline}");
+
+        config.pi_tool_overrides = Some("pi-tool-overrides.json".to_string());
+        run(&config, args()).unwrap();
+        let overridden = fs::read_to_string(&extension).unwrap();
+        assert!(overridden.contains("const TOOL_OVERRIDES"), "{overridden}");
+        assert!(
+            overridden.contains("function applyToolOverrides"),
+            "{overridden}"
+        );
+        run(&config, args()).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), overridden);
+
+        // Orthogonal with `pi_direct_tools` and `pi_tool_exposure = "codemode"`.
+        config.pi_direct_tools = Some(vec!["memory_recent".to_string()]);
+        run(&config, args()).unwrap();
+        let with_direct = fs::read_to_string(&extension).unwrap();
+        assert!(with_direct.contains("DIRECT_TOOLS"), "{with_direct}");
+        assert!(with_direct.contains("TOOL_OVERRIDES"), "{with_direct}");
+
+        config.pi_direct_tools = None;
+        config.pi_tool_exposure = PiToolExposure::Codemode;
+        run(&config, args()).unwrap();
+        let with_codemode = fs::read_to_string(&extension).unwrap();
+        assert!(
+            with_codemode.contains("exposure: \"codemode\","),
+            "{with_codemode}"
+        );
+        assert!(with_codemode.contains("TOOL_OVERRIDES"), "{with_codemode}");
+
+        config.pi_tool_exposure = PiToolExposure::Direct;
+        config.pi_tool_overrides = None;
+        run(&config, args()).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), baseline);
+    }
+
+    /// #2493 in Node: verifies `applyToolOverrides` replaces `description`,
+    /// filters `parameters.properties` while preserving types/enums/`required`/
+    /// `additionalProperties`, and leaves non-overridden tools untouched.
+    #[test]
+    fn pi_tool_overrides_rewrites_registered_tools_in_node() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        const HARNESS: &str = r#"
+import { pathToFileURL } from "node:url";
+globalThis.fetch = async (url: any, options: any) => {
+  const target = new URL(url);
+  if (target.pathname !== "/mcp") return new Response(null, { status: 202 });
+  const body = JSON.parse(options.body);
+  if (body.id === undefined) return new Response(null, { status: 202 });
+  const result = body.method === "tools/list"
+    ? {
+        tools: [
+          {
+            name: "memory_query",
+            description: "Original long memory_query description",
+            inputSchema: {
+              type: "object",
+              required: ["query"],
+              additionalProperties: false,
+              properties: {
+                query: { type: "string", description: "Original query desc" },
+                limit: { type: "integer", minimum: 1, description: "Original limit desc" },
+                mode: { type: "string", enum: ["fast", "deep"], description: "Original mode desc" },
+                dropped_opt: { type: "boolean", description: "Should be filtered out" },
+              },
+            },
+          },
+          {
+            name: "memory_briefing",
+            description: "Untouched briefing description",
+            inputSchema: {
+              type: "object",
+              properties: {
+                topic: { type: "string", description: "Untouched topic desc" },
+              },
+            },
+          },
+        ],
+      }
+    : {};
+  return Response.json({ jsonrpc: "2.0", id: body.id, result });
+};
+const tools: any[] = [];
+const { default: extension } = await import(pathToFileURL(process.argv[2]).href);
+extension({
+  on: () => {},
+  registerTool: (tool: any) => tools.push(tool),
+});
+for (let i = 0; i < 200 && tools.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+process.stdout.write(JSON.stringify(tools.map((t) => ({
+  name: t.name,
+  description: t.description,
+  parameters: t.parameters,
+}))) + "\n", (error) => process.exit(error ? 1 : 0));
+"#;
+
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "memory_query".to_string(),
+            crate::config::PiToolOverride {
+                description: Some("Short query.".to_string()),
+                params: Some(std::collections::BTreeMap::from([
+                    ("query".to_string(), "Terms.".to_string()),
+                    ("mode".to_string(), "Search mode.".to_string()),
+                ])),
+            },
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let extension = tmp.path().join("ai-memory-pi.ts");
+        fs::write(
+            &extension,
+            build_pi_extension_with_options(
+                "http://127.0.0.1:49600",
+                None,
+                None,
+                "denylist",
+                false,
+                PiToolOptions {
+                    exposure: PiToolExposure::Direct,
+                    direct_tools: None,
+                    tool_overrides: Some(&overrides),
+                },
+            ),
+        )
+        .unwrap();
+        fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
+        let mut command = Command::new("node");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("AI_MEMORY_") {
+                command.env_remove(&key);
+            }
+        }
+        let output = command
+            .args(["--experimental-strip-types", "--no-warnings", "harness.ts"])
+            .arg(&extension)
+            .current_dir(tmp.path())
+            .env("HOME", tmp.path())
+            .env("USERPROFILE", tmp.path())
+            .env("AI_MEMORY_DATA_DIR", tmp.path().join("data"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "harness failed\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let seen: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            seen,
+            serde_json::json!([
+                {
+                    "name": "memory_query",
+                    "description": "Short query.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["query"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "mode": { "type": "string", "enum": ["fast", "deep"], "description": "Search mode." },
+                            "query": { "type": "string", "description": "Terms." },
+                        },
+                    },
+                },
+                {
+                    "name": "memory_briefing",
+                    "description": "Untouched briefing description",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "topic": { "type": "string", "description": "Untouched topic desc" },
+                        },
+                    },
+                },
+            ])
+        );
     }
 
     // Windows 11 + Git Bash support matters for regulated enterprise setups

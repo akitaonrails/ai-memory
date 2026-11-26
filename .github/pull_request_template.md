@@ -31,8 +31,9 @@
 - [ ] **Major (breaking)**: on-disk format, removed/renamed surface, or
       breaking MCP schema change, called out in "What changed" above
 
-- [ ] The base branch matches: `main` for a patch, the standing feature
-      branch (currently `release/3.6`) for minor or major work.
+- [ ] The base branch follows the release policy. Use the standing feature
+      branch (currently `release/3.7`) for minor or major work and fixes to
+      code that exists only there. Use `main` for other patches.
 - [ ] I checked that this does not redo something already on `main` or the
       feature branch, or fixed by a closed issue.
 

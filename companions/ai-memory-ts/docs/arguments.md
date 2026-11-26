@@ -180,6 +180,7 @@ Methods: `recent`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `limit` | `limit` |
+| `path_prefix` | `pathPrefix` |
 
 ## `memory_message_send`
 

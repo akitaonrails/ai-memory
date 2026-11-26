@@ -596,6 +596,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
         ))
         .await
         .unwrap();
+    store.writer.end_session(sid, None).await.unwrap();
     assert!(
         store
             .writer

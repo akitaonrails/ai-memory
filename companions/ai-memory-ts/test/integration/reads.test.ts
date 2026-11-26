@@ -56,6 +56,8 @@ describe("read tools", () => {
     );
     const recent = await memory.recent({ limit: 5 });
     assert.ok(recent.hits.some((h) => h.path === "notes/a.md"));
+    const recentNotes = await memory.recent({ pathPrefix: "notes/", limit: 1 });
+    assert.deepEqual(recentNotes.hits.map((hit) => hit.path), ["notes/a.md"]);
     const briefing = await memory.briefing();
     assert.ok(briefing.rules.some((r) => r.path === "_rules/style.md"));
     assert.equal(briefing.activity7d.days, 7);
