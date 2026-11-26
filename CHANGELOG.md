@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `backup-agents` to archive Claude Desktop's `claude_desktop_config.json`
+  on Linux, from `$XDG_CONFIG_HOME/Claude` where `install-mcp` writes it.
+  `restore-agents` already restored the entry there. (#2528)
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
