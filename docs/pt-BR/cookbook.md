@@ -591,6 +591,99 @@ ai-memory run --yolo claude
   entrega seu token a um agente isolado, portanto faça isso apenas para trabalhos em que você confiaria nele;
   ele deliberadamente nunca é encaminhado de forma automática.
 
+### Emitindo um token de menor privilégio para `--jail` em um servidor solo
+
+Em uma instalação de operador único cujo servidor usa `[auth].bearer_token_file`,
+`ai-memory run --jail` para até que `AI_MEMORY_AUTH_TOKEN` esteja definido no
+ambiente. Emitir uma chave de API nativa `aim_` (exige `[auth].token_pepper`,
+gerado pelo `ai-memory init`; consulte [`users.md`](users.md)) atende a essa
+verificação sem expor o token root ao sandbox:
+
+```bash
+ai-memory user add-human --username <voce> --role root
+ai-memory api-key add --username <voce> --label ai-jail
+```
+
+Salve o token `aim_` impresso em um arquivo acessível apenas ao dono (por
+exemplo `chmod 600 ~/.config/ai-memory/jail.token`).
+
+Criar um usuário no banco ativa a autenticação humana e o modo multiusuário,
+com três consequências em um servidor solo:
+
+- **Mantenha um root recuperável.** `user add-human` usa `--role user` por
+  padrão, e assim que algum usuário tem senha, `ai-memory serve` recusa
+  reiniciar se não houver root recuperável ou `[auth].recovery_token`
+  (`AI_MEMORY_AUTH__RECOVERY_TOKEN`). Criar `<voce>` com `--role root` atende
+  a essa checagem de partida diretamente, e o servidor recusa desabilitar o
+  último root habilitado com senha. Se você não quiser login web em `<voce>`,
+  crie a conta com `--role user`, rode `ai-memory user disable <voce>` (a
+  chave `aim_` continua válida) e configure `AI_MEMORY_AUTH__RECOVERY_TOKEN`
+  para o `ai-memory serve` subir.
+- **Alinhe a autoria e mantenha o perfil entre projetos.** Criar um usuário no
+  banco coloca o servidor em modo multiusuário, no qual `[profile]` fica
+  desligado por padrão e `share = "auto"` passa a usar um perfil privado por
+  usuário (`_profile.<user_id>`) que sessões com token root não leem (e
+  `ai-memory profile` passa a pedir `--user <voce>`). Definir `share = "global"`
+  junto com `enabled = true` mantém um único perfil em `default/_global/profile/`
+  legível tanto em execuções root quanto `aim_` (gravável pelo root ou com
+  permissão de escrita em `_global`; consulte
+  [`cross-project-profile.md`](cross-project-profile.md)). Definir
+  `[auth].root_username` como `<voce>` mantém gravações e handoffs fora da jail
+  sob `user:<voce>`, permitindo que handoffs cruzem entre sessões root e na
+  jail. Reinicie `ai-memory serve` após editar o `config.toml`:
+
+  ```toml
+  [profile]
+  enabled = true
+  share = "global"
+
+  [auth]
+  root_username = "<voce>"
+  ```
+
+- **Não exporte a chave `aim_` globalmente no shell.** Chaves nativas `aim_`
+  sempre autenticam como `AuthLevel::User` (mesmo para um usuário `root`) e
+  recebem `403 Forbidden` nos endpoints `/admin/*` restritos ao root. Exportar
+  `AI_MEMORY_AUTH_TOKEN` substitui `bearer_token_file` em todos os comandos da
+  CLI e quebra subcomandos de administração (`api-key`, `profile`, `user`,
+  `move-session`). Injete a chave apenas nas execuções `run` com `--jail` ou
+  `--yolo` (sem `--no-jail`) com uma função curta em bash:
+
+  ```bash
+  ai-memory() {
+      local want_jail=0 no_jail=0 has_no_autowire=0 arg
+      if [ "${1:-}" = "run" ] && [ -z "${AI_MEMORY_AUTH_TOKEN:-}" ] && [ -r "$HOME/.config/ai-memory/jail.token" ]; then
+          for arg in "${@:2}"; do
+              case "$arg" in
+                  --) break ;;
+                  --no-jail) no_jail=1 ;;
+                  --no-autowire) has_no_autowire=1 ;;
+                  --jail|--jail=*|--yolo) want_jail=1 ;;
+              esac
+          done
+      fi
+      if [ "$want_jail" -eq 1 ] && [ "$no_jail" -eq 0 ]; then
+          if [ "$has_no_autowire" -eq 1 ]; then
+              AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory "$@"
+          else
+              AI_MEMORY_AUTH_TOKEN="$(<"$HOME/.config/ai-memory/jail.token")" command ai-memory run --no-autowire "${@:2}"
+          fi
+      else
+          command ai-memory "$@"
+      fi
+  }
+  ```
+
+  Execuções com `--jail` ou `--yolo` (sem `--no-jail`) recebem apenas a chave
+  `aim_` e `--no-autowire`, enquanto comandos admin e execuções comuns
+  continuam usando `bearer_token_file`. Passar `--no-autowire` impede que o
+  re-exec dentro do home privado do `ai-jail` (onde
+  `<data_dir>/autowire-state` fica oculto) rode o auto-wire novamente a cada
+  execução na jail e sobrescreva entradas MCP HTTP estáticas com a chave `aim_`
+  inline; configure cada harness uma vez fora da `--jail` (ou com
+  `ai-memory install-mcp --client <harness> --apply`) para que sessões sem
+  jail mantenham acesso root e sessões na jail usem `AI_MEMORY_AUTH_TOKEN`.
+
 Consulte [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) para o
 contrato completo.
 
