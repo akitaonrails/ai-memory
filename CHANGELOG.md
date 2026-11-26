@@ -17,6 +17,30 @@ version in [`docs/changelog/`](docs/changelog/):
   a different session. The fallback clears only when its own session-end
   is acknowledged, including when a later request in `--all` fails.
 
+## [3.6.3] - 2026-11-26
+
+### Fixed
+
+- Kept repository files and their sync state when their server pages
+  reappear before `ai-memory-wikisync` applies local deletions. (#986)
+- Kept validated MCP server and tool names from Antigravity CLI tool hooks
+  while retaining the metadata-only capture policy. (#2505)
+- Raised `ai-memory-wikisync`'s per-segment filename limit (`MAX_SEGMENT_BYTES`)
+  from 64 to 128 bytes so legitimate server-generated ASCII filenames (such as
+  ~80-byte auto-improve gotcha pages) no longer abort the entire project
+  export or sync batch, while keeping `MAX_PATH_BYTES` (180), `MAX_DEPTH` (8),
+  and fail-closed rejection of unsafe paths intact. (#2488)
+- Rule-based session pages now compute `started_at` and session duration from
+  the earliest `SessionStart` observation instead of the latest one, so
+  compacted or resumed sessions no longer lose the time spent before the last
+  compaction or resume. (#2502)
+- Resuming an ended session and exiting without a user prompt or tool call no
+  longer re-ends the session, rewrites its wiki page, refreshes its
+  auto-handoff, or enqueues a duplicate LLM consolidation job. `AlreadyEnded`
+  detection now requires substantive observations past the end watermark, and
+  ended-session consolidation jobs key their generation on
+  `ended_observation_count`. (#2504)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
@@ -6469,7 +6493,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.3...HEAD
+[3.6.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.3
 [3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
 [3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
 [3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
