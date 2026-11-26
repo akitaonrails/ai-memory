@@ -315,6 +315,13 @@ Regras:
   apenas `project` para manter o escopo inequívoco).
 - `scopes` (POST) tem limite máximo de `25` entradas; não pode ser combinado com
   `workspace`/`project` no nível superior.
+- Filtros opcionais de metadados de página `kind`, `tier`, `path_prefix` e `tag`
+  restringem o conjunto de candidatos **antes** do ranqueamento, em ambas as
+  formas. Eles exigem um projeto ou escopo explícito: uma requisição global que
+  defina um deles retorna `400`. `tier` deve ser `working`, `episodic`,
+  `semantic` ou `procedural` (sem distinção entre maiúsculas e minúsculas;
+  qualquer outro valor retorna `400`). `kind`, `path_prefix` e `tag` têm
+  espaços nas extremidades removidos, e um valor vazio significa sem filtro.
 - `snippet` contém marcadores HTML do FTS5 (`<mark>…</mark>`) ao redor dos
   termos correspondidos.
 - Uma busca **global** (sem escopo) é FTS5 sobre cada projeto que o chamador pode

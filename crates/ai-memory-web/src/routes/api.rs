@@ -484,14 +484,22 @@ async fn search_with_request(
             "scopes cannot be combined with workspace/project",
         ));
     }
+    let filter = search_page_filter(&request)?;
     let hits = match scoped_search_mode(state, &request, viewer).await? {
-        SearchMode::Global => state.reader.search_pages(term, limit, viewer).await,
+        SearchMode::Global => {
+            if filter.is_active() {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "filters require an explicit project or scope",
+                ));
+            }
+            state.reader.search_pages(term, limit, viewer).await
+        }
         SearchMode::Scoped(scopes) => {
             let scopes: Vec<(WorkspaceId, ProjectId)> = scopes
                 .iter()
                 .map(|scope| (scope.workspace_id, scope.project_id))
                 .collect();
-            let filter = ai_memory_store::PageFilter::default();
             crate::recall::search_scopes(state, &scopes, &term, limit, false, owner, filter)
                 .await
                 .map(|result| result.hits.into_iter().map(|(hit, _)| hit).collect())
@@ -507,6 +515,66 @@ async fn search_with_request(
     Ok(with_no_store(
         Json(enrich_hits(state, hits).await?).into_response(),
     ))
+}
+
+#[allow(clippy::result_large_err)] // the handler error is the router's `Response`.
+fn bounded_search_filter<'a>(
+    name: &str,
+    value: Option<&'a str>,
+    max_len: usize,
+) -> Result<Option<&'a str>, Response> {
+    let Some(value) = trimmed_opt(value) else {
+        return Ok(None);
+    };
+    if value.chars().take(max_len + 1).count() > max_len || value.chars().any(char::is_control) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{name} must be at most {max_len} characters and contain no control characters"
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Validate the optional page-metadata filters and borrow them from
+/// `request` for the store's pre-ranking `PageFilter`.
+#[allow(clippy::result_large_err)] // the handler error is the router's `Response`.
+fn search_page_filter(
+    request: &SearchRequest,
+) -> Result<ai_memory_store::PageFilter<'_>, Response> {
+    let kind = bounded_search_filter(
+        "kind",
+        request.kind.as_deref(),
+        ai_memory_core::page::MAX_PAGE_KIND_LEN,
+    )?;
+    let path_prefix = bounded_search_filter(
+        "path_prefix",
+        request.path_prefix.as_deref(),
+        MAX_QUERY_PATH_PREFIX_LEN,
+    )?;
+    let tag = bounded_search_filter("tag", request.tag.as_deref(), MAX_QUERY_TAG_LEN)?;
+    let tier = match bounded_search_filter("tier", request.tier.as_deref(), 16)? {
+        Some(tier) => Some(
+            ai_memory_core::Tier::ALL
+                .iter()
+                .find(|candidate| candidate.as_str().eq_ignore_ascii_case(tier))
+                .map(ai_memory_core::Tier::as_str)
+                .ok_or_else(|| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        "tier must be working, episodic, semantic or procedural",
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    Ok(ai_memory_store::PageFilter {
+        kind,
+        tier,
+        path_prefix,
+        tag,
+    })
 }
 
 async fn scoped_search_mode(
@@ -1459,6 +1527,8 @@ fn default_limit() -> usize {
 }
 
 const MAX_SEARCH_SCOPES: usize = 25;
+const MAX_QUERY_PATH_PREFIX_LEN: usize = 1_024;
+const MAX_QUERY_TAG_LEN: usize = 128;
 
 #[derive(Debug, Deserialize)]
 struct ProjectListQuery {
@@ -1481,6 +1551,10 @@ struct SearchQuery {
     project: Option<String>,
     scope: Vec<String>,
     limit: usize,
+    kind: Option<String>,
+    tier: Option<String>,
+    path_prefix: Option<String>,
+    tag: Option<String>,
 }
 
 impl SearchQuery {
@@ -1491,6 +1565,10 @@ impl SearchQuery {
             q: String::new(),
             scope: Vec::new(),
             workspace: None,
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
         };
         let Some(raw_query) = raw_query else {
             return Ok(query);
@@ -1509,6 +1587,10 @@ impl SearchQuery {
                 "q" | "query" => query.q = value,
                 "scope" => query.scope.push(value),
                 "workspace" => query.workspace = Some(value),
+                "kind" => query.kind = Some(value),
+                "tier" => query.tier = Some(value),
+                "path_prefix" => query.path_prefix = Some(value),
+                "tag" => query.tag = Some(value),
                 _ => {}
             }
         }
@@ -1530,6 +1612,10 @@ impl SearchQuery {
             q: self.q,
             scopes,
             workspace: self.workspace,
+            kind: self.kind,
+            tier: self.tier,
+            path_prefix: self.path_prefix,
+            tag: self.tag,
         })
     }
 }
@@ -1546,6 +1632,14 @@ struct SearchRequest {
     scopes: Vec<ApiSearchScope>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
