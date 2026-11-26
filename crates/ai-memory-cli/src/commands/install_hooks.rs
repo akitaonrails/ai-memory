@@ -3872,9 +3872,12 @@ fn apply_to_antigravity_settings(
 const ANTIGRAVITY_FINALIZATION_GUIDANCE: &str = "\
 Antigravity has no conversation-end event. Each finished turn refreshes the\n\
 session summary and its handoff, which a new session in this project picks up\n\
-once the conversation has been quiet for 10 minutes. To close a conversation\n\
-now, hand its baton over at once and queue opt-in SessionEnd consolidation,\n\
-run `ai-memory finalize-session --agent antigravity-cli`.\n";
+once the conversation has been quiet for 10 minutes. Sessions launched with\n\
+`ai-memory run antigravity` finalize automatically on exit, and\n\
+`[sessions] idle_end_after_hours` closes idle sessions server-side and queues\n\
+opt-in consolidation. To close a conversation now, hand its baton over at once\n\
+and queue opt-in SessionEnd consolidation, run\n\
+`ai-memory finalize-session --agent antigravity-cli`.\n";
 
 fn merge_antigravity_hooks(
     staged: &Path,
@@ -12221,6 +12224,8 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
 
         assert!(output.contains("Antigravity has no conversation-end event"));
         assert!(output.contains("quiet for 10 minutes"));
+        assert!(output.contains("ai-memory run antigravity"));
+        assert!(output.contains("idle_end_after_hours"));
         assert!(
             output.contains("ai-memory finalize-session --agent antigravity-cli"),
             "Antigravity install output must expose the supported finalizer: {output}"

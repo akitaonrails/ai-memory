@@ -683,7 +683,11 @@ outro workstream; a adoção continua sendo uma operação de bootstrap.
    e consolidação opcional em SessionEnd. Ele faz isso apenas para uma sessão nomeada
    na linha de comando, escolhida antes do spawn, ou vinculada durante a execução,
    nunca para uma que ele tenha precisado procurar. Se a finalização falhar, ele imprime o comando
-   exato `finalize-session` para ser executado.
+   exato `finalize-session` para ser executado. Fora de `ai-memory run`, uma execução
+   headless `agy -p --output-format json` emite `conversation_id` em stdout
+   ([documentação headless do Antigravity](https://antigravity.google/docs/cli/headless/)),
+   que scripts podem passar para
+   `ai-memory finalize-session --agent antigravity-cli --session-id <id>`.
 
 O próximo harness recebe um delta recente limitado porque nenhuma janela de contexto de agente
 pode absorver com segurança uma transcrição ilimitada. O ledger visível completo permanece

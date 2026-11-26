@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Updated `install-hooks --agent antigravity-cli` finalization guidance and the
+  Antigravity / Command Code documentation in `docs/support-matrix.md` and
+  `docs/managed-workstreams.md` to cover `ai-memory run` automatic
+  finalization (interactive and headless), `[sessions] idle_end_after_hours`,
+  and headless `agy -p --output-format json` `conversation_id` finalization.
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
