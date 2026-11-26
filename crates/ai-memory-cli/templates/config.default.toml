@@ -267,6 +267,16 @@ log_level = "info"
 # `["memory_query","memory_briefing"]`).
 # pi_direct_tools = ["memory_query", "memory_briefing"]
 
+# Optional JSON file (relative to the config directory, max 64 KiB) that
+# overrides declared tool descriptions and narrows declared parameters in the
+# generated Pi extension. Unset by default (output stays unchanged). Each key
+# is an ai-memory MCP tool name with optional `description` and `params`
+# (`{ "<param>": "<description>" }`; must keep all required parameters). Works
+# alongside `pi_tool_exposure` and `pi_direct_tools`. Re-run
+# `ai-memory install-hooks --agent pi --apply` and restart Pi after changing
+# it. Env equivalent: `AI_MEMORY_PI_TOOL_OVERRIDES`.
+# pi_tool_overrides = "pi-tool-overrides.json"
+
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above
 # the min and below the max are flagged; at or above the max they count as

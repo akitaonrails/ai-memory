@@ -1050,3 +1050,16 @@ diag-verifying-redacted-config = verifying redacted config for { $value0 }
 diag-pi-direct-tools-codemode-conflict = pi_direct_tools and pi_tool_exposure = "codemode" are mutually exclusive; remove pi_direct_tools or set pi_tool_exposure = "direct"
 diag-pi-direct-tools-too-many = pi_direct_tools may list at most { $max } tools (got { $count })
 diag-pi-direct-tools-invalid-entry = pi_direct_tools entry `{ $tool }` is invalid; tool names must be non-empty, at most { $max } characters, and use only ASCII letters, digits, `_`, or `-`
+diag-pi-tool-overrides-invalid-path = pi_tool_overrides must be a non-empty relative path inside the config directory
+diag-pi-tool-overrides-escapes-config-dir = pi_tool_overrides `{ $path }` escapes the config directory
+diag-pi-tool-overrides-not-regular-file = pi_tool_overrides `{ $path }` must point to a regular file
+diag-pi-tool-overrides-resolve-config-dir = resolving pi_tool_overrides config directory `{ $path }`
+diag-pi-tool-overrides-resolve-file = resolving pi_tool_overrides file `{ $path }`
+diag-pi-tool-overrides-read-file = reading pi_tool_overrides file `{ $path }`
+diag-pi-tool-overrides-too-large = pi_tool_overrides file `{ $path }` exceeds the { $max } byte limit
+diag-pi-tool-overrides-parse-json = parsing pi_tool_overrides file `{ $path }`
+diag-pi-tool-overrides-unknown-tool = pi_tool_overrides names unknown tool `{ $tool }`
+diag-pi-tool-overrides-invalid-description = pi_tool_overrides description for `{ $tool }` must be non-empty and at most { $max } characters
+diag-pi-tool-overrides-unknown-param = pi_tool_overrides for `{ $tool }` names unknown parameter `{ $param }`
+diag-pi-tool-overrides-invalid-param-description = pi_tool_overrides description for `{ $tool }.{ $param }` must be non-empty and at most { $max } characters
+diag-pi-tool-overrides-missing-required-param = pi_tool_overrides for `{ $tool }` omits required parameter `{ $param }`

@@ -9468,6 +9468,15 @@ impl AiMemoryServer {
         names
     }
 
+    /// All MCP tool definitions compiled into this server.
+    ///
+    /// Used offline by CLI validation (such as `pi_tool_overrides` in
+    /// `install-hooks`) without instantiating a server or opening a store.
+    #[must_use]
+    pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     /// The latest version id of a page in an already-authorized scope.
     async fn latest_page_id(
         &self,

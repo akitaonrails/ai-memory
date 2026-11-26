@@ -2593,6 +2593,47 @@ ativação de `tool_search`. `pi_direct_tools` é mutuamente exclusivo com
 `pi_tool_exposure = "codemode"`. Remova a chave para voltar à saída padrão da
 extensão.
 
+#### Sobrescritas de descrição e parâmetros das ferramentas do Pi (`pi_tool_overrides`)
+
+Para encurtar as descrições declaradas ou reduzir parâmetros opcionais de
+ferramentas escolhidas do ai-memory na extensão gerada do Pi sem alterar o
+servidor MCP, aponte `pi_tool_overrides` no `config.toml` (ou
+`AI_MEMORY_PI_TOOL_OVERRIDES`) para um arquivo JSON dentro do diretório de
+configuração e regenere a extensão:
+
+```toml
+pi_tool_overrides = "pi-tool-overrides.json"
+```
+
+```json
+{
+  "memory_recent": {
+    "description": "List this project's most recently updated wiki pages, newest first.",
+    "params": {
+      "limit": "Max pages (default 10, max 100).",
+      "project": "Omit with workspace for the current project; otherwise pass both.",
+      "workspace": "Omit with project for the current project; otherwise pass both."
+    }
+  }
+}
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Para cada ferramenta listada, a ponte declara a `description` informada (quando
+presente) e, quando `params` está presente, mantém apenas esses parâmetros em
+`inputSchema.properties` com suas descrições substitutas, preservando tipos,
+enums, `required` e `additionalProperties`. Ferramentas não listadas permanecem
+inalteradas, e o servidor continua aceitando todos os parâmetros. O
+`install-hooks` valida o arquivo offline contra o catálogo compilado de
+ferramentas (rejeitando escapes de caminho, arquivos acima de 64 KiB,
+ferramentas ou parâmetros desconhecidos, parâmetros obrigatórios ausentes e
+descrições vazias ou longas demais). Funciona em conjunto com
+`pi_tool_exposure` e `pi_direct_tools`. Remova a chave para voltar à saída
+padrão da extensão.
+
 ### Montagens bind vs docker cp
 
 O subcomando `setup-agent` faz a extração + renderização em uma única etapa
