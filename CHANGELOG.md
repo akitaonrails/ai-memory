@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Rule-based session pages now compute `started_at` and session duration from
+  the earliest `SessionStart` observation instead of the latest one, so
+  compacted or resumed sessions no longer lose the time spent before the last
+  compaction or resume. (#2502)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

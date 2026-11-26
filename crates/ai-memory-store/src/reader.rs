@@ -15892,9 +15892,11 @@ pub struct SessionObservationSnapshot<'c> {
 }
 
 /// Counts and "last of a kind" markers for one session, from one aggregate
-/// pass. A `*_at` field is the newest `created_at` of that kind (microseconds
-/// since the epoch), which is enough to seek straight to the row with an
-/// indexed `created_at <= ?` range instead of walking the session.
+/// pass. Most `*_at` fields are the newest `created_at` of that kind
+/// (microseconds since the epoch), which is enough to seek straight to the row
+/// with an indexed `created_at <= ?` range instead of walking the session;
+/// `first_session_start_at` is the earliest `session-start` so compactions and
+/// resumes do not shift a session's start time forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionKindSummary {
     /// Every row of the session.
@@ -15904,8 +15906,8 @@ pub struct SessionKindSummary {
     /// At least one prompt or tool use: the positive "real work" predicate
     /// [`SUBSTANTIVE_OBSERVATION_KIND_SQL`] also gives the writer.
     pub substantive: bool,
-    /// Newest `session-start`.
-    pub last_session_start_at: Option<i64>,
+    /// Earliest `session-start`.
+    pub first_session_start_at: Option<i64>,
     /// Newest `session-end`.
     pub last_session_end_at: Option<i64>,
     /// Newest `stop`.
@@ -16024,7 +16026,7 @@ impl SessionObservationSnapshot<'_> {
             "SELECT COUNT(*), \
                     COALESCE(SUM(kind = ?2), 0), \
                     COALESCE(MAX({SUBSTANTIVE_OBSERVATION_KIND_SQL}), 0), \
-                    MAX(CASE WHEN kind = ?3 THEN created_at END), \
+                    MIN(CASE WHEN kind = ?3 THEN created_at END), \
                     MAX(CASE WHEN kind = ?4 THEN created_at END), \
                     MAX(CASE WHEN kind = ?5 THEN created_at END), \
                     MAX(CASE WHEN kind = ?5 AND body <> '' THEN created_at END), \
@@ -16054,7 +16056,7 @@ impl SessionObservationSnapshot<'_> {
                     total: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
                     prompts: usize::try_from(row.get::<_, i64>(1)?).unwrap_or(usize::MAX),
                     substantive: row.get::<_, i64>(2)? != 0,
-                    last_session_start_at: row.get(3)?,
+                    first_session_start_at: row.get(3)?,
                     last_session_end_at: row.get(4)?,
                     last_stop_at: row.get(5)?,
                     last_stop_with_body_at: row.get(6)?,
