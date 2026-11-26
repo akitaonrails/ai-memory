@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept repository files and their sync state when their server pages
+  reappear before `ai-memory-wikisync` applies local deletions. (#986)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
