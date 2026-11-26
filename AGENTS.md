@@ -853,15 +853,14 @@ Additional boundary rules:
 - **Branch model.** `main` is the patch line: it takes fixes and docs only
   (`[Unreleased]` holds only `### Fixed`), and patch tags are cut from it.
   Additive work targets the standing `release/X.Y` branch for the next
-  minor or major (currently `release/3.6`). Keep `main` an
+  minor or major (currently `release/3.7`). Keep `main` an
   ancestor of it by forward-merging
   `main` into it after every fix lands, never the reverse; when a patch
   release ships, rebuild the branch's `[Unreleased]` as only its own entries
   so released sections stay identical to `main`'s. A fix lands on `main`
   first. To ship the minor, merge `release/X.Y` into `main`, run the release
   gates on that SHA and tag from `main`; the old `release/X.Y` then goes
-  dormant. A PR's base branch follows its semver bucket: fixes → `main`,
-  features → `release/X.Y`.
+  dormant. Fixes to code that exists only on `release/X.Y` target that branch.
 - Keep `CLAUDE.md` as a pointer to this file.
 - **A new config key is documented in the same change, in two places.** Any key ai-memory accepts from `config.toml` (a `Config` field or a settings struct, whichever crate owns it) lands with (1) a commented entry in `crates/ai-memory-cli/templates/config.default.toml`, following the template's grammar (top-level keys above the first table, indented examples for credential or Option-typed keys, `[auth]` last; the two `the_shipped_default_config*` tests must pass), and (2) a row in `docs/config-properties.md`: key, default, env equivalent, one-line purpose. Env-only settings stay out of both; the `[auth]` keys `ai-memory init` appends itself stay out of the template and appear in `docs/config-properties.md` marked as init-managed. A config change that skips either file is incomplete.
 

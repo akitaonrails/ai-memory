@@ -6987,12 +6987,11 @@ impl ReaderPool {
             if ended_at.is_none() {
                 return Ok(SessionEndDisposition::Open);
             }
-            let current_observation_count: u64 = conn.query_row(
-                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
-                params![session_id.as_bytes()],
-                |row| row.get(0),
-            )?;
-            if current_observation_count > ended_observation_count {
+            if session_has_substantive_work_after_watermark(
+                conn,
+                session_id,
+                ended_observation_count,
+            )? {
                 Ok(SessionEndDisposition::ReEndWithNewWork)
             } else {
                 Ok(SessionEndDisposition::AlreadyEnded)
@@ -15951,9 +15950,11 @@ pub struct SessionObservationSnapshot<'c> {
 }
 
 /// Counts and "last of a kind" markers for one session, from one aggregate
-/// pass. A `*_at` field is the newest `created_at` of that kind (microseconds
-/// since the epoch), which is enough to seek straight to the row with an
-/// indexed `created_at <= ?` range instead of walking the session.
+/// pass. Most `*_at` fields are the newest `created_at` of that kind
+/// (microseconds since the epoch), which is enough to seek straight to the row
+/// with an indexed `created_at <= ?` range instead of walking the session;
+/// `first_session_start_at` is the earliest `session-start` so compactions and
+/// resumes do not shift a session's start time forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionKindSummary {
     /// Every row of the session.
@@ -15963,8 +15964,8 @@ pub struct SessionKindSummary {
     /// At least one prompt or tool use: the positive "real work" predicate
     /// [`SUBSTANTIVE_OBSERVATION_KIND_SQL`] also gives the writer.
     pub substantive: bool,
-    /// Newest `session-start`.
-    pub last_session_start_at: Option<i64>,
+    /// Earliest `session-start`.
+    pub first_session_start_at: Option<i64>,
     /// Newest `session-end`.
     pub last_session_end_at: Option<i64>,
     /// Newest `stop`.
@@ -16063,6 +16064,44 @@ pub const SESSION_LINE_TITLE_CHARS: usize = 80;
 pub const SUBSTANTIVE_OBSERVATION_KIND_SQL: &str =
     "kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use')";
 
+/// Whether `session_id` has recorded any substantive observation (user prompt
+/// or tool call) *after* the first `ended_observation_count` rows in insertion
+/// (`rowid ASC`) order.
+///
+/// Both [`ReaderPool::session_end_disposition`] and
+/// [`crate::ops::admit_hook_session`] share this predicate so an empty resume
+/// (`SessionStart` + `SessionEnd` with no prompt or tool call) stays
+/// `AlreadyEnded` instead of rewriting the session page, refreshing the
+/// auto-handoff, and enqueueing another LLM consolidation pass (#2504).
+/// Ordering by `rowid ASC` stays aligned after observation pruning lowers
+/// `ended_observation_count` to the surviving row count.
+pub(crate) fn session_has_substantive_work_after_watermark(
+    conn: &Connection,
+    session_id: SessionId,
+    ended_observation_count: u64,
+) -> StoreResult<bool> {
+    let sql = format!(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM ( \
+                 SELECT kind FROM observations \
+                 WHERE session_id = ?1 \
+                 ORDER BY rowid ASC \
+                 LIMIT -1 OFFSET ?2 \
+             ) \
+             WHERE {SUBSTANTIVE_OBSERVATION_KIND_SQL} \
+         )"
+    );
+    let has_work: i64 = conn.query_row(
+        &sql,
+        params![
+            session_id.as_bytes(),
+            i64::try_from(ended_observation_count).unwrap_or(i64::MAX),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(has_work != 0)
+}
+
 impl SessionObservationSnapshot<'_> {
     /// Rows this snapshot has deserialized into an [`Observation`] or a
     /// [`SessionLine`] so far. Aggregates and the prompt-title queries (the
@@ -16083,7 +16122,7 @@ impl SessionObservationSnapshot<'_> {
             "SELECT COUNT(*), \
                     COALESCE(SUM(kind = ?2), 0), \
                     COALESCE(MAX({SUBSTANTIVE_OBSERVATION_KIND_SQL}), 0), \
-                    MAX(CASE WHEN kind = ?3 THEN created_at END), \
+                    MIN(CASE WHEN kind = ?3 THEN created_at END), \
                     MAX(CASE WHEN kind = ?4 THEN created_at END), \
                     MAX(CASE WHEN kind = ?5 THEN created_at END), \
                     MAX(CASE WHEN kind = ?5 AND body <> '' THEN created_at END), \
@@ -16113,7 +16152,7 @@ impl SessionObservationSnapshot<'_> {
                     total: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
                     prompts: usize::try_from(row.get::<_, i64>(1)?).unwrap_or(usize::MAX),
                     substantive: row.get::<_, i64>(2)? != 0,
-                    last_session_start_at: row.get(3)?,
+                    first_session_start_at: row.get(3)?,
                     last_session_end_at: row.get(4)?,
                     last_stop_at: row.get(5)?,
                     last_stop_with_body_at: row.get(6)?,

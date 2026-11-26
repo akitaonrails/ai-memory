@@ -842,7 +842,26 @@ async fn apply_plan(
             }
         }
     }
+    // A page absent during planning may have reappeared during apply.
+    let current_server_paths = if plan.file_deletes.is_empty() {
+        BTreeSet::new()
+    } else {
+        match api.list_pages(scope.workspace, scope.project).await {
+            Ok(pages) => pages.into_iter().map(|page| page.path).collect(),
+            Err(error) => {
+                state::save(dest_root, &new_state)?;
+                return Err(error.context(
+                    "could not recheck repository deletions after recording completed changes",
+                ));
+            }
+        }
+    };
     for delete in &plan.file_deletes {
+        if current_server_paths.contains(&delete.path) {
+            report_race(&delete.path, "page reappeared on the server");
+            applied.raced.push(delete.path.clone());
+            continue;
+        }
         match delete_file(dest_root, delete) {
             Ok(true) => {
                 new_state.pages.remove(&delete.path);
@@ -872,9 +891,9 @@ fn report_local_change(path: &str) {
     );
 }
 
-fn report_race(path: &str, error: &anyhow::Error) {
+fn report_race(path: &str, reason: impl std::fmt::Display) {
     println!(
-        "  {:<9} {path} — {error}; left for the next sync",
+        "  {:<9} {path} — {reason}; left for the next sync",
         "CHANGED"
     );
 }
