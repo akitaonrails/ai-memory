@@ -72,10 +72,11 @@ session citation a write already carries (`PageEvidence::observations`).
   and the id outlives the observation. A class that must survive pruning has to
   be stored at compile time, not looked up from the observation later.
 - **Not covered:** the zero-LLM rule-based `sessions/<id>.md` page the hook
-  router writes at SessionEnd and at compaction checkpoints. It is built from
-  the session's observations and cites no session today, so it records no
-  sources. Pages compiled before V112 have none either; nothing is backfilled,
-  because the observations an old prompt selected were not kept.
+  router writes at SessionEnd and at compaction checkpoints, and the `idle_end`
+  tick writes when it ends an idle session. It is built from the session's
+  observations and cites no session today, so it records no sources. Pages
+  compiled before V112 have none either; nothing is backfilled, because the
+  observations an old prompt selected were not kept.
 
 Read path: `ReaderPool::page_compiled_sources`, by `(workspace_id, project_id,
 path)`, under the session-owner filter.
