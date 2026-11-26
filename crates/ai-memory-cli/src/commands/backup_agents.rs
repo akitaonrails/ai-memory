@@ -265,20 +265,16 @@ pub fn discover_assets(
     // Reuse the installer path so platform-specific Claude Desktop configs
     // are backed up and restored at the same location.
     if filter_agent(AgentKind::ClaudeDesktop) && want_global {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            let desktop_cfg =
-                crate::commands::install_mcp::mcp_config_path(McpClient::ClaudeDesktop)?;
-            push_if_file(
-                &mut assets,
-                AgentKind::ClaudeDesktop,
-                AgentAssetKind::McpConfig,
-                AgentAssetScope::Global,
-                desktop_cfg,
-                ".claude/claude_desktop_config.json",
-                "claude-desktop/claude_desktop_config.json",
-            );
-        }
+        let desktop_cfg = crate::commands::install_mcp::mcp_config_path(McpClient::ClaudeDesktop)?;
+        push_if_file(
+            &mut assets,
+            AgentKind::ClaudeDesktop,
+            AgentAssetKind::McpConfig,
+            AgentAssetScope::Global,
+            desktop_cfg,
+            ".claude/claude_desktop_config.json",
+            "claude-desktop/claude_desktop_config.json",
+        );
     }
 
     // 2. OpenAI Codex CLI
