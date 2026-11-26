@@ -29,6 +29,19 @@ version in [`docs/changelog/`](docs/changelog/):
   export or sync batch, while keeping `MAX_PATH_BYTES` (180), `MAX_DEPTH` (8),
   and fail-closed rejection of unsafe paths intact. (#2488)
 
+### Fixed
+
+- Rule-based session pages now compute `started_at` and session duration from
+  the earliest `SessionStart` observation instead of the latest one, so
+  compacted or resumed sessions no longer lose the time spent before the last
+  compaction or resume. (#2502)
+- Resuming an ended session and exiting without a user prompt or tool call no
+  longer re-ends the session, rewrites its wiki page, refreshes its
+  auto-handoff, or enqueues a duplicate LLM consolidation job. `AlreadyEnded`
+  detection now requires substantive observations past the end watermark, and
+  ended-session consolidation jobs key their generation on
+  `ended_observation_count`. (#2504)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
