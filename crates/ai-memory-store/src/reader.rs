@@ -12260,7 +12260,8 @@ impl ReaderPool {
         &self,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
-        self.list_projects_with_stats_filtered(None, viewer).await
+        self.list_projects_with_stats_filtered(None, None, viewer)
+            .await
     }
 
     /// Return one row per project within one workspace.
@@ -12275,13 +12276,36 @@ impl ReaderPool {
         workspace: String,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
-        self.list_projects_with_stats_filtered(Some(workspace), viewer)
+        self.list_projects_with_stats_filtered(Some(workspace), None, viewer)
             .await
+    }
+
+    /// Return the summary for an exact workspace and project name pair.
+    ///
+    /// The counts and viewer filter match [`Self::list_projects_with_stats`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn project_stats_by_name(
+        &self,
+        workspace: &str,
+        project: &str,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Option<ProjectSummary>> {
+        let mut rows = self
+            .list_projects_with_stats_filtered(
+                Some(workspace.to_owned()),
+                Some(project.to_owned()),
+                viewer,
+            )
+            .await?;
+        Ok(rows.pop())
     }
 
     async fn list_projects_with_stats_filtered(
         &self,
         workspace: Option<String>,
+        project: Option<String>,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
         self.with_conn(move |conn| {
@@ -12290,6 +12314,13 @@ impl ReaderPool {
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
             let ttl = not_expired("pg", "?2");
+            // Equality predicates let SQLite seek the unique project before
+            // it runs the aggregates, including on each dashboard refresh.
+            let scope = if project.is_some() {
+                "w.name = ?1 AND p.name = ?3"
+            } else {
+                "(?1 IS NULL OR w.name = ?1)"
+            };
             // A known observation need not be the newest activity. Aggregate
             // the three values so missing sources stay null, without a zero
             // fallback that would overtake a pre-epoch timestamp.
@@ -12310,12 +12341,16 @@ impl ReaderPool {
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.workspace_id = w.id AND pg.project_id = p.id AND pg.is_latest = 1{ttl} \
-                 WHERE (?1 IS NULL OR w.name = ?1){visible} \
+                 WHERE {scope}{visible} \
                  GROUP BY w.id, p.id \
                  ORDER BY last_activity DESC NULLS LAST"
             ))?;
             let now = now_us();
-            let rows = stmt.query_map(params![workspace, now], |row| {
+            let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&workspace, &now];
+            if let Some(project) = &project {
+                bound.push(project);
+            }
+            let rows = stmt.query_map(params_from_iter(bound), |row| {
                 let workspace_id: Vec<u8> = row.get(0)?;
                 let workspace_name: String = row.get(1)?;
                 let project_id: Vec<u8> = row.get(2)?;

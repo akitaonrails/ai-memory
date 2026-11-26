@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Scoped the project dashboard's summary query to the project being viewed,
+  avoiding aggregates for unrelated projects during recurring refreshes.
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
