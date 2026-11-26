@@ -211,7 +211,9 @@ fn tally_session(observations: &[Observation]) -> SessionTally<'_> {
     };
     for obs in observations {
         match obs.kind {
-            ObservationKind::SessionStart => tally.start = Some(obs),
+            ObservationKind::SessionStart => {
+                tally.start.get_or_insert(obs);
+            }
             ObservationKind::SessionEnd => tally.end = Some(obs),
             // #2149: a machine turn Claude Code routes through the prompt
             // channel is not a user prompt, so it counts in neither the
@@ -1126,7 +1128,7 @@ fn large(n: usize, ending: Ending) -> Vec<Row> {
     let long = "長い題名".repeat(40);
     let mut rows = vec![
         start(0),
-        // A second start: the newest one is the page's `started_at`.
+        // A second start: the earliest one is the page's `started_at`.
         start(1),
         prompt("make the backpressure test deterministic", 2),
     ];
@@ -1784,4 +1786,111 @@ async fn the_ephemeral_predicate_agrees_for_every_observation_kind() {
             "{kind:?}: digest vs row predicate"
         );
     }
+}
+
+/// A compacted or resumed session emits additional `SessionStart` rows after
+/// its original start. Both the bounded `SessionDigest::load` path and the
+/// row-list oracle must anchor `started_at` and duration on the earliest
+/// `SessionStart`, not the last compaction/resume start (#2502).
+#[tokio::test]
+async fn compacted_and_resumed_sessions_time_from_earliest_session_start() {
+    let fx = fixture().await;
+    let t0_ts = jiff::Timestamp::from_microsecond(BASE_US).unwrap();
+    let expected_started_at = format!(
+        "- **started_at:** {}",
+        t0_ts
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+    );
+
+    // Compacted session: SessionStart(T0) -> work -> PreCompact -> SessionStart(T0 + 50m) -> SessionEnd(T0 + 60m).
+    // Duration must be 60m (1h 0m), not 10m.
+    let compacted_rows = vec![
+        start(0),
+        prompt("refactor the storage layer", 10),
+        row(ObservationKind::PostToolUse, "Edit", "edited store.rs", 20),
+        row(ObservationKind::PreCompact, "pre-compact", "", 2990),
+        start(3000),
+        row(ObservationKind::Stop, "stop", "done", 3590),
+        end(3600),
+    ];
+    let compacted_sid = fx.seed(&compacted_rows).await;
+    fx.assert_equivalent("compacted", compacted_sid).await;
+
+    let compacted_obs = fx
+        .store
+        .reader
+        .observations_for_session(compacted_sid)
+        .await
+        .unwrap();
+    let compacted_digest = SessionDigest::load(&fx.store.reader, fx.ws, fx.proj, compacted_sid)
+        .await
+        .unwrap();
+    assert_eq!(
+        compacted_digest,
+        SessionDigest::from_observations(compacted_sid, &compacted_obs),
+        "bounded digest and from_observations must agree on compacted session"
+    );
+    let compacted_page = crate::synthesize_session_page(
+        fx.ws,
+        fx.proj,
+        compacted_sid,
+        AgentKind::ClaudeCode,
+        &compacted_digest,
+    );
+    assert!(
+        compacted_page.body.contains(&expected_started_at),
+        "compacted page must use T0 for started_at:\n{}",
+        compacted_page.body
+    );
+    let compacted_summary = compacted_page.frontmatter_json["summary"].as_str().unwrap();
+    assert!(
+        compacted_summary.contains("over 1h"),
+        "compacted summary must span T2 - T0 (1h), got: {compacted_summary}"
+    );
+
+    // Resumed session: SessionStart(T0) -> work -> SessionEnd(T0 + 5m) -> SessionStart(T0 + 30m) -> work -> SessionEnd(T0 + 45m).
+    // Duration must be 45m, not 15m.
+    let resumed_rows = vec![
+        start(0),
+        prompt("initial investigation", 10),
+        end(300),
+        start(1800),
+        prompt("follow-up fix", 1810),
+        end(2700),
+    ];
+    let resumed_sid = fx.seed(&resumed_rows).await;
+    fx.assert_equivalent("resumed", resumed_sid).await;
+
+    let resumed_obs = fx
+        .store
+        .reader
+        .observations_for_session(resumed_sid)
+        .await
+        .unwrap();
+    let resumed_digest = SessionDigest::load(&fx.store.reader, fx.ws, fx.proj, resumed_sid)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed_digest,
+        SessionDigest::from_observations(resumed_sid, &resumed_obs),
+        "bounded digest and from_observations must agree on resumed session"
+    );
+    let resumed_page = crate::synthesize_session_page(
+        fx.ws,
+        fx.proj,
+        resumed_sid,
+        AgentKind::ClaudeCode,
+        &resumed_digest,
+    );
+    assert!(
+        resumed_page.body.contains(&expected_started_at),
+        "resumed page must use T0 for started_at:\n{}",
+        resumed_page.body
+    );
+    let resumed_summary = resumed_page.frontmatter_json["summary"].as_str().unwrap();
+    assert!(
+        resumed_summary.contains("over 45m"),
+        "resumed summary must span T3 - T0 (45m), got: {resumed_summary}"
+    );
 }

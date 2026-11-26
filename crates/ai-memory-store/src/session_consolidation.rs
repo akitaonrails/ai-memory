@@ -164,47 +164,74 @@ fn enqueue_eligible_in_tx(
     session_id: SessionId,
     eligibility: EnqueueEligibility,
 ) -> StoreResult<bool> {
-    let ended_predicate = match eligibility {
-        EnqueueEligibility::EndedSession => "AND s.ended_at IS NOT NULL",
-        EnqueueEligibility::AnySession => "",
-    };
-    let sql = format!(
-        "INSERT OR IGNORE INTO session_consolidation_jobs \
-         (session_id, workspace_id, project_id, generation, state, requested_at, \
-          next_attempt_at, started_at, completed_at, attempts, claim_id, last_error) \
-         SELECT s.id, s.workspace_id, s.project_id, COUNT(o.id), 'pending', ?4, \
-                ?4, NULL, NULL, 0, NULL, NULL \
-         FROM sessions s \
-         JOIN observations o ON o.session_id = s.id \
-         WHERE s.id = ?1 AND s.workspace_id = ?2 AND s.project_id = ?3 \
-           {ended_predicate} \
-         GROUP BY s.id, s.workspace_id, s.project_id \
-         HAVING COUNT(o.id) > 0"
-    );
     let now = Timestamp::now().as_microsecond();
-    let inserted = tx.execute(
-        &sql,
-        params![
-            session_id.as_bytes(),
-            workspace_id.as_bytes(),
-            project_id.as_bytes(),
-            now,
-        ],
-    )?;
+    let (inserted, supersede_bound_sql) = match eligibility {
+        EnqueueEligibility::EndedSession => {
+            // Use the persisted end watermark (`ended_observation_count`) as
+            // the job generation rather than live `COUNT(o.id)` (#2504). An
+            // empty resume appends `SessionStart` without re-ending the
+            // session; using live count would cause `AlreadyEnded` crash
+            // recovery to enqueue a duplicate consolidation job and supersede
+            // a still-pending job for the real end.
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO session_consolidation_jobs \
+                 (session_id, workspace_id, project_id, generation, state, requested_at, \
+                  next_attempt_at, started_at, completed_at, attempts, claim_id, last_error) \
+                 SELECT s.id, s.workspace_id, s.project_id, s.ended_observation_count, \
+                        'pending', ?4, ?4, NULL, NULL, 0, NULL, NULL \
+                 FROM sessions s \
+                 WHERE s.id = ?1 AND s.workspace_id = ?2 AND s.project_id = ?3 \
+                   AND s.ended_at IS NOT NULL \
+                   AND s.ended_observation_count > 0",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    now,
+                ],
+            )?;
+            (
+                inserted,
+                "(SELECT ended_observation_count FROM sessions WHERE id = ?2)",
+            )
+        }
+        EnqueueEligibility::AnySession => {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO session_consolidation_jobs \
+                 (session_id, workspace_id, project_id, generation, state, requested_at, \
+                  next_attempt_at, started_at, completed_at, attempts, claim_id, last_error) \
+                 SELECT s.id, s.workspace_id, s.project_id, COUNT(o.id), 'pending', ?4, \
+                        ?4, NULL, NULL, 0, NULL, NULL \
+                 FROM sessions s \
+                 JOIN observations o ON o.session_id = s.id \
+                 WHERE s.id = ?1 AND s.workspace_id = ?2 AND s.project_id = ?3 \
+                 GROUP BY s.id, s.workspace_id, s.project_id \
+                 HAVING COUNT(o.id) > 0",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    now,
+                ],
+            )?;
+            (
+                inserted,
+                "(SELECT COUNT(*) FROM observations WHERE session_id = ?2)",
+            )
+        }
+    };
     // A newer pending generation subsumes an older one because consolidation
     // reads the session's current observations. Running work keeps its lease:
     // it may already have read the older snapshot, so the new generation must
     // still run afterward.
-    tx.execute(
+    let supersede_sql = format!(
         "UPDATE session_consolidation_jobs \
          SET state = 'superseded', completed_at = ?1, claim_id = NULL, \
              last_error = 'superseded by a newer observation generation' \
          WHERE session_id = ?2 AND state = 'pending' \
-           AND generation < ( \
-               SELECT COUNT(*) FROM observations WHERE session_id = ?2 \
-           )",
-        params![now, session_id.as_bytes()],
-    )?;
+           AND generation < {supersede_bound_sql}"
+    );
+    tx.execute(&supersede_sql, params![now, session_id.as_bytes()])?;
     Ok(inserted == 1)
 }
 
