@@ -6928,12 +6928,11 @@ impl ReaderPool {
             if ended_at.is_none() {
                 return Ok(SessionEndDisposition::Open);
             }
-            let current_observation_count: u64 = conn.query_row(
-                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
-                params![session_id.as_bytes()],
-                |row| row.get(0),
-            )?;
-            if current_observation_count > ended_observation_count {
+            if session_has_substantive_work_after_watermark(
+                conn,
+                session_id,
+                ended_observation_count,
+            )? {
                 Ok(SessionEndDisposition::ReEndWithNewWork)
             } else {
                 Ok(SessionEndDisposition::AlreadyEnded)
@@ -16005,6 +16004,44 @@ pub const SESSION_LINE_TITLE_CHARS: usize = 80;
 /// pins the three together).
 pub const SUBSTANTIVE_OBSERVATION_KIND_SQL: &str =
     "kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use')";
+
+/// Whether `session_id` has recorded any substantive observation (user prompt
+/// or tool call) *after* the first `ended_observation_count` rows in insertion
+/// (`rowid ASC`) order.
+///
+/// Both [`ReaderPool::session_end_disposition`] and
+/// [`crate::ops::admit_hook_session`] share this predicate so an empty resume
+/// (`SessionStart` + `SessionEnd` with no prompt or tool call) stays
+/// `AlreadyEnded` instead of rewriting the session page, refreshing the
+/// auto-handoff, and enqueueing another LLM consolidation pass (#2504).
+/// Ordering by `rowid ASC` stays aligned after observation pruning lowers
+/// `ended_observation_count` to the surviving row count.
+pub(crate) fn session_has_substantive_work_after_watermark(
+    conn: &Connection,
+    session_id: SessionId,
+    ended_observation_count: u64,
+) -> StoreResult<bool> {
+    let sql = format!(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM ( \
+                 SELECT kind FROM observations \
+                 WHERE session_id = ?1 \
+                 ORDER BY rowid ASC \
+                 LIMIT -1 OFFSET ?2 \
+             ) \
+             WHERE {SUBSTANTIVE_OBSERVATION_KIND_SQL} \
+         )"
+    );
+    let has_work: i64 = conn.query_row(
+        &sql,
+        params![
+            session_id.as_bytes(),
+            i64::try_from(ended_observation_count).unwrap_or(i64::MAX),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(has_work != 0)
+}
 
 impl SessionObservationSnapshot<'_> {
     /// Rows this snapshot has deserialized into an [`Observation`] or a
