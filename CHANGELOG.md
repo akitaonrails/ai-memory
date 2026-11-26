@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved the current fallback session ID when `finalize-session` closes
+  a different session. The fallback clears only when its own session-end
+  is acknowledged, including when a later request in `--all` fails.
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

@@ -451,6 +451,14 @@ pub(crate) fn clear_session_id(data_dir: &Path, agent: AgentKind) {
     let _ = fs::remove_file(session_id_state_path(data_dir, agent));
 }
 
+pub(crate) fn clear_matching_session_id(data_dir: &Path, agent: AgentKind, session_id: &str) {
+    if agent_needs_session_id_state(agent)
+        && stored_session_id(data_dir, agent).as_deref() == Some(session_id)
+    {
+        clear_session_id(data_dir, agent);
+    }
+}
+
 /// `<data_dir>/briefed/<key>` — records that the compiled project brief
 /// (`[briefing] inject_on_session_start`) was already delivered for this
 /// session by the user-prompt handoff path. kimi-code discards SessionStart
