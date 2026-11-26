@@ -317,6 +317,10 @@ pub struct Config {
     pub i18n: ai_memory_core::i18n::Localizer,
     /// Root data directory holding `wiki/`, `raw/`, `db/`, `models/`, `logs/`.
     pub data_dir: PathBuf,
+    /// Directory containing the loaded `config.toml` (used to confine relative
+    /// config-adjacent files such as `pi_tool_overrides`).
+    #[serde(skip)]
+    pub config_dir: PathBuf,
     /// Whether `--data-dir`, `AI_MEMORY_DATA_DIR` or the config file's
     /// `data_dir` key chose [`Self::data_dir`], including an explicit value
     /// equal to the platform default.
@@ -586,6 +590,14 @@ pub struct Config {
     /// Set with `AI_MEMORY_PI_DIRECT_TOOLS` or `pi_direct_tools` in
     /// `config.toml`.
     pub pi_direct_tools: Option<Vec<String>>,
+    /// Optional relative path inside the config directory to a JSON file
+    /// overriding declared tool descriptions and/or narrowing declared
+    /// parameters in the generated Pi extension (#2493). Unset (`None`, the
+    /// default) keeps the generated extension byte-identical. Validated
+    /// offline against the compiled MCP tool catalog. Orthogonal to
+    /// `pi_tool_exposure` and `pi_direct_tools`. Set with
+    /// `AI_MEMORY_PI_TOOL_OVERRIDES` or `pi_tool_overrides` in `config.toml`.
+    pub pi_tool_overrides: Option<String>,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -1607,6 +1619,7 @@ impl Default for Config {
             language: ai_memory_core::i18n::Language::English,
             i18n: ai_memory_core::i18n::Localizer::default(),
             data_dir: default_data_dir(),
+            config_dir: default_data_dir(),
             data_dir_explicit: false,
             bind: DEFAULT_BIND.into(),
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
@@ -1644,6 +1657,7 @@ impl Default for Config {
             claude_true_yolo: false,
             pi_tool_exposure: PiToolExposure::default(),
             pi_direct_tools: None,
+            pi_tool_overrides: None,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -2860,6 +2874,11 @@ impl Config {
         )?;
         config.i18n = ai_memory_core::i18n::Localizer::new(config.language);
         config.runtime_env = runtime_env;
+        config.config_dir = resolved_config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| config.data_dir.clone());
 
         validate_run_profiles(&config.run)?;
         if config.profile.max_output_tokens == 0 {
@@ -3156,6 +3175,9 @@ impl Config {
             .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?;
         validate_auth_settings(&config.auth)?;
         validate_pi_direct_tools(config.pi_tool_exposure, config.pi_direct_tools.as_deref())?;
+        if let Some(raw_path) = config.pi_tool_overrides.as_deref() {
+            validate_pi_tool_overrides_path(raw_path)?;
+        }
 
         // Validated and resolved eagerly, unlike the primary provider (which
         // stays lazily checked at `serve` startup): a fallback can otherwise
@@ -4205,6 +4227,171 @@ fn validate_pi_direct_tools(
                  at most {MAX_PI_DIRECT_TOOL_NAME_LEN} characters, and use only ASCII letters, \
                  digits, `_`, or `-`"
             );
+        }
+    }
+    Ok(())
+}
+
+/// Maximum byte size of the `pi_tool_overrides` JSON file (64 KiB).
+pub const MAX_PI_TOOL_OVERRIDES_BYTES: usize = 64 * 1024;
+
+/// Maximum character length of a tool or parameter override description.
+pub const MAX_PI_TOOL_OVERRIDE_DESC_CHARS: usize = 4096;
+
+/// Per-tool description and parameter overrides for the generated Pi extension
+/// (#2493).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiToolOverride {
+    /// Replacement tool description (1..=4096 characters when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Subset of parameter names to keep, mapped to replacement descriptions.
+    /// When present, every required parameter of the tool must be included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<BTreeMap<String, String>>,
+}
+
+impl Config {
+    /// Load and validate the configured `pi_tool_overrides` JSON file against
+    /// the compiled MCP tool catalog (#2493). Returns `Ok(None)` when
+    /// `pi_tool_overrides` is unset.
+    pub fn load_pi_tool_overrides(&self) -> Result<Option<BTreeMap<String, PiToolOverride>>> {
+        let Some(raw) = self.pi_tool_overrides.as_deref() else {
+            return Ok(None);
+        };
+        load_and_validate_pi_tool_overrides(&self.config_dir, raw).map(Some)
+    }
+}
+
+/// Validate the syntax of a `pi_tool_overrides` path without touching disk
+/// (must be a non-empty relative path with no NUL, root, or `..` components).
+fn validate_pi_tool_overrides_path(raw_path: &str) -> Result<&str> {
+    use std::path::Component;
+
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() || raw_path.contains('\0') {
+        anyhow::bail!(
+            "pi_tool_overrides must be a non-empty relative path inside the config directory"
+        );
+    }
+    let rel = Path::new(trimmed);
+    if rel.is_absolute()
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!("pi_tool_overrides `{trimmed}` escapes the config directory");
+    }
+    Ok(trimmed)
+}
+
+/// Resolve, read, parse, and validate a `pi_tool_overrides` JSON file confined
+/// to `config_dir` against [`ai_memory_mcp::AiMemoryServer::tool_definitions`].
+fn load_and_validate_pi_tool_overrides(
+    config_dir: &Path,
+    raw_path: &str,
+) -> Result<BTreeMap<String, PiToolOverride>> {
+    use std::io::Read as _;
+
+    let trimmed = validate_pi_tool_overrides_path(raw_path)?;
+    let rel = Path::new(trimmed);
+
+    let canon_dir = std::fs::canonicalize(config_dir).with_context(|| {
+        format!(
+            "resolving pi_tool_overrides config directory `{}`",
+            config_dir.display()
+        )
+    })?;
+    let candidate = canon_dir.join(rel);
+    let canon_file = std::fs::canonicalize(&candidate)
+        .with_context(|| format!("resolving pi_tool_overrides file `{trimmed}`"))?;
+    if !canon_file.starts_with(&canon_dir) {
+        anyhow::bail!("pi_tool_overrides `{trimmed}` escapes the config directory");
+    }
+
+    let meta = std::fs::metadata(&canon_file)
+        .with_context(|| format!("reading pi_tool_overrides file `{trimmed}`"))?;
+    if !meta.is_file() {
+        anyhow::bail!("pi_tool_overrides `{trimmed}` must point to a regular file");
+    }
+    if meta.len() > MAX_PI_TOOL_OVERRIDES_BYTES as u64 {
+        anyhow::bail!(
+            "pi_tool_overrides file `{trimmed}` exceeds the {MAX_PI_TOOL_OVERRIDES_BYTES} byte limit"
+        );
+    }
+
+    let file = std::fs::File::open(&canon_file)
+        .with_context(|| format!("reading pi_tool_overrides file `{trimmed}`"))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_PI_TOOL_OVERRIDES_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading pi_tool_overrides file `{trimmed}`"))?;
+    if bytes.len() > MAX_PI_TOOL_OVERRIDES_BYTES {
+        anyhow::bail!(
+            "pi_tool_overrides file `{trimmed}` exceeds the {MAX_PI_TOOL_OVERRIDES_BYTES} byte limit"
+        );
+    }
+
+    let overrides: BTreeMap<String, PiToolOverride> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing pi_tool_overrides file `{trimmed}`"))?;
+
+    validate_pi_tool_overrides_against_catalog(&overrides)?;
+    Ok(overrides)
+}
+
+fn validate_pi_tool_overrides_against_catalog(
+    overrides: &BTreeMap<String, PiToolOverride>,
+) -> Result<()> {
+    let defs = ai_memory_mcp::AiMemoryServer::tool_definitions();
+    let by_name: std::collections::HashMap<&str, _> =
+        defs.iter().map(|tool| (tool.name.as_ref(), tool)).collect();
+
+    for (tool_name, entry) in overrides {
+        let Some(tool) = by_name.get(tool_name.as_str()) else {
+            anyhow::bail!("pi_tool_overrides names unknown tool `{tool_name}`");
+        };
+        if let Some(desc) = &entry.description
+            && (desc.trim().is_empty() || desc.chars().count() > MAX_PI_TOOL_OVERRIDE_DESC_CHARS)
+        {
+            anyhow::bail!(
+                "pi_tool_overrides description for `{tool_name}` must be non-empty and at most \
+                 {MAX_PI_TOOL_OVERRIDE_DESC_CHARS} characters"
+            );
+        }
+        if let Some(params) = &entry.params {
+            let schema_props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|v| v.as_object());
+            for (param_name, param_desc) in params {
+                let exists = schema_props.is_some_and(|props| props.contains_key(param_name));
+                if !exists {
+                    anyhow::bail!(
+                        "pi_tool_overrides for `{tool_name}` names unknown parameter `{param_name}`"
+                    );
+                }
+                if param_desc.trim().is_empty()
+                    || param_desc.chars().count() > MAX_PI_TOOL_OVERRIDE_DESC_CHARS
+                {
+                    anyhow::bail!(
+                        "pi_tool_overrides description for `{tool_name}.{param_name}` must be \
+                         non-empty and at most {MAX_PI_TOOL_OVERRIDE_DESC_CHARS} characters"
+                    );
+                }
+            }
+            if let Some(required) = tool.input_schema.get("required").and_then(|v| v.as_array()) {
+                for req in required.iter().filter_map(|v| v.as_str()) {
+                    if !params.contains_key(req) {
+                        anyhow::bail!(
+                            "pi_tool_overrides for `{tool_name}` omits required parameter `{req}`"
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -6953,6 +7140,176 @@ input_token_safety_margin = {margin}
             conflict_empty.to_string().contains("mutually exclusive"),
             "{conflict_empty}"
         );
+    }
+
+    /// #2493: `pi_tool_overrides` defaults to `None`, loads valid overrides
+    /// confined to `config_dir`, and rejects path traversal, symlink escapes,
+    /// oversized files, unknown fields, unknown tools/params, missing required
+    /// params, and empty or oversized descriptions.
+    #[test]
+    fn load_validates_pi_tool_overrides() {
+        let absent = load_with_toml("").unwrap();
+        assert_eq!(absent.pi_tool_overrides, None);
+        assert_eq!(absent.load_pi_tool_overrides().unwrap(), None);
+
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let overrides_path = tmp.path().join("pi-tool-overrides.json");
+        std::fs::write(
+            &overrides_path,
+            r#"{
+              "memory_recent": {
+                "description": "List recently updated pages.",
+                "params": {
+                  "limit": "Max pages."
+                }
+              },
+              "memory_query": {
+                "params": {
+                  "query": "Search terms."
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &cfg_path,
+            "pi_tool_overrides = \"pi-tool-overrides.json\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&cfg_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        let loaded = cfg.load_pi_tool_overrides().unwrap().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded["memory_recent"].description.as_deref(),
+            Some("List recently updated pages.")
+        );
+        assert_eq!(
+            loaded["memory_query"]
+                .params
+                .as_ref()
+                .and_then(|p| p.get("query"))
+                .map(String::as_str),
+            Some("Search terms.")
+        );
+
+        // Path traversal and absolute paths are rejected.
+        for bad_path in ["", "   ", "../outside.json", "/etc/passwd"] {
+            let err = load_and_validate_pi_tool_overrides(tmp.path(), bad_path).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("escapes the config directory")
+                    || msg.contains("non-empty relative path"),
+                "{bad_path}: {msg}"
+            );
+        }
+
+        // Symlink escaping config_dir is rejected.
+        #[cfg(unix)]
+        {
+            let outside = TempDir::new().unwrap();
+            let outside_file = outside.path().join("escape.json");
+            std::fs::write(&outside_file, "{}").unwrap();
+            let link = tmp.path().join("link.json");
+            std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+            let err = load_and_validate_pi_tool_overrides(tmp.path(), "link.json").unwrap_err();
+            assert!(
+                err.to_string().contains("escapes the config directory"),
+                "{err}"
+            );
+        }
+
+        // Oversized file (> 64 KiB) is rejected.
+        let big = tmp.path().join("big.json");
+        std::fs::write(&big, " ".repeat(MAX_PI_TOOL_OVERRIDES_BYTES + 1)).unwrap();
+        let err = load_and_validate_pi_tool_overrides(tmp.path(), "big.json").unwrap_err();
+        assert!(err.to_string().contains("exceeds the"), "{err}");
+
+        // Unknown JSON field is rejected by deny_unknown_fields.
+        let unknown_field = tmp.path().join("unknown-field.json");
+        std::fs::write(
+            &unknown_field,
+            r#"{"memory_recent":{"description":"ok","extra":true}}"#,
+        )
+        .unwrap();
+        let err =
+            load_and_validate_pi_tool_overrides(tmp.path(), "unknown-field.json").unwrap_err();
+        assert!(format!("{err:#}").contains("unknown field"), "{err:#}");
+
+        // Unknown tool is rejected.
+        let unknown_tool = tmp.path().join("unknown-tool.json");
+        std::fs::write(
+            &unknown_tool,
+            r#"{"memory_nonexistent":{"description":"x"}}"#,
+        )
+        .unwrap();
+        let err = load_and_validate_pi_tool_overrides(tmp.path(), "unknown-tool.json").unwrap_err();
+        assert!(err.to_string().contains("unknown tool"), "{err}");
+
+        // Unknown parameter is rejected.
+        let unknown_param = tmp.path().join("unknown-param.json");
+        std::fs::write(
+            &unknown_param,
+            r#"{"memory_recent":{"params":{"no_such_param":"x"}}}"#,
+        )
+        .unwrap();
+        let err =
+            load_and_validate_pi_tool_overrides(tmp.path(), "unknown-param.json").unwrap_err();
+        assert!(err.to_string().contains("unknown parameter"), "{err}");
+
+        // Missing required parameter (`query` on `memory_query`) is rejected.
+        let missing_req = tmp.path().join("missing-req.json");
+        std::fs::write(
+            &missing_req,
+            r#"{"memory_query":{"params":{"limit":"max"}}}"#,
+        )
+        .unwrap();
+        let err = load_and_validate_pi_tool_overrides(tmp.path(), "missing-req.json").unwrap_err();
+        assert!(
+            err.to_string().contains("omits required parameter `query`"),
+            "{err}"
+        );
+
+        // Empty and oversized descriptions (tool and param) are rejected.
+        let empty_desc = tmp.path().join("empty-desc.json");
+        std::fs::write(&empty_desc, r#"{"memory_recent":{"description":"   "}}"#).unwrap();
+        let err = load_and_validate_pi_tool_overrides(tmp.path(), "empty-desc.json").unwrap_err();
+        assert!(err.to_string().contains("must be non-empty"), "{err}");
+
+        let long_desc = tmp.path().join("long-desc.json");
+        let over = "x".repeat(MAX_PI_TOOL_OVERRIDE_DESC_CHARS + 1);
+        std::fs::write(
+            &long_desc,
+            format!(r#"{{"memory_recent":{{"description":"{over}"}}}}"#),
+        )
+        .unwrap();
+        let err = load_and_validate_pi_tool_overrides(tmp.path(), "long-desc.json").unwrap_err();
+        assert!(err.to_string().contains("must be non-empty"), "{err}");
+
+        let empty_param_desc = tmp.path().join("empty-param-desc.json");
+        std::fs::write(
+            &empty_param_desc,
+            r#"{"memory_recent":{"params":{"limit":""}}}"#,
+        )
+        .unwrap();
+        let err =
+            load_and_validate_pi_tool_overrides(tmp.path(), "empty-param-desc.json").unwrap_err();
+        assert!(err.to_string().contains("must be non-empty"), "{err}");
+
+        let long_param_desc = tmp.path().join("long-param-desc.json");
+        std::fs::write(
+            &long_param_desc,
+            format!(r#"{{"memory_recent":{{"params":{{"limit":"{over}"}}}}}}"#),
+        )
+        .unwrap();
+        let err =
+            load_and_validate_pi_tool_overrides(tmp.path(), "long-param-desc.json").unwrap_err();
+        assert!(err.to_string().contains("must be non-empty"), "{err}");
     }
 
     #[test]

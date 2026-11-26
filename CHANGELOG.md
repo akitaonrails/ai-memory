@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Pi tool description and parameter overrides (`pi_tool_overrides` /
+  `AI_MEMORY_PI_TOOL_OVERRIDES`): operators can point to a JSON file relative
+  to the config directory (confined to that directory, max 64 KiB) to shorten
+  declared tool descriptions and/or filter declared optional parameters in the
+  generated `ai-memory-pi.ts` extension without changing the MCP server.
+  `install-hooks` validates overrides offline against the compiled MCP tool
+  catalog (`AiMemoryServer::tool_definitions()`), rejecting unknown tools or
+  parameters, missing required parameters, path escapes, and empty or overlong
+  descriptions; works orthogonally with `pi_tool_exposure` and
+  `pi_direct_tools`, and leaves output byte-identical when unset. (#2493)
+
 - Reported measured session token usage for OpenCode 2 and Antigravity CLI:
   OpenCode 2's generated plugin records measured assistant message/step token
   counters keyed by native message ID (`_ai_memory_usage_calls`) on `stop` and

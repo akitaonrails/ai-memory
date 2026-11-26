@@ -1062,3 +1062,16 @@ diag-pi-direct-tools-codemode-conflict = pi_direct_tools e pi_tool_exposure = "c
 diag-pi-direct-tools-too-many = pi_direct_tools pode listar no máximo { $max } ferramentas (recebido { $count })
 diag-pi-direct-tools-invalid-entry = a entrada `{ $tool }` em pi_direct_tools é inválida; nomes de ferramentas não podem ser vazios, devem ter no máximo { $max } caracteres e usar apenas letras ASCII, dígitos, `_` ou `-`
 diag-workstream-search-before-sequence-with-query = before_sequence não pode ser combinado com uma consulta de texto
+diag-pi-tool-overrides-invalid-path = pi_tool_overrides deve ser um caminho relativo não vazio dentro do diretório de configuração
+diag-pi-tool-overrides-escapes-config-dir = pi_tool_overrides `{ $path }` escapa do diretório de configuração
+diag-pi-tool-overrides-not-regular-file = pi_tool_overrides `{ $path }` deve apontar para um arquivo regular
+diag-pi-tool-overrides-resolve-config-dir = resolvendo o diretório de configuração de pi_tool_overrides `{ $path }`
+diag-pi-tool-overrides-resolve-file = resolvendo o arquivo pi_tool_overrides `{ $path }`
+diag-pi-tool-overrides-read-file = lendo o arquivo pi_tool_overrides `{ $path }`
+diag-pi-tool-overrides-too-large = o arquivo pi_tool_overrides `{ $path }` excede o limite de { $max } bytes
+diag-pi-tool-overrides-parse-json = analisando o arquivo pi_tool_overrides `{ $path }`
+diag-pi-tool-overrides-unknown-tool = pi_tool_overrides referencia a ferramenta desconhecida `{ $tool }`
+diag-pi-tool-overrides-invalid-description = a descrição em pi_tool_overrides para `{ $tool }` não pode ser vazia e deve ter no máximo { $max } caracteres
+diag-pi-tool-overrides-unknown-param = pi_tool_overrides para `{ $tool }` referencia o parâmetro desconhecido `{ $param }`
+diag-pi-tool-overrides-invalid-param-description = a descrição em pi_tool_overrides para `{ $tool }.{ $param }` não pode ser vazia e deve ter no máximo { $max } caracteres
+diag-pi-tool-overrides-missing-required-param = pi_tool_overrides para `{ $tool }` omite o parâmetro obrigatório `{ $param }`
