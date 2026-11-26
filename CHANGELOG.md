@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `AI_MEMORY_DECAY__TOKEN_CALL_TOOL_RETENTION_DAYS`, default `0` = off), a
   forget-sweep pass that deletes the `token_call_tools` rows of closed-session
   token calls older than the cutoff, in bounded batches per scope. Token calls
-  and `session_usage` totals are kept.
+  and `session_usage` totals are kept. (#2514)
 - Reported measured session token usage for OpenCode 2 and Antigravity CLI:
   OpenCode 2's generated plugin records measured assistant message/step token
   counters keyed by native message ID (`_ai_memory_usage_calls`) on `stop` and
