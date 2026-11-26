@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept validated MCP server and tool names from Antigravity CLI tool hooks
+  while retaining the metadata-only capture policy. (#2505)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
