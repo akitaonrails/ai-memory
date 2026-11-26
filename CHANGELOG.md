@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Native `antigravity-cli` `stop` hooks now emit `{"decision":""}` on stdout to
+  match Antigravity's documented `Stop` response contract and the shell and
+  PowerShell hook bundles. (#2521)
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
