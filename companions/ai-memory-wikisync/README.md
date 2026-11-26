@@ -222,7 +222,10 @@ Safety rules:
   the tool rechecks that its repository file is still absent. A file restored
   during planning keeps the server page and baseline, even with `--prefer repo`;
   the run reports the change and exits non-zero so the next sync can reconsider
-  it. The tool never runs git: it prints the `git rm` to stage the deletes.
+  it. Before deleting repository files, the tool refreshes the server page
+  listing. A page present in the refreshed listing keeps its file and
+  baseline, including with `--prefer server`, and is reported for the next
+  sync. The tool never runs git: it prints the `git rm` to stage the deletes.
   Apply order is imports, exports, server deletes, file deletes.
 
 ## CI and post-merge

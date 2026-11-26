@@ -63,6 +63,8 @@ fn next_version() -> String {
 struct Fixture {
     /// Pages in listing order.
     pages: Mutex<Vec<FixturePage>>,
+    /// Restore this page after the next listing takes its snapshot.
+    restore_after_listing: Mutex<Option<FixturePage>>,
     token: Option<&'static str>,
     project_exists: bool,
     /// Page advertised by the listing but missing on read, to simulate a
@@ -116,6 +118,7 @@ impl Fixture {
     fn with_pages(pages: Vec<FixturePage>) -> Self {
         Self {
             pages: Mutex::new(pages),
+            restore_after_listing: Mutex::new(None),
             token: None,
             project_exists: true,
             unreachable: None,
@@ -221,7 +224,14 @@ async fn recent_handler(
         .and_then(|value| value.strip_prefix("idx:"))
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    let all = fixture.pages.lock().unwrap().clone();
+    let all = {
+        let mut pages = fixture.pages.lock().unwrap();
+        let listed = pages.clone();
+        if let Some(restored) = fixture.restore_after_listing.lock().unwrap().take() {
+            pages.push(restored);
+        }
+        listed
+    };
     if fixture.legacy_listing {
         let limit = query
             .get("limit")
@@ -1741,6 +1751,51 @@ async fn sync_propagates_deletes_from_an_unchanged_side() {
         dest.join("decisions/kept.md").exists(),
         "untouched pages stay"
     );
+}
+
+#[tokio::test]
+async fn sync_keeps_a_file_when_its_server_page_reappears_during_planning() {
+    let restored_path = "decisions/db.md";
+    let absent_path = "decisions/other.md";
+    for prefer in [None, Some(Prefer::Server)] {
+        let mut other = decision();
+        other.path = absent_path.to_string();
+        let (addr, fixture) = serve(Fixture::with_pages(vec![decision(), other])).await;
+        let (_tmp, dest) = temp_dest();
+        sync(addr, &dest).await.expect("first sync");
+        let before = state::load(&dest).unwrap();
+        let disk = fs::read(dest.join(restored_path)).unwrap();
+
+        fixture.remove(restored_path);
+        fixture.remove(absent_path);
+        *fixture.restore_after_listing.lock().unwrap() = Some(FixturePage::new(
+            restored_path,
+            "Restored with a new server edit.",
+        ));
+
+        let result = bidi::run(&deleting_args(addr, &dest, prefer), SyncMode::Apply).await;
+        assert_eq!(
+            fs::read(dest.join(restored_path)).expect("a restored page must keep its local file"),
+            disk
+        );
+        let after = state::load(&dest).unwrap();
+        assert_eq!(after.pages[restored_path], before.pages[restored_path]);
+        let message = result
+            .expect_err("the server race must be reported")
+            .to_string();
+        assert!(message.contains("changed during this run"), "{message}");
+        assert!(message.contains(restored_path), "{message}");
+
+        assert!(!dest.join(absent_path).exists());
+        assert!(!after.pages.contains_key(absent_path));
+        assert!(fixture.mcp_calls.lock().unwrap().is_empty());
+
+        sync(addr, &dest)
+            .await
+            .expect("the next sync exports the restored page");
+        let contents = fs::read_to_string(dest.join(restored_path)).unwrap();
+        assert!(contents.contains("Restored with a new server edit."));
+    }
 }
 
 /// A restored file invalidates the planned repository-side deletion even

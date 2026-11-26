@@ -1084,11 +1084,12 @@ The normal capture contract is intentionally narrow: supported Claude Code,
 OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
-arguments, paths, input bodies, or arbitrary tool names. The one name kept is
-an MCP tool's: a call named `mcp__<server>__<tool>` (Claude Code, Codex, Hermes
-Agent) stays in the `unknown` family, with no input or output, and adds
-`mcp_server` and `mcp_tool` lines when the whole name is at most 64 ASCII
-letters, digits, `_` or `-`. `PostToolUse` appends
+arguments, paths, input bodies, or arbitrary tool names. MCP calls stay in the
+`unknown` family, with no input or output. They can retain `mcp_server` and
+`mcp_tool` when Claude Code, Codex, or Hermes Agent supplies
+`mcp__<server>__<tool>`, or when Antigravity CLI supplies `ServerName` and
+`ToolName` in its `call_mcp_tool` wrapper. The equivalent prefixed name
+must fit within 64 ASCII letters, digits, `_` or `-`. `PostToolUse` appends
 its existing tool-response/error excerpt and caps the complete rendered body at
 2,000 UTF-8-safe bytes. Antigravity's successful file-edit events fall back to
 the bounded replacement or written-content field in `toolCall.args` because its
