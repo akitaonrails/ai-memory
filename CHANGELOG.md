@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `reclaim-ledger-versions --drop-latest` answering "nothing to reclaim"
+  when only recognized live ledger heads were selected: the preview and the
+  `--confirm` report now count the selected heads' paths and rows, and report
+  heads apart from superseded versions.
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

@@ -827,3 +827,6 @@ cli-run-project-split-explain = 🔀 Esta sessão está em { $workspace }/{ $old
 cli-run-project-split-prompt = Renomear e continuar? [S/n]{ " " }
 cli-run-project-split-repaired = Renomeado { $workspace }/{ $old } → { $workspace }/{ $new }; iniciando a sessão de novo.
 cli-repair-split-done = Unidos: { $workspace }/{ $project } agora é dono de { $identity }; o projeto vazio fica guardado como { $workspace }/{ $archived }.
+cli-reclaim-ledger-versions-breakdown = { $value0 } versão(ões) substituída(s); { $value1 } linha(s) atual(is).
+cli-reclaim-ledger-versions-would-delete-total = Excluiria { $value0 } linha(s) do registro em { $value1 } caminho(s), contendo { $value2 } de conteúdo de páginas.
+cli-reclaim-ledger-versions-deleted-total = { $value0 } linha(s) do registro excluída(s) em { $value1 } caminho(s), contendo { $value2 } de conteúdo de páginas.
