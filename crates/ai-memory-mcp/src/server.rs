@@ -321,7 +321,8 @@ Tool index (each tool's full routing follows):\n\
   project/scopes ranking; it adds score provenance, while global search \
   reports only its distinct FTS stream.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
-  been going on lately'. Returns the N most-recent pages.\n\
+  been going on lately'. Use a literal `path_prefix` such as `decisions/` \
+  to list only matching pages, newest first. The prefix applies before the limit.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
   'how big is the knowledge base'. Returns lifetime counts.\n\
 - `memory_briefing` — when the user wants a STRUCTURED snapshot \
@@ -956,6 +957,11 @@ struct RecentArgs {
     /// Maximum number of recent pages to return (default 10, max 100).
     #[serde(default, alias = "n")]
     limit: Option<usize>,
+    /// Keep only pages whose project-relative path starts with this literal
+    /// prefix, such as `decisions/`, before the cut to `limit`. `%`, `_`, and
+    /// backslash have no wildcard meaning.
+    #[serde(default)]
+    path_prefix: Option<String>,
     /// Project to read. Session-aware clients may omit it for the current
     /// project. Static MCP clients must pass it together with `workspace` for
     /// every project-scoped call.
@@ -1031,7 +1037,19 @@ fn bounded_query_filter<'a>(
     value: Option<&'a str>,
     max_len: usize,
 ) -> Result<Option<&'a str>, McpError> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+    validate_query_filter(
+        name,
+        value.map(str::trim).filter(|value| !value.is_empty()),
+        max_len,
+    )
+}
+
+fn validate_query_filter<'a>(
+    name: &str,
+    value: Option<&'a str>,
+    max_len: usize,
+) -> Result<Option<&'a str>, McpError> {
+    let Some(value) = value else {
         return Ok(None);
     };
     if value.chars().take(max_len + 1).count() > max_len || value.chars().any(char::is_control) {
@@ -4334,9 +4352,10 @@ impl AiMemoryServer {
         description = "Return the N most-recently-updated wiki pages \
         for this project (descending by updated_at). Call this at the \
         START of any session to see what the previous session was \
-        working on — even when no explicit handoff exists. Cheap, fast, \
-        no LLM cost. Pair with memory_query when you need to drill into \
-        specifics."
+        working on — even when no explicit handoff exists. Pass a literal \
+        `path_prefix` such as `decisions/` to list one page family, newest \
+        first; it applies before the limit. Cheap, fast, no LLM cost. Pair \
+        with memory_query when you need to drill into specifics."
     )]
     async fn memory_recent(
         &self,
@@ -4345,6 +4364,15 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        let filter = ai_memory_store::PageFilter {
+            path_prefix: validate_query_filter(
+                "path_prefix",
+                args.path_prefix.as_deref(),
+                MAX_QUERY_PATH_PREFIX_LEN,
+            )?
+            .filter(|prefix| !prefix.trim().is_empty()),
+            ..ai_memory_store::PageFilter::default()
+        };
         // A repo that opted into `[recall] default_global` broadens an
         // unscoped `memory_recent` to "most recent across every project", each
         // hit annotated with its workspace + project. An explicit
@@ -4354,7 +4382,7 @@ impl AiMemoryServer {
         if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
             let global_hits = self
                 .reader
-                .recent_pages_global(limit, Self::viewer_from_parts(Some(&parts)))
+                .recent_pages_global_filtered(limit, Self::viewer_from_parts(Some(&parts)), filter)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryRecentResponse {
@@ -4372,7 +4400,7 @@ impl AiMemoryServer {
             .await?;
         let hits = self
             .reader
-            .recent_pages_for_project(ws, proj, limit)
+            .recent_pages_for_project_filtered(ws, proj, limit, filter)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(
@@ -15106,6 +15134,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(5),
+                    path_prefix: None,
                     project: Some("sibling".to_string()),
                     workspace: None,
                 }),
@@ -21040,6 +21069,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(5),
+                    path_prefix: None,
                     project: None,
                     workspace: None,
                 }),
@@ -21101,6 +21131,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(10),
+                    path_prefix: None,
                     project: None,
                     workspace: None,
                 }),
@@ -21126,6 +21157,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(10),
+                    path_prefix: None,
                     project: Some("runbooks".into()),
                     workspace: Some("ops".into()),
                 }),
@@ -21143,6 +21175,209 @@ mod tests {
         assert!(
             !scoped_text.contains("cluster.md"),
             "explicit scope must not broaden: {scoped_text}"
+        );
+    }
+
+    async fn seed_recent_pages(store: &Store, ws: WorkspaceId, proj: ProjectId, paths: &[&str]) {
+        for path in paths {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: ws,
+                    project_id: proj,
+                    path: PagePath::new(*path).unwrap(),
+                    title: (*path).into(),
+                    body: "recent body".into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                    evidence: Vec::new(),
+                    trust_class: None,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn recent_with_prefix(
+        server: &AiMemoryServer,
+        limit: usize,
+        path_prefix: Option<&str>,
+    ) -> Result<serde_json::Value, McpError> {
+        server
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(limit),
+                    path_prefix: path_prefix.map(str::to_owned),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .map(|result| tool_json(&result))
+    }
+
+    fn recent_paths(response: &serde_json::Value, key: &str) -> Vec<String> {
+        response[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The prefix applies before the limit, literally and case-sensitively:
+    /// the one matching page comes back even though newer pages outside the
+    /// family would fill the limit, and so would a newer page that `%` and
+    /// `_` match only as wildcards.
+    #[tokio::test]
+    async fn memory_recent_path_prefix_keeps_one_literal_family_before_the_limit() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        seed_recent_pages(
+            &store,
+            ws,
+            proj,
+            &[
+                "reports/percent%_literal.md",
+                "reports/percentXYwildcard.md",
+                "reports/weekly news.md",
+                "reports/weekly-summary.md",
+                "decisions/newer.md",
+                "notes/newest.md",
+            ],
+        )
+        .await;
+
+        let unfiltered = recent_with_prefix(&server, 1, None).await.unwrap();
+        assert_ne!(
+            recent_paths(&unfiltered, "hits"),
+            vec!["reports/percent%_literal.md"],
+            "without the prefix, newer pages must crowd the report out: {unfiltered}"
+        );
+
+        let literal = recent_with_prefix(&server, 1, Some("reports/percent%_"))
+            .await
+            .unwrap();
+        assert_eq!(
+            recent_paths(&literal, "hits"),
+            vec!["reports/percent%_literal.md"],
+            "the prefix must apply before the limit and match literally: {literal}"
+        );
+
+        let differently_cased = recent_with_prefix(&server, 10, Some("REPORTS/"))
+            .await
+            .unwrap();
+        assert!(
+            recent_paths(&differently_cased, "hits").is_empty(),
+            "literal path prefixes are case-sensitive: {differently_cased}"
+        );
+
+        let with_space = recent_with_prefix(&server, 10, Some("reports/weekly "))
+            .await
+            .unwrap();
+        assert_eq!(
+            recent_paths(&with_space, "hits"),
+            vec!["reports/weekly news.md"],
+            "the trailing space is part of the prefix: {with_space}"
+        );
+
+        let blank = recent_with_prefix(&server, 1, Some("  ")).await.unwrap();
+        assert_eq!(
+            recent_paths(&blank, "hits"),
+            recent_paths(&unfiltered, "hits"),
+            "a blank prefix must read as omitted"
+        );
+
+        let error = recent_with_prefix(&server, 10, Some("reports/\nprivate/"))
+            .await
+            .expect_err("control characters must be rejected");
+        assert!(error.to_string().contains("control characters"), "{error}");
+
+        let overlong = "é".repeat(MAX_QUERY_PATH_PREFIX_LEN + 1);
+        let error = recent_with_prefix(&server, 10, Some(&overlong))
+            .await
+            .expect_err("an overlong prefix must be rejected by character count");
+        assert!(
+            error.to_string().contains("at most 1024 characters"),
+            "{error}"
+        );
+    }
+
+    /// A repository that opted into `[recall] default_global` lists recent
+    /// pages across projects; the prefix narrows that listing too instead of
+    /// being dropped on the global branch.
+    #[tokio::test]
+    async fn memory_recent_path_prefix_narrows_the_default_global_listing() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let infra = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+        seed_recent_pages(
+            &store,
+            ws,
+            proj,
+            &["reports/scratch.md", "notes/scratch.md"],
+        )
+        .await;
+        seed_recent_pages(&store, ws, infra, &["reports/infra.md", "notes/infra.md"]).await;
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, infra, true);
+
+        let response = recent_with_prefix(&server, 10, Some("reports/"))
+            .await
+            .unwrap();
+        let mut global_paths = recent_paths(&response, "global_hits");
+        global_paths.sort();
+        assert_eq!(
+            global_paths,
+            vec!["reports/infra.md", "reports/scratch.md"],
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_recent_prompts_and_schema_document_path_prefix() {
+        let installed = installed_ai_memory_prompt_surface();
+        for (label, prompt) in [
+            ("MCP handshake instructions", MEMORY_INSTRUCTIONS),
+            ("installed routing and managed skills", installed.as_str()),
+        ] {
+            let entry = prompt
+                .lines()
+                .find(|line| line.starts_with("- `memory_recent`"))
+                .expect("prompt must document memory_recent");
+            assert!(entry.contains("path_prefix"), "{label}: {entry}");
+        }
+        assert!(ai_memory_core::SNIPPET_BODY.contains("literal `path_prefix` filter for"));
+
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let recent = tools
+            .iter()
+            .find(|tool| tool.name == "memory_recent")
+            .expect("memory_recent must be registered");
+        assert!(
+            recent
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|properties| properties.contains_key("path_prefix")),
+            "memory_recent schema must expose path_prefix"
+        );
+        assert!(
+            recent
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("path_prefix")),
+            "memory_recent description must explain path_prefix"
         );
     }
 
@@ -21861,6 +22096,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(5),
+                    path_prefix: None,
                     project: None,
                     workspace: None,
                 }),
@@ -25254,6 +25490,7 @@ mod tests {
                     .memory_recent(
                         Parameters(RecentArgs {
                             limit: Some(10),
+                            path_prefix: None,
                             project: None,
                             workspace: None,
                         }),
@@ -25934,6 +26171,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(10),
+                    path_prefix: None,
                     project: None,
                     workspace: None,
                 }),
@@ -26863,6 +27101,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(5),
+                    path_prefix: None,
                     project: Some("other".into()),
                     workspace: None,
                 }),
@@ -26885,6 +27124,7 @@ mod tests {
             .memory_recent(
                 Parameters(RecentArgs {
                     limit: Some(5),
+                    path_prefix: None,
                     project: None,
                     workspace: None,
                 }),

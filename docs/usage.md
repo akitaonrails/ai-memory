@@ -290,6 +290,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 |---|---|---|
 | "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + entity/graph/vector RRF over compiled wiki pages, plus an observation stream (on by default) that lifts a session's page when only its captured turns match, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
+| "List the five most recent decisions" | `memory_recent` with `path_prefix: "decisions/"` and `limit: 5` | Matches the literal prefix before taking the five newest pages. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_list` then `memory_handoff_accept` with that `handoff_id` if no block exists | Inspects pending handoffs without claiming, then claims the chosen id once. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |

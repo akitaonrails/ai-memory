@@ -40,6 +40,12 @@ version in [`docs/changelog/`](docs/changelog/):
 - Completed the English and Brazilian Portuguese help and installer
   diagnostics for Antigravity CLI status line setup. (#2486)
 
+- Added an optional literal `path_prefix` to `memory_recent`. It lists one
+  page family, such as `decisions/`, newest first, and applies before the
+  `limit` cut, so newer pages elsewhere no longer crowd the family out; it
+  narrows the cross-project `default_global` listing too. The TypeScript SDK
+  sends it from `recent` as `pathPrefix`. (#2501)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security

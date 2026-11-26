@@ -756,8 +756,13 @@ describe("reads", () => {
     const status = await memory.status();
     assert.equal(status.counts.pagesAll, 2);
     assert.equal(status.scope.resolvedBy, "explicit");
-    const recent = await memory.recent({ limit: 3 });
-    assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", limit: 3 });
+    const recent = await memory.recent({ limit: 3, pathPrefix: "decisions/" });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      limit: 3,
+      path_prefix: "decisions/",
+    });
     assert.equal(recent.hits[0]?.path, "notes/retries.md");
     const briefing = await memory.briefing({
       recentPagesLimit: 2,
@@ -914,6 +919,26 @@ describe("capability gating", () => {
     assert.equal(server.toolCalls().length, 0);
   });
 
+  it("an older server accepts unfiltered recent listings and rejects a prefix", async () => {
+    const { server, memory } = setup();
+    const recent = server.schemas["memory_recent"];
+    assert.ok(recent !== undefined);
+    delete recent.properties["path_prefix"];
+    server.serverVersion = "3.5.1";
+    server.tools.set("memory_recent", () => ({ hits: [payloads.hit] }));
+
+    await assert.rejects(memory.recent({ pathPrefix: "reports/" }), (error: unknown) => {
+      assert.ok(error instanceof UnsupportedServerError);
+      assert.equal(error.feature, "memory_recent.path_prefix");
+      return true;
+    });
+    assert.equal(server.toolCalls().length, 0);
+
+    const unfiltered = await memory.recent({ limit: 3 });
+    assert.equal(unfiltered.hits[0]?.path, "notes/retries.md");
+    assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", limit: 3 });
+  });
+
   it("probes once per client and re-probes after refresh", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_status", () => payloads.status);
@@ -1031,7 +1056,7 @@ describe("wire names", () => {
       memory.query({ query: "q", scopes: [SCOPE] }),
       memory.query({ query: "q", global: true }),
       memory.status(),
-      memory.recent({ limit: 1 }),
+      memory.recent({ limit: 1, pathPrefix: "decisions/" }),
       memory.briefing({ recentPagesLimit: 1, recentSessionsLimit: 1, settledFirst: true }),
       memory.explore({ focus: "f", recentPagesLimit: 1, reasoning: "low" }),
       memory.observations({

@@ -1005,6 +1005,59 @@ mod tests {
         );
     }
 
+    /// A path prefix narrows only what the viewer may already read. Bob names
+    /// the prefix of a page in a repository he holds no grant on and gets
+    /// nothing; alice, who holds one, gets the page, and bob's own prefix
+    /// still works once he is granted his repository.
+    #[tokio::test]
+    async fn a_filtered_recent_listing_shows_only_what_the_viewer_may_read() {
+        let f = fixture().await;
+        let r = &f.store.reader;
+        page(
+            &f.store,
+            f.client,
+            "secrets/rates.md",
+            "confidential day rate",
+        )
+        .await;
+        page(&f.store, f.personal, "notes/rates.md", "personal day rate").await;
+        f.store
+            .writer
+            .grant_memory(f.alice, f.client, GrantLevel::Read, None)
+            .await
+            .unwrap();
+        f.store
+            .writer
+            .grant_memory(f.bob, f.personal, GrantLevel::Read, None)
+            .await
+            .unwrap();
+
+        let listed = |viewer, path_prefix: &'static str| async move {
+            let filter = crate::PageFilter {
+                path_prefix: Some(path_prefix),
+                ..crate::PageFilter::default()
+            };
+            paths(
+                &r.recent_pages_global_filtered(10, viewer, filter)
+                    .await
+                    .unwrap(),
+                |h| h.path.as_str(),
+            )
+        };
+
+        assert!(
+            listed(Some(f.bob), "secrets/").await.is_empty(),
+            "a prefix must never reach a repository the viewer may not read"
+        );
+        let secrets = vec!["secrets/rates.md".to_owned()];
+        assert_eq!(listed(Some(f.alice), "secrets/").await, secrets);
+        assert_eq!(listed(None, "secrets/").await, secrets);
+        assert_eq!(
+            listed(Some(f.bob), "notes/").await,
+            vec!["notes/rates.md".to_owned()]
+        );
+    }
+
     #[tokio::test]
     async fn the_limit_counts_only_what_the_viewer_may_see() {
         // Filtering after LIMIT would hand bob a short page: of the first ten

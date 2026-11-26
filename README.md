@@ -629,6 +629,8 @@ readable wiki pages; the next session starts with a handoff.
 - Narrow a large wiki before ranking with `memory_query` filters such as
   `path_prefix: "procedures/"`, `tag: "rust"`, `kind: "decision"`, or
   `tier: "procedural"`.
+- List the newest pages in one family with `memory_recent` and a literal
+  `path_prefix`, such as `decisions/`.
 - Ask "catch me up" for a prose digest of recent project activity, or run
   `ai-memory recent` (`--global` for every project) to list the newest pages.
 - Search Chinese, Japanese, Korean, and Arabic text with zero-LLM normalization:

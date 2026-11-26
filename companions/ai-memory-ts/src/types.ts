@@ -545,6 +545,8 @@ export interface QueryResult {
 export interface RecentArgs extends ScopedArgs {
   /** Maximum pages (server default 10, clamped to 100). */
   limit?: number;
+  /** Keep only pages whose project-relative path starts with this literal prefix, before the limit. */
+  pathPrefix?: string;
 }
 
 /** Result of {@link AiMemoryClient.recent}. */

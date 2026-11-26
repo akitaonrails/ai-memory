@@ -279,6 +279,7 @@ pacote de roteamento gerenciado uma vez: um trecho compacto sempre carregado dir
 |---|---|---|
 | "Já discutimos X?" / "busque na memória por Y" | `memory_query` | RRF de FTS5 + entidade/grafo/vetor sobre páginas wiki compiladas, além de um stream de observações (ativo por padrão) que eleva a página de uma sessão quando apenas seus turnos capturados coincidem, seguido por classificação delimitada por autoridade de fonte e fallback para observações brutas em caso de falha de página. |
 | Antes de propor uma arquitetura | `memory_query` | Verifica decisões anteriores e gotchas antes de sugerir designs. |
+| "Liste as cinco decisões mais recentes" | `memory_recent` com `path_prefix: "decisions/"` e `limit: 5` | Filtra pelo prefixo literal e retorna as cinco páginas mais recentes que correspondem ao filtro. |
 | "Atualize-me" / "estive fora" | `memory_explore` | Digest em prosa cuja verbosidade escala com o tempo desde a última atividade. |
 | "Onde paramos?" | Bloco de handoff existente, ou `memory_handoff_list` depois `memory_handoff_accept` com esse `handoff_id` se nenhum bloco existir | Inspeciona handoffs pendentes sem reivindicar, depois reivindica o id escolhido uma vez. |
 | "Salve o contexto para a próxima sessão" | `memory_handoff_begin` | Grava um handoff conciso de término de sessão com perguntas abertas e próximas etapas. Não use para solicitações de status ou briefing. |
