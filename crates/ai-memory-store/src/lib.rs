@@ -4690,6 +4690,360 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_resume_after_end_stays_already_ended_and_preserves_consolidation_generation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+        for (kind, title) in [
+            (ObservationKind::SessionStart, "start"),
+            (ObservationKind::UserPrompt, "initial work"),
+            (ObservationKind::SessionEnd, "end"),
+        ] {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind,
+                        extension: None,
+                        source_event: None,
+                        title: title.into(),
+                        body: String::new(),
+                        importance: 5,
+                        file_path: None,
+                        trust_class: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "first end enqueues generation 3"
+        );
+
+        // Empty resume appends only SessionStart (no prompt or tool call).
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::SessionStart,
+                    extension: None,
+                    source_event: None,
+                    title: "resume".into(),
+                    body: String::new(),
+                    importance: 5,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "a lifecycle-only resume must not classify as ReEndWithNewWork (#2504)"
+        );
+        assert!(
+            !store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "AlreadyEnded recovery after an empty resume must not enqueue a duplicate job"
+        );
+        let conn = Connection::open(store.db_path()).unwrap();
+        let jobs: Vec<(u64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT generation, state FROM session_consolidation_jobs \
+                     WHERE session_id = ?1 ORDER BY generation ASC",
+                )
+                .unwrap();
+            stmt.query_map(params![session_id.as_bytes()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            jobs,
+            vec![(3, "pending".to_string())],
+            "existing pending job must remain pending and not be superseded by SessionStart"
+        );
+
+        // Crash-recovery control: if no job existed for the ended generation,
+        // recovery enqueues generation = ended_observation_count (3), not live count (4).
+        conn.execute(
+            "DELETE FROM session_consolidation_jobs WHERE session_id = ?1",
+            params![session_id.as_bytes()],
+        )
+        .unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "crash recovery must still enqueue when the ended generation has no job"
+        );
+        let recovered_gen: u64 = conn
+            .query_row(
+                "SELECT generation FROM session_consolidation_jobs WHERE session_id = ?1",
+                params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered_gen, 3,
+            "recovered job must use ended_observation_count, not live COUNT(*)"
+        );
+
+        // Later substantive work triggers ReEndWithNewWork and a new generation.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "follow-up".into(),
+                    body: "real work".into(),
+                    importance: 8,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork
+        );
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "re-end with substantive work must enqueue the new generation"
+        );
+        let max_gen: u64 = conn
+            .query_row(
+                "SELECT MAX(generation) FROM session_consolidation_jobs WHERE session_id = ?1",
+                params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_gen, 5);
+    }
+
+    #[tokio::test]
+    async fn post_prune_empty_resume_stays_already_ended_while_new_work_re_ends() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+        let old_ts = jiff::Timestamp::from_second(1_700_000_000).unwrap();
+        let recent_ts = jiff::Timestamp::from_second(1_750_000_000).unwrap();
+        for (kind, title, ts) in [
+            (ObservationKind::SessionStart, "start", old_ts),
+            (ObservationKind::UserPrompt, "old prompt", old_ts),
+            (ObservationKind::PostToolUse, "Edit", recent_ts),
+            (ObservationKind::SessionEnd, "end", recent_ts),
+        ] {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(ts.as_microsecond()),
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind,
+                        extension: None,
+                        source_event: None,
+                        title: title.into(),
+                        body: String::new(),
+                        importance: 5,
+                        file_path: None,
+                        trust_class: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        // Record a session page and link it via end_session so observation
+        // pruning considers the session eligible.
+        let page_id = store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                &format!("sessions/{session_id}.md"),
+                "Consolidated",
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .end_session(session_id, Some(page_id))
+            .await
+            .unwrap();
+
+        let cutoff_us = jiff::Timestamp::from_second(1_725_000_000)
+            .unwrap()
+            .as_microsecond();
+        let mut conn = Connection::open(store.db_path()).unwrap();
+        let outcome =
+            ops::prune_consolidated_observations(&mut conn, ws, proj, cutoff_us, 100).unwrap();
+        assert_eq!(outcome.deleted, 2, "prunes the two old observations");
+        assert_eq!(outcome.sessions_resynced, 1);
+
+        // Empty resume after pruning must still classify as AlreadyEnded.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::SessionStart,
+                    extension: None,
+                    source_event: None,
+                    title: "empty resume".into(),
+                    body: String::new(),
+                    importance: 5,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "post-prune empty resume must stay AlreadyEnded"
+        );
+
+        // New substantive prompt after pruning must still trigger ReEndWithNewWork.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "new prompt after prune".into(),
+                    body: "real work".into(),
+                    importance: 8,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork,
+            "post-prune substantive work must trigger ReEndWithNewWork"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_improve_scheduler_candidates_respect_watermark_age_and_runs() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();

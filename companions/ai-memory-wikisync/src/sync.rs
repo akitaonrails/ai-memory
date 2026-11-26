@@ -943,4 +943,26 @@ mod tests {
             .to_string();
         assert!(err.contains("refused"), "{err}");
     }
+
+    #[test]
+    fn select_pages_accepts_long_server_generated_gotcha_filename() {
+        let long_name = format!("{}.md", "a".repeat(77));
+        assert_eq!(long_name.len(), 80);
+        let long_path = format!("gotchas/{long_name}");
+        let families = vec!["gotchas".to_string(), "notes".to_string()];
+        let selected = select_pages(
+            vec![
+                summary("notes/a.md"),
+                summary(&long_path),
+                summary("gotchas/short.md"),
+            ],
+            &families,
+        )
+        .unwrap();
+        let paths: Vec<&str> = selected.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![long_path.as_str(), "gotchas/short.md", "notes/a.md"]
+        );
+    }
 }

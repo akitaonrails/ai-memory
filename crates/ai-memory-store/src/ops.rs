@@ -4053,16 +4053,16 @@ pub fn admit_hook_session_event(
         agent_kind: session.agent_kind,
         owner,
     };
-    if session_end && ended_at.is_some() {
-        let count: u64 = tx.query_row(
-            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
-            params![session.id.as_bytes()],
-            |r| r.get(0),
-        )?;
-        if count <= ended_count {
-            tx.commit()?;
-            return Ok(HookSessionAdmission::AlreadyEnded { session: guard });
-        }
+    if session_end
+        && ended_at.is_some()
+        && !crate::reader::session_has_substantive_work_after_watermark(
+            &tx,
+            session.id,
+            ended_count,
+        )?
+    {
+        tx.commit()?;
+        return Ok(HookSessionAdmission::AlreadyEnded { session: guard });
     }
     let ingest = if let Some(key) = ingest_key {
         tx.execute(

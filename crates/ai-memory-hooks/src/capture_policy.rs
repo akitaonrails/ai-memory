@@ -160,6 +160,8 @@ pub(crate) struct McpToolName {
 /// characters OpenAI-compatible providers accept (`tools/mcp_tool_schema.py`,
 /// v0.22.2); a longer name is not a shape any documented harness sends.
 const MAX_MCP_TOOL_NAME_CHARS: usize = 64;
+const MCP_TOOL_PREFIX: &str = "mcp__";
+const MCP_TOOL_SEPARATOR: &str = "__";
 
 /// The server and tool of an `mcp__<server>__<tool>` tool name, the shape
 /// Claude Code (<https://code.claude.com/docs/en/hooks>, "Match MCP tools",
@@ -173,18 +175,38 @@ const MAX_MCP_TOOL_NAME_CHARS: usize = 64;
 /// when the whole name is at most 64 ASCII letters, digits, `_` or `-`: an
 /// identifier, never free text. The server ends at the first `__`.
 pub(crate) fn mcp_tool_name(name: &str) -> Option<McpToolName> {
-    if name.len() > MAX_MCP_TOOL_NAME_CHARS
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if name.len() > MAX_MCP_TOOL_NAME_CHARS {
+        return None;
+    }
+    let (server, tool) = name
+        .strip_prefix(MCP_TOOL_PREFIX)?
+        .split_once(MCP_TOOL_SEPARATOR)?;
+    mcp_tool_identifiers(server, tool)
+}
+
+fn mcp_tool_identifiers(server: &str, tool: &str) -> Option<McpToolName> {
+    // The separated form has the same total budget as the prefixed name.
+    let names_limit = MAX_MCP_TOOL_NAME_CHARS - MCP_TOOL_PREFIX.len() - MCP_TOOL_SEPARATOR.len();
+    if server.len().saturating_add(tool.len()) > names_limit
+        || !is_tool_identifier(server)
+        || !is_tool_identifier(tool)
     {
         return None;
     }
-    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
-    (!server.is_empty() && !tool.is_empty()).then(|| McpToolName {
+    Some(McpToolName {
         server: server.to_owned(),
         tool: tool.to_owned(),
     })
+}
+
+/// Antigravity reports the tool through `toolCall` on both tool hook events.
+/// The `call_mcp_tool` wrapper carries these two identifiers in CLI 1.5.17
+/// (#2505). https://antigravity.google/docs/hooks/#pretooluse
+fn antigravity_mcp_tool_name(raw: &Value) -> Option<McpToolName> {
+    let args = raw.pointer("/toolCall/args")?;
+    let server = args.get("ServerName")?.as_str()?;
+    let tool = args.get("ToolName")?.as_str()?;
+    mcp_tool_identifiers(server, tool)
 }
 
 /// Longest harness tool name kept by `[ingest] record_tool_names`, the same
@@ -251,8 +273,11 @@ pub(crate) fn recorded_tool_name(agent: AgentKind, raw: &Value) -> Option<Record
 /// A harness tool name as `[ingest] record_tool_names` keeps it: an
 /// identifier, never free text.
 pub(crate) fn valid_tool_name(name: &str) -> bool {
+    name.len() <= MAX_TOOL_NAME_CHARS && is_tool_identifier(name)
+}
+
+fn is_tool_identifier(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= MAX_TOOL_NAME_CHARS
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -482,10 +507,12 @@ pub(crate) fn tool_observation_metadata(
         ToolObservationMetadata {
             tool_family,
             tool_call_id: id.filter(|id| valid_call_id(id)).map(str::to_owned),
-            mcp_tool: if tool_family == ToolFamily::Unknown {
-                mcp_tool_name(name)
-            } else {
-                None
+            mcp_tool: match (tool_family, agent, name) {
+                (ToolFamily::Unknown, AgentKind::AntigravityCli, "call_mcp_tool") => {
+                    antigravity_mcp_tool_name(raw)
+                }
+                (ToolFamily::Unknown, _, _) => mcp_tool_name(name),
+                _ => None,
             },
         }
     })
