@@ -3582,6 +3582,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn antigravity_mcp_wrapper_keeps_only_valid_identifiers() {
+        use serde_json::json;
+
+        for (name, server, tool, expected_names) in [
+            ("call_mcp_tool", json!("help-center"), json!("lookup"), true),
+            ("call_mcp_tool", json!("docs__v2"), json!("lookup"), true),
+            ("call_mcp_tool", json!("notes"), json!("a".repeat(52)), true),
+            (
+                "call_mcp_tool",
+                json!("notes"),
+                json!("a".repeat(53)),
+                false,
+            ),
+            (
+                "call_mcp_tool",
+                json!("invalid name"),
+                json!("lookup"),
+                false,
+            ),
+            ("call_mcp_tool", json!("notes"), json!(42), false),
+            ("unknown_tool", json!("notes"), json!("lookup"), false),
+        ] {
+            let raw = json!({
+                "toolCall": {
+                    "name": name,
+                    "args": {
+                        "ServerName": server,
+                        "ToolName": tool,
+                        "Arguments": {"query": "fixture input excluded from the observation"}
+                    }
+                },
+                "tool_response": "fixture output excluded from the observation"
+            });
+            let mut expected = String::from("tool_family: unknown");
+            if expected_names {
+                expected.push_str(&format!(
+                    "\nmcp_server: {}\nmcp_tool: {}",
+                    server.as_str().unwrap(),
+                    tool.as_str().unwrap()
+                ));
+            }
+            for (event, suffix) in [
+                ("pre-tool-use", ""),
+                ("post-tool-use", "\noutcome: unknown"),
+            ] {
+                let env = HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("antigravity-cli".into()),
+                        ..Default::default()
+                    },
+                    raw.clone(),
+                );
+                assert_eq!(env.title_hint.as_deref(), Some("tool unknown"), "{event}");
+                assert_eq!(
+                    env.body_excerpt.unwrap(),
+                    format!("{expected}{suffix}"),
+                    "{event}"
+                );
+            }
+        }
+    }
+
     /// Every documented `mcp__<server>__<tool>` spelling keeps both names:
     /// a hyphenated Claude Code server, a Claude Code plugin server, Codex's
     /// own example and a Hermes name clamped to 64 characters with a hash.
