@@ -24,6 +24,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `--confirm` report now count the selected heads' paths and rows, and report
   heads apart from superseded versions. (#2513)
 
+### Fixed
+
+- Scoped the project dashboard's summary query to the project being viewed,
+  avoiding aggregates for unrelated projects during recurring refreshes.
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed

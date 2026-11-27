@@ -184,6 +184,58 @@ async fn expired_and_superseded_pages_do_not_advance_project_activity() {
 }
 
 #[tokio::test]
+async fn named_project_stats_match_the_list_for_the_exact_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("team").await.unwrap();
+    let other = store.writer.get_or_create_workspace("other").await.unwrap();
+    let project = seed(
+        &store,
+        ws,
+        "app",
+        &[BASE, BASE + 20],
+        Some(BASE + 30),
+        Some(BASE + 10),
+    )
+    .await;
+    add_page(&store, ws, project, "notes/expired.md", BASE + 100, Some(0)).await;
+    seed(&store, other, "app", &[BASE + 100], None, Some(BASE + 200)).await;
+
+    let named = store
+        .reader
+        .project_stats_by_name("team", "app", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(named.project_id, project.to_string());
+    assert_eq!(named.page_count, 1);
+    assert_eq!(named.session_count, 2);
+    assert_eq!(named.observation_count, 1);
+    assert_eq!(named.open_session_count, 2);
+    assert_eq!(named.last_activity, Some(timestamp(BASE + 30)));
+    let listed = store
+        .reader
+        .list_projects_with_stats(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.project_id == named.project_id)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(named).unwrap(),
+        serde_json::to_value(listed).unwrap(),
+    );
+    assert!(
+        store
+            .reader
+            .project_stats_by_name("missing", "app", None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn recent_restricted_activity_stays_hidden_until_the_viewer_has_a_grant() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path()).unwrap();
@@ -227,6 +279,14 @@ async fn recent_restricted_activity_stays_hidden_until_the_viewer_has_a_grant() 
         assert_eq!(rows[0].project_name, "open");
         assert_eq!(rows[0].last_activity, Some(timestamp(BASE)));
     }
+    assert!(
+        store
+            .reader
+            .project_stats_by_name("team", "private", Some(viewer))
+            .await
+            .unwrap()
+            .is_none()
+    );
     store
         .writer
         .grant_memory(viewer, private, GrantLevel::Read, None)
@@ -240,4 +300,12 @@ async fn recent_restricted_activity_stays_hidden_until_the_viewer_has_a_grant() 
     assert_eq!(rows[0].project_name, "private");
     assert_eq!(rows[0].last_activity, Some(timestamp(BASE + 100)));
     assert_eq!(rows.len(), 2);
+    let named = store
+        .reader
+        .project_stats_by_name("team", "private", Some(viewer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(named.project_id, private.to_string());
+    assert_eq!(named.last_activity, Some(timestamp(BASE + 100)));
 }

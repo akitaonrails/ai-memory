@@ -130,6 +130,54 @@ async fn operations_project_tabs_have_one_default_panel_and_matching_controls() 
 }
 
 #[tokio::test]
+async fn operations_project_summary_counts_sessions_in_its_workspace() {
+    let (_tmp, store, wiki, _, _, _) = fixture().await;
+    let other = store.writer.get_or_create_workspace("other").await.unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(other, "app", None)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        store
+            .writer
+            .begin_session(NewSession {
+                id: SessionId::new(),
+                workspace_id: other,
+                project_id: project,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki);
+    for (workspace, expected) in [("team", 1), ("other", 2)] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/w/{workspace}/app"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = text(response).await;
+        assert!(html.contains(&format!(
+            "<strong>{expected}</strong><small>Registered activity</small>"
+        )));
+        assert!(html.contains(&format!(
+            "<strong>{expected}</strong><small>Only unfinished sessions</small>"
+        )));
+    }
+}
+
+#[tokio::test]
 async fn operations_inbox_filters_initial_agents_by_both_project_coordinates() {
     let (_tmp, store, wiki, ws, _, _) = fixture().await;
     let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
