@@ -20,6 +20,7 @@ use crate::codex_responses::{CodexResponsesAuth, post_codex_responses};
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
+use crate::response::scrubbed_body;
 use crate::stored_token::{StoredOAuthToken, credential_endpoint, refresh_grant};
 use crate::text::truncate_with_ellipsis;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
@@ -365,7 +366,7 @@ pub(crate) fn parse_sse_response(body: &str, model: &str) -> LlmResult<CodexResp
         if value.get("error").is_some() {
             return Err(LlmError::Provider {
                 status: SSE_TERMINAL_ERROR_STATUS,
-                body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
+                body: scrubbed_body(trimmed, SSE_ERROR_BODY_TRIM),
                 retry_after: None,
             });
         }
@@ -408,7 +409,7 @@ pub(crate) fn parse_sse_response(body: &str, model: &str) -> LlmResult<CodexResp
             "response.failed" | "response.incomplete" | "response.cancelled" | "error" => {
                 return Err(LlmError::Provider {
                     status: SSE_TERMINAL_ERROR_STATUS,
-                    body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
+                    body: scrubbed_body(trimmed, SSE_ERROR_BODY_TRIM),
                     retry_after: None,
                 });
             }
@@ -839,6 +840,36 @@ mod tests {
                     );
                 }
                 other => panic!("expected provider error for {event}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_sse_response_scrubs_a_secret_in_a_terminal_error_frame() {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        // The top-level `error` arm and the `response.failed` arm build their
+        // own body from the raw frame, without `provider_error`.
+        for body in [
+            format!(
+                "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":\"{secret}\"}}}}\n\n"
+            ),
+            format!(
+                "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"message\":\"{secret}\"}}}}}}\n\n"
+            ),
+        ] {
+            let err = parse_sse_response(&body, "gpt-5.5").expect_err("terminal event must fail");
+            match err {
+                LlmError::Provider { body, .. } => {
+                    assert!(
+                        !body.contains(secret),
+                        "secret leaked into the error body: {body}"
+                    );
+                    assert!(
+                        body.contains("[REDACTED"),
+                        "expected a redaction marker: {body}"
+                    );
+                }
+                other => panic!("expected provider error, got {other:?}"),
             }
         }
     }

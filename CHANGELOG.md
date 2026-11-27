@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Scrubbed the embedding and OAuth SSE provider error bodies before they
+  could reach the health snapshot or the admin `llm-test` route. Those two
+  paths built their own error body without the provider-error helper, so a
+  credential-shaped string echoed by an upstream endpoint could have appeared
+  in operator-visible output.
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed

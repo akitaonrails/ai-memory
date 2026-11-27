@@ -59,6 +59,18 @@ pub async fn provider_error_body(resp: reqwest::Response) -> String {
     }
 }
 
+/// Scrub provider-controlled text with the built-in sanitizer, then bound it
+/// for display.
+///
+/// Use this for a provider body that did not come through [`provider_error`]:
+/// a parse failure on a 2xx response, or a terminal SSE frame. Those paths
+/// build their own error body, and row 7f requires every error body to be
+/// scrubbed before it can reach the health snapshot or the admin `llm-test`
+/// route.
+pub(crate) fn scrubbed_body(text: &str, limit: usize) -> String {
+    truncate_with_ellipsis(&Sanitizer::builtin().scrub(text), limit)
+}
+
 /// Build a typed provider error while preserving a retry hint that may live
 /// beyond the bounded display prefix. The body is still read at most 1 MiB,
 /// scrubbed before parsing, and exposed at most 1 KiB.
