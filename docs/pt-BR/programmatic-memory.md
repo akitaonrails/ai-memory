@@ -185,7 +185,7 @@ qualquer chamador que a autenticação do servidor permita.
 job atual ou o último (`idle`, `running`, `succeeded`, `failed`) a partir da memória do
 processo. As duas formas de POST compartilham um slot e respondem 409 com o job em
 curso enquanto uma compactação está em andamento. Veja
-[deploy.md](../deploy.md#reclaiming-disk-space) para o caso de timeout do proxy.
+[deploy.md](deploy.md#recuperando-espaço-em-disco) para o caso de timeout do proxy.
 
 Ambas as rotas de expurgo recusam com 400 a menos que `confirm` seja `true`, e `dry_run`
 prevalece sobre `confirm`: um corpo com ambos definidos apenas pré-visualiza as contagens. `confirm`
