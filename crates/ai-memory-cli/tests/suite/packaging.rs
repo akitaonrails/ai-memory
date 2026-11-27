@@ -662,6 +662,13 @@ fn powershell_wrapper_forwards_every_supported_provider_api_key() {
         "AI_MEMORY_COPILOT_CLIENT_ID",
         "AI_MEMORY_WORKSTREAM_ID",
         "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "COPILOT_HOME",
+        "GEMINI_CLI_HOME",
+        "GROK_HOME",
+        "KIMI_CODE_HOME",
+        "KIRO_HOME",
+        "HERMES_HOME",
     ] {
         assert!(
             allowlist
@@ -1234,6 +1241,13 @@ fn run_wrapper_with_fake_docker_env(
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("GEMINI_CLI_HOME")
+        .env_remove("GROK_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("KIRO_HOME")
+        .env_remove("HERMES_HOME")
         .env_remove("AI_MEMORY_LLM_COMPAT_STREAM")
         // Guarantees the "unset" case in
         // `posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness`
@@ -3359,6 +3373,52 @@ mod slow {
             args.contains("-e\nCLAUDE_CONFIG_DIR"),
             "wrapper must forward Claude's config root; got {args}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_forwards_agent_config_homes_to_helper_container() {
+        let agent_homes = [
+            ("CODEX_HOME", "/home/alice/.config/codex"),
+            ("COPILOT_HOME", "/home/alice/.config/copilot"),
+            ("GEMINI_CLI_HOME", "/home/alice/.config/gemini"),
+            ("GROK_HOME", "/home/alice/.config/grok"),
+            ("KIMI_CODE_HOME", "/home/alice/.config/kimi"),
+            ("KIRO_HOME", "/home/alice/.config/kiro"),
+            ("HERMES_HOME", "/home/alice/.config/hermes"),
+        ];
+
+        for subcommand in ["backup-agents", "restore-agents"] {
+            let args_with_env = run_wrapper_with_fake_docker_env(
+                &[subcommand],
+                FakeInfo::Docker("[name=seccomp,profile=default]"),
+                None,
+                None,
+                None,
+                &agent_homes,
+            );
+            for (var, _) in agent_homes {
+                assert!(
+                    args_with_env.contains(&format!("-e\n{var}")),
+                    "wrapper must forward {var} for {subcommand}; got {args_with_env}"
+                );
+            }
+
+            let args_unset = run_wrapper_with_fake_docker_env(
+                &[subcommand],
+                FakeInfo::Docker("[name=seccomp,profile=default]"),
+                None,
+                None,
+                None,
+                &[],
+            );
+            for (var, _) in agent_homes {
+                assert!(
+                    !args_unset.contains(&format!("-e\n{var}")),
+                    "wrapper must omit unset {var} for {subcommand}; got {args_unset}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

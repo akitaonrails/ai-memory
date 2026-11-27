@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Forwarded `CODEX_HOME` and sibling agent config-home environment overrides
+  (`COPILOT_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`,
+  `KIRO_HOME`, `HERMES_HOME`) through the POSIX and PowerShell container
+  wrappers so helper commands such as `backup-agents` and `restore-agents`
+  honor non-default agent homes. (#2508)
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
