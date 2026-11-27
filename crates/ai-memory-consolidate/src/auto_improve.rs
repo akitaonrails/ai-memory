@@ -97,10 +97,12 @@ const SAMPLE_LIMIT_WITH_SESSION_PAGE: usize = 48;
 const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
 // Per-observation body cap in the reviewer projection. Note this is a SECOND,
 // tighter truncation than storage: the opt-in assistant/Stop excerpt (#196) is
-// persisted at up to 2 KB, but the reviewer only ever sees its first 1500 chars
-// here (head-biased). A late correction inside a long Stop body must fall within
-// this window to influence the reviewer.
+// persisted at up to 2 KB, but the reviewer falls back to 1500 chars here when
+// the budget is tight. When compaction recovers prompt budget (#2532),
+// substantive bodies may expand up to MAX_EXPANDED_OBSERVATION_BODY_CHARS
+// before falling back to this cap.
 pub(crate) const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
+pub(crate) const MAX_EXPANDED_OBSERVATION_BODY_CHARS: usize = 8_000;
 const PROMPT_SCAFFOLD_RESERVE_CHARS: usize = 4_000;
 pub(crate) const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
 const MAX_REJECTION_PATH_CHARS: usize = 256;
@@ -665,7 +667,10 @@ pub async fn run_auto_improve_review(
         sections.selected_limit,
         MAX_OBSERVATION_BODY_CHARS,
     )
-    .with_context_label("auto-improve");
+    .with_context_label("auto-improve")
+    .with_compact_empty_envelopes(true)
+    .with_expanded_body_excerpt_chars(MAX_EXPANDED_OBSERVATION_BODY_CHARS)
+    .with_recovered_budget_chars(sections.session_page_compacted_chars);
     let closure_cfg = cfg.clone();
     let outcome = reader
         .read_session_observations(workspace_id, project_id, session_id, move |snap| {
@@ -1700,6 +1705,7 @@ pub(crate) struct PromptSections {
     global: String,
     patchable: RenderedPatchablePages,
     session_page_section: String,
+    session_page_compacted_chars: usize,
     rejection_text: String,
     pub(crate) observation_budget: usize,
     pub(crate) selected_limit: usize,
@@ -1743,8 +1749,8 @@ pub(crate) fn auto_improve_prompt_sections(
         .map(|_| usable_chars / 3)
         .unwrap_or(0)
         .min(MAX_SESSION_PAGE_CHARS);
-    let session_page_section =
-        render_session_page(session_page, session_page_budget, &mut warnings);
+    let (session_page_section, session_page_compacted_chars) =
+        render_session_page_with_compaction(session_page, session_page_budget, &mut warnings);
     let rejection_budget = rejection_context_char_budget(usable_chars);
     let rejection_text = render_rejection_context(rejection_context, rejection_budget);
     let observation_budget = usable_chars
@@ -1764,6 +1770,7 @@ pub(crate) fn auto_improve_prompt_sections(
         global,
         patchable,
         session_page_section,
+        session_page_compacted_chars,
         rejection_text,
         observation_budget,
         selected_limit,
@@ -1804,7 +1811,10 @@ fn test_prompt_input(
             sections.selected_limit,
             MAX_OBSERVATION_BODY_CHARS,
         )
-        .with_context_label("auto-improve"),
+        .with_context_label("auto-improve")
+        .with_compact_empty_envelopes(true)
+        .with_expanded_body_excerpt_chars(MAX_EXPANDED_OBSERVATION_BODY_CHARS)
+        .with_recovered_budget_chars(sections.session_page_compacted_chars),
     );
     build_prompt_input(
         session_id,
@@ -1955,28 +1965,242 @@ fn truncate_field(input: &str, max_chars: usize) -> String {
     truncate_to_budget(input, max_chars, " [truncated]")
 }
 
+#[cfg(test)]
 fn render_session_page(
     page: Option<&StoredPageBody>,
     max_chars: usize,
     warnings: &mut Vec<String>,
 ) -> String {
+    render_session_page_with_compaction(page, max_chars, warnings).0
+}
+
+fn render_session_page_with_compaction(
+    page: Option<&StoredPageBody>,
+    max_chars: usize,
+    warnings: &mut Vec<String>,
+) -> (String, usize) {
     let Some(page) = page else {
-        return "(none; relying on sampled observations)".into();
+        return ("(none; relying on sampled observations)".into(), 0);
     };
     if max_chars == 0 {
         warnings.push("session page exists but input budget left no room for it".into());
-        return "(omitted by input budget)".into();
+        return ("(omitted by input budget)".into(), 0);
     }
-    let (body, truncated) = truncate_with_marker(&page.body, max_chars, "[session page truncated]");
+    let (compacted_body, saved_chars) = compact_machine_raw_observations(&page.body);
+    let (body, truncated) =
+        truncate_with_marker(&compacted_body, max_chars, "[session page truncated]");
     if truncated {
         warnings.push(format!(
             "session page body truncated to {max_chars} chars before review"
         ));
     }
-    format!(
-        "title: {}\ntier: {}\npinned: {}\nbody:\n{}\n",
-        page.title, page.tier, page.pinned, body
+    (
+        format!(
+            "title: {}\ntier: {}\npinned: {}\nbody:\n{}\n",
+            page.title, page.tier, page.pinned, body
+        ),
+        saved_chars,
     )
+}
+
+/// Compact a *positively identified* machine-generated `## Raw observations`
+/// index block in a session page to a one-line count/range note for the
+/// outgoing review prompt (#2532).
+///
+/// Human-authored Markdown under `## Raw observations` (prose, non-synth
+/// bullets, code blocks, or mixed content) is preserved untouched. Returns
+/// `(rendered_body, chars_saved)`.
+fn compact_machine_raw_observations(body: &str) -> (String, usize) {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut in_fence = false;
+    let mut fence_char = '\0';
+    let mut heading_idx: Option<usize> = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(ch) = fence_marker(trimmed) {
+            if !in_fence {
+                in_fence = true;
+                fence_char = ch;
+            } else if ch == fence_char {
+                in_fence = false;
+            }
+            continue;
+        }
+        if !in_fence && line.trim() == "## Raw observations" {
+            heading_idx = Some(idx);
+            break;
+        }
+    }
+
+    let Some(start_idx) = heading_idx else {
+        return (body.to_string(), 0);
+    };
+
+    // Section spans until the next top-level (`# ` or `## `) heading outside a
+    // code fence, or end of document.
+    let mut end_idx = lines.len();
+    let mut sec_in_fence = false;
+    let mut sec_fence_char = '\0';
+    for (idx, line) in lines.iter().enumerate().skip(start_idx + 1) {
+        let trimmed = line.trim_start();
+        if let Some(ch) = fence_marker(trimmed) {
+            if !sec_in_fence {
+                sec_in_fence = true;
+                sec_fence_char = ch;
+            } else if ch == sec_fence_char {
+                sec_in_fence = false;
+            }
+            continue;
+        }
+        if !sec_in_fence && (trimmed.starts_with("## ") || trimmed.starts_with("# ")) {
+            end_idx = idx;
+            break;
+        }
+    }
+
+    // Separate an optional trailing `_Synthesised by ai-memory..._` footer
+    // inside this section so it is preserved after the compact note.
+    let mut content_end = end_idx;
+    while content_end > start_idx + 1 && lines[content_end - 1].trim().is_empty() {
+        content_end -= 1;
+    }
+    let footer_idx =
+        if content_end > start_idx + 1 && is_synth_footer(lines[content_end - 1].trim()) {
+            content_end -= 1;
+            Some(content_end)
+        } else {
+            None
+        };
+
+    let mut bullet_count = 0usize;
+    let mut middle_omitted = 0usize;
+    let mut first_ts: Option<&str> = None;
+    let mut last_ts: Option<&str> = None;
+
+    for line in &lines[start_idx + 1..content_end] {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(ts) = parse_synth_raw_bullet_ts(trimmed) {
+            bullet_count += 1;
+            if first_ts.is_none() {
+                first_ts = Some(ts);
+            }
+            last_ts = Some(ts);
+        } else if let Some(omitted) = parse_synth_middle_omission(trimmed) {
+            middle_omitted = middle_omitted.saturating_add(omitted);
+        } else {
+            // Any non-index line (prose, authored bullet, code block) means
+            // this section is not purely machine-generated: keep it untouched.
+            return (body.to_string(), 0);
+        }
+    }
+
+    if bullet_count == 0 {
+        return (body.to_string(), 0);
+    }
+
+    let total_indexed = bullet_count.saturating_add(middle_omitted);
+    let range_clause = match (first_ts, last_ts) {
+        (Some(first), Some(last)) if first != last => format!(" ({first} .. {last})"),
+        (Some(ts), _) => format!(" ({ts})"),
+        _ => String::new(),
+    };
+    let note = format!(
+        "[Machine-generated observation index compacted for review: {total_indexed} entries{range_clause}; substantive observations are projected separately below.]"
+    );
+
+    let mut out = String::new();
+    for line in &lines[..start_idx] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("## Raw observations\n\n");
+    out.push_str(&note);
+    out.push('\n');
+    if let Some(f_idx) = footer_idx {
+        out.push('\n');
+        out.push_str(lines[f_idx]);
+        out.push('\n');
+    }
+    if end_idx < lines.len() {
+        out.push('\n');
+        for line in &lines[end_idx..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !body.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+
+    let before_chars = body.chars().count();
+    let after_chars = out.chars().count();
+    let saved = before_chars.saturating_sub(after_chars);
+    (out, saved)
+}
+
+fn fence_marker(trimmed_start: &str) -> Option<char> {
+    if trimmed_start.starts_with("```") {
+        Some('`')
+    } else if trimmed_start.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
+    }
+}
+
+fn is_synth_footer(trimmed: &str) -> bool {
+    (trimmed.starts_with("_Synthesised by ai-memory")
+        || trimmed.starts_with("_Synthesized by ai-memory"))
+        && trimmed.ends_with('_')
+}
+
+fn parse_synth_raw_bullet_ts(trimmed: &str) -> Option<&str> {
+    // Current synth format: `- `<kind>` @ 2026-11-26T10:00:00Z — <title>`
+    if let Some(rest) = trimmed.strip_prefix("- `") {
+        let (kind, after_kind) = rest.split_once('`')?;
+        if kind.trim().is_empty() {
+            return None;
+        }
+        let after_at = after_kind.strip_prefix(" @ ")?;
+        let ts = after_at.split_whitespace().next()?;
+        return looks_like_iso_timestamp(ts).then_some(ts);
+    }
+    // Timestamp-first synth format: `- 2026-11-26T10:00:00Z [<kind>] <title>`
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        let (ts, after_ts) = rest.split_once(' ')?;
+        if !looks_like_iso_timestamp(ts) {
+            return None;
+        }
+        let after_ts = after_ts.trim_start();
+        let bracketed = after_ts.strip_prefix('[')?;
+        let (kind, _) = bracketed.split_once(']')?;
+        if !kind.trim().is_empty() {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+fn looks_like_iso_timestamp(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() >= 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn parse_synth_middle_omission(trimmed: &str) -> Option<usize> {
+    let rest = trimmed.strip_prefix("_... ")?;
+    if !trimmed.ends_with('_') || !rest.contains("raw observations omitted") {
+        return None;
+    }
+    rest.split_whitespace().next()?.parse::<usize>().ok()
 }
 
 pub(crate) fn render_recent_pages(pages: &[BriefingPage]) -> String {

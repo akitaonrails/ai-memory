@@ -39,6 +39,17 @@ pub struct ObservationProjectionConfig {
     pub context_label: Option<String>,
     /// Include bounded literal tokens from omitted and truncated observations.
     pub verbatim_residue: bool,
+    /// Collapse known empty hook envelopes before sampling so substantive
+    /// observations keep sampling slots (#2532). Off by default.
+    pub compact_empty_envelopes: bool,
+    /// Optional upper bound per observation body when reallocating budget
+    /// recovered by compaction before falling back to `per_body_excerpt_chars`
+    /// (#2532).
+    pub expanded_body_excerpt_chars: Option<usize>,
+    /// Characters freed upstream (e.g. by compacting a machine-generated
+    /// session-page index) that qualify the projection for body-cap
+    /// reallocation (#2532).
+    pub recovered_budget_chars: usize,
 }
 
 impl ObservationProjectionConfig {
@@ -55,6 +66,9 @@ impl ObservationProjectionConfig {
             per_body_excerpt_chars,
             context_label: None,
             verbatim_residue: false,
+            compact_empty_envelopes: false,
+            expanded_body_excerpt_chars: None,
+            recovered_budget_chars: 0,
         }
     }
 
@@ -71,6 +85,158 @@ impl ObservationProjectionConfig {
         self.verbatim_residue = enabled;
         self
     }
+
+    /// Opt into collapsing known empty hook envelopes before sampling (#2532).
+    #[must_use]
+    pub fn with_compact_empty_envelopes(mut self, enabled: bool) -> Self {
+        self.compact_empty_envelopes = enabled;
+        self
+    }
+
+    /// Set the bounded per-body cap used when reallocating recovered budget
+    /// before falling back to `per_body_excerpt_chars` (#2532).
+    #[must_use]
+    pub fn with_expanded_body_excerpt_chars(mut self, max_chars: usize) -> Self {
+        self.expanded_body_excerpt_chars = Some(max_chars);
+        self
+    }
+
+    /// Record characters freed upstream (for example by compacting a
+    /// machine-generated session-page index) so body-cap reallocation can
+    /// spend the recovered budget (#2532).
+    #[must_use]
+    pub fn with_recovered_budget_chars(mut self, chars: usize) -> Self {
+        self.recovered_budget_chars = chars;
+        self
+    }
+}
+
+/// Categories of known empty hook envelopes collapsed before sampling (#2532).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EmptyEnvelopeCategory {
+    PostToolUseNoOutput,
+    PreToolUse,
+    EmptyStop,
+    EmptySessionStart,
+}
+
+impl EmptyEnvelopeCategory {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PostToolUseNoOutput => "post-tool-use no-output",
+            Self::PreToolUse => "pre-tool-use",
+            Self::EmptyStop => "empty stop",
+            Self::EmptySessionStart => "empty session-start",
+        }
+    }
+}
+
+/// Counts of collapsed empty hook envelopes seen during a projection pass.
+#[derive(Debug, Default, Clone)]
+struct CompactionSummary {
+    counts: BTreeMap<EmptyEnvelopeCategory, usize>,
+}
+
+impl CompactionSummary {
+    fn record(&mut self, category: EmptyEnvelopeCategory) {
+        *self.counts.entry(category).or_insert(0) += 1;
+    }
+
+    fn total(&self) -> usize {
+        self.counts.values().sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    fn breakdown(&self) -> String {
+        self.counts
+            .iter()
+            .map(|(cat, count)| format!("{count} {}", cat.label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Classify an observation as a collapsible empty hook envelope, or `None` if
+/// it carries substantive evidence or a meaningful lifecycle/error signal.
+///
+/// Meaningful empty-body observations (`outcome: error`/`failed`, `SessionEnd`,
+/// `PreCompact`, `PostCompaction`, `UserPrompt`, `Notification`, `Other`) are
+/// never collapsed.
+fn classify_empty_envelope(obs: &Observation) -> Option<EmptyEnvelopeCategory> {
+    match obs.kind {
+        ObservationKind::SessionStart => obs
+            .body
+            .trim()
+            .is_empty()
+            .then_some(EmptyEnvelopeCategory::EmptySessionStart),
+        ObservationKind::Stop => obs
+            .body
+            .trim()
+            .is_empty()
+            .then_some(EmptyEnvelopeCategory::EmptyStop),
+        ObservationKind::PreToolUse => is_empty_or_metadata_only_tool_body(&obs.body, false)
+            .then_some(EmptyEnvelopeCategory::PreToolUse),
+        ObservationKind::PostToolUse => is_empty_or_metadata_only_tool_body(&obs.body, true)
+            .then_some(EmptyEnvelopeCategory::PostToolUseNoOutput),
+        ObservationKind::UserPrompt
+        | ObservationKind::SessionEnd
+        | ObservationKind::PreCompact
+        | ObservationKind::PostCompaction
+        | ObservationKind::Notification
+        | ObservationKind::Other => None,
+    }
+}
+
+fn is_empty_or_metadata_only_tool_body(body: &str, check_outcome: bool) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("(no output captured)") {
+        return true;
+    }
+    let first_line = trimmed.split(['\n', '\r']).next().unwrap_or_default();
+    if !(first_line.starts_with("tool_family:") || first_line.starts_with("tool:")) {
+        return false;
+    }
+    let (header, output_opt) = if let Some((h, o)) = trimmed.split_once("\n---\n") {
+        (h, Some(o))
+    } else if let Some((h, o)) = trimmed.split_once("\r\n---\r\n") {
+        (h, Some(o))
+    } else if let Some(h) = trimmed
+        .strip_suffix("\n---")
+        .or_else(|| trimmed.strip_suffix("\r\n---"))
+    {
+        (h, Some(""))
+    } else {
+        (trimmed, None)
+    };
+    if check_outcome && header_indicates_failure(header) {
+        return false;
+    }
+    match output_opt {
+        None => true,
+        Some(output) => {
+            let out_trimmed = output.trim();
+            out_trimmed.is_empty() || out_trimmed.eq_ignore_ascii_case("(no output captured)")
+        }
+    }
+}
+
+fn header_indicates_failure(header: &str) -> bool {
+    header.lines().any(|line| {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            return false;
+        };
+        if !key.trim().eq_ignore_ascii_case("outcome") {
+            return false;
+        }
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "error" | "failed" | "failure" | "denied" | "timeout"
+        )
+    })
 }
 
 /// Rendered observation projection plus accounting useful to callers.
@@ -186,25 +352,112 @@ pub fn project_observations(
         return early;
     }
 
-    // Scores depend only on an observation and its position in the full list,
-    // never on which other observations were selected, so they are computed
-    // once here.
-    let scores: Vec<i32> = observations
-        .iter()
-        .enumerate()
-        .map(|(idx, obs)| observation_score(obs, idx, observations.len()))
-        .collect();
-    let selected =
-        select_observation_indices(observations.len(), cfg.max_selected_observations, &scores);
-    let selected_pairs: Vec<(usize, i32)> =
-        selected.iter().map(|&idx| (idx, scores[idx])).collect();
+    let total = observations.len();
+    // Below the sampling threshold, if every observation already fits unclipped
+    // within the character budget, there is no sampling or clipping pressure to
+    // relieve (preserving small sessions such as paired PreToolUse/PostToolUse
+    // calls). Above the sampling threshold, or whenever any body would be
+    // clipped or the budget exceeded, collapse known empty hook envelopes first.
+    let compact_now = cfg.compact_empty_envelopes
+        && (total > cfg.max_selected_observations
+            || observations
+                .iter()
+                .any(|obs| obs.body.chars().count() > cfg.per_body_excerpt_chars)
+            || observations
+                .iter()
+                .enumerate()
+                .map(|(idx, obs)| {
+                    render_observation_block(total, idx, obs, cfg.per_body_excerpt_chars)
+                        .text
+                        .chars()
+                        .count()
+                })
+                .sum::<usize>()
+                > cfg.max_total_chars);
+    if !compact_now {
+        // Scores depend only on an observation and its position in the full list,
+        // never on which other observations were selected, so they are computed
+        // once here.
+        let scores: Vec<i32> = observations
+            .iter()
+            .enumerate()
+            .map(|(idx, obs)| observation_score(obs, idx, total))
+            .collect();
+        let selected = select_observation_indices(total, cfg.max_selected_observations, &scores);
+        let selected_pairs: Vec<(usize, i32)> =
+            selected.iter().map(|&idx| (idx, scores[idx])).collect();
+        let anchors = (Some(0), Some(total - 1));
+        return project_from_rows(
+            total,
+            selected_pairs,
+            anchors,
+            &CompactionSummary::default(),
+            &|idx| observations.get(idx),
+            cfg,
+            ResidueSource::InMemory(observations),
+        );
+    }
+
+    let mut compaction = CompactionSummary::default();
+    let mut substantive: Vec<(usize, i32)> = Vec::new();
+    for (idx, obs) in observations.iter().enumerate() {
+        if let Some(cat) = classify_empty_envelope(obs) {
+            compaction.record(cat);
+        } else {
+            substantive.push((idx, observation_score(obs, idx, total)));
+        }
+    }
+    let (selected_pairs, anchors) =
+        select_substantive_pairs(total, cfg.max_selected_observations, &substantive);
     project_from_rows(
-        observations.len(),
+        total,
         selected_pairs,
+        anchors,
+        &compaction,
         &|idx| observations.get(idx),
         cfg,
         ResidueSource::InMemory(observations),
     )
+}
+
+/// First and last non-prunable observation indices for a projection.
+type HardAnchors = (Option<usize>, Option<usize>);
+
+/// Select up to `limit` substantive `(idx, base_score)` pairs using the same
+/// anchor + even-sample + top-k rules as [`select_observation_indices`],
+/// returning the chronologically ordered selection and its `(first, last)`
+/// hard anchors.
+fn select_substantive_pairs(
+    total: usize,
+    limit: usize,
+    substantive: &[(usize, i32)],
+) -> (Vec<(usize, i32)>, HardAnchors) {
+    let Some(&(first_idx, first_score)) = substantive.first() else {
+        return (Vec::new(), (None, None));
+    };
+    let Some(&(last_idx, last_score)) = substantive.last() else {
+        return (Vec::new(), (None, None));
+    };
+    if limit == 1 {
+        return (vec![(last_idx, last_score)], (None, Some(last_idx)));
+    }
+    if substantive.len() <= limit {
+        return (substantive.to_vec(), (Some(first_idx), Some(last_idx)));
+    }
+    let even = even_sample_indices(total);
+    let mut middle: Vec<(i32, usize, i32)> = substantive[1..substantive.len() - 1]
+        .iter()
+        .map(|&(idx, score)| (selection_key(score, idx, &even), idx, score))
+        .collect();
+    middle.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut picked: Vec<(usize, i32)> = Vec::with_capacity(limit);
+    picked.push((first_idx, first_score));
+    for &(_, idx, score) in middle.iter().take(limit.saturating_sub(2)) {
+        picked.push((idx, score));
+    }
+    picked.push((last_idx, last_score));
+    picked.sort_unstable_by_key(|&(idx, _)| idx);
+    (picked, (Some(first_idx), Some(last_idx)))
 }
 
 /// Project one session's observations from the parts both a full in-memory
@@ -226,6 +479,8 @@ pub fn project_observations(
 fn project_from_rows<'a>(
     total: usize,
     selected: Vec<(usize, i32)>,
+    anchors: (Option<usize>, Option<usize>),
+    compaction: &CompactionSummary,
     row_at: &dyn Fn(usize) -> Option<&'a Observation>,
     cfg: &ObservationProjectionConfig,
     residue_source: ResidueSource<'_>,
@@ -254,7 +509,7 @@ fn project_from_rows<'a>(
         .sum();
 
     while total_chars > cfg.max_total_chars && selected.len() > 1 {
-        let Some(remove_idx) = lowest_prunable_pair(total, &selected) else {
+        let Some(remove_idx) = lowest_prunable_pair_with_anchors(anchors, &selected) else {
             break;
         };
         selected.retain(|&(idx, _)| idx != remove_idx);
@@ -302,7 +557,7 @@ fn project_from_rows<'a>(
             {
                 break;
             }
-            let Some(remove_idx) = lowest_prunable_pair(total, &selected) else {
+            let Some(remove_idx) = lowest_prunable_pair_with_anchors(anchors, &selected) else {
                 break;
             };
             selected.retain(|&(idx, _)| idx != remove_idx);
@@ -324,8 +579,21 @@ fn project_from_rows<'a>(
         }
     }
 
-    let rendered =
-        render_projection_rows(total, &selected_indices, row_at, cfg.per_body_excerpt_chars);
+    let per_row_caps = compute_reallocated_body_caps(
+        total,
+        &selected_indices,
+        &block_chars,
+        row_at,
+        compaction,
+        cfg,
+    );
+    let rendered = render_projection_rows_with_caps(
+        total,
+        &selected_indices,
+        row_at,
+        &per_row_caps,
+        cfg.per_body_excerpt_chars,
+    );
     let omitted_count = total.saturating_sub(selected.len());
     let mut text = rendered.text;
     let mut warnings = Vec::new();
@@ -337,7 +605,32 @@ fn project_from_rows<'a>(
         source_starts.push((observation_id, cursor));
         cursor = cursor.saturating_add(chars);
     }
-    if omitted_count > 0 {
+    if !compaction.is_empty() {
+        let marker = compaction_footer_marker(
+            total,
+            selected.len(),
+            compaction,
+            rendered.truncated_bodies,
+            cfg,
+        );
+        cursor = cursor.saturating_add(marker.chars().count());
+        text.push_str(&marker);
+        warnings.push(format!(
+            "{} compacted {} empty hook envelopes before sampling",
+            context_label(cfg),
+            compaction.total()
+        ));
+        let substantive_total = total.saturating_sub(compaction.total());
+        if selected.len() < substantive_total {
+            warnings.push(format!(
+                "{} observation input sampled {} of {} substantive observations ({} total)",
+                context_label(cfg),
+                selected.len(),
+                substantive_total,
+                total
+            ));
+        }
+    } else if omitted_count > 0 {
         let marker = omission_marker(total, selected.len(), cfg);
         cursor = cursor.saturating_add(marker.chars().count());
         text.push_str(&marker);
@@ -349,17 +642,36 @@ fn project_from_rows<'a>(
         ));
     }
     if rendered.truncated_bodies > 0 {
-        warnings.push(format!(
-            "{} truncated {} observation bod{} to {} chars",
-            context_label(cfg),
-            rendered.truncated_bodies,
-            if rendered.truncated_bodies == 1 {
-                "y"
-            } else {
-                "ies"
-            },
-            cfg.per_body_excerpt_chars
-        ));
+        if per_row_caps.is_empty() {
+            warnings.push(format!(
+                "{} truncated {} observation bod{} to {} chars",
+                context_label(cfg),
+                rendered.truncated_bodies,
+                if rendered.truncated_bodies == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                cfg.per_body_excerpt_chars
+            ));
+        } else {
+            let max_cap = per_row_caps
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(cfg.per_body_excerpt_chars);
+            warnings.push(format!(
+                "{} truncated {} observation bod{} (budget-adjusted cap up to {} chars)",
+                context_label(cfg),
+                rendered.truncated_bodies,
+                if rendered.truncated_bodies == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                max_cap
+            ));
+        }
     }
     if let Some(residue) = residue.filter(|rendered| !rendered.is_empty()) {
         tracing::info!(
@@ -408,6 +720,91 @@ fn project_from_rows<'a>(
         source_ids,
         warnings,
     }
+}
+
+/// Reallocate unused projection character budget to let substantive bodies fit
+/// unclipped (up to `expanded_body_excerpt_chars`) before falling back to
+/// `per_body_excerpt_chars`. Only activates when compaction is enabled and
+/// actually recovered budget (`!compaction.is_empty()` or
+/// `cfg.recovered_budget_chars > 0`).
+fn compute_reallocated_body_caps<'a>(
+    total: usize,
+    selected_indices: &[usize],
+    baseline_block_chars: &BTreeMap<usize, usize>,
+    row_at: &dyn Fn(usize) -> Option<&'a Observation>,
+    compaction: &CompactionSummary,
+    cfg: &ObservationProjectionConfig,
+) -> BTreeMap<usize, usize> {
+    let mut caps = BTreeMap::new();
+    if !cfg.compact_empty_envelopes || (compaction.is_empty() && cfg.recovered_budget_chars == 0) {
+        return caps;
+    }
+    let Some(expanded_cap) = cfg.expanded_body_excerpt_chars else {
+        return caps;
+    };
+    if expanded_cap <= cfg.per_body_excerpt_chars {
+        return caps;
+    }
+    let marker_chars = if !compaction.is_empty() {
+        compaction_footer_marker(
+            total,
+            selected_indices.len(),
+            compaction,
+            selected_indices.len(),
+            cfg,
+        )
+        .chars()
+        .count()
+    } else {
+        omission_marker(total, selected_indices.len(), cfg)
+            .chars()
+            .count()
+    };
+    let baseline_total: usize = selected_indices
+        .iter()
+        .map(|idx| baseline_block_chars.get(idx).copied().unwrap_or(0))
+        .sum();
+    let surplus = cfg
+        .max_total_chars
+        .saturating_sub(baseline_total.saturating_add(marker_chars));
+    if surplus == 0 {
+        return caps;
+    }
+
+    let mut wants: Vec<(usize, usize)> = Vec::new();
+    for &idx in selected_indices {
+        let Some(obs) = row_at(idx) else {
+            continue;
+        };
+        let body_chars = obs.body.chars().count();
+        if body_chars > cfg.per_body_excerpt_chars {
+            let wanted = body_chars
+                .min(expanded_cap)
+                .saturating_sub(cfg.per_body_excerpt_chars);
+            if wanted > 0 {
+                wants.push((idx, wanted));
+            }
+        }
+    }
+    if wants.is_empty() {
+        return caps;
+    }
+
+    // Water-filling by ascending wanted-extra: shorter substantive bodies get
+    // unclipped first, and remaining surplus is shared evenly among longer ones.
+    wants.sort_unstable_by_key(|&(idx, wanted)| (wanted, idx));
+    let mut remaining_surplus = surplus;
+    let mut remaining = wants.len();
+    for (idx, wanted) in wants {
+        let share = remaining_surplus / remaining;
+        let grant = wanted.min(share);
+        if grant > 0 {
+            caps.insert(idx, cfg.per_body_excerpt_chars.saturating_add(grant));
+            remaining_surplus = remaining_surplus.saturating_sub(grant);
+        }
+        remaining -= 1;
+    }
+    caps
 }
 
 /// Where the residue passes get their candidates and bodies.
@@ -650,10 +1047,20 @@ pub(crate) fn project_session_observations(
     let mut top_k = BoundedTopK::new(limit.saturating_sub(2));
     let mut anchor0_rowid: Option<i64> = None;
     let mut last_rowid: Option<i64> = None;
+    let mut compaction = CompactionSummary::default();
+    let mut first_substantive: Option<(usize, i32, i64)> = None;
+    let mut last_substantive: Option<(usize, i32, i64)> = None;
     let mut pass_one: Vec<ResidueCandidate> = Vec::new();
     let mut pass_two: Vec<ResidueCandidate> = Vec::new();
     let mut idx = 0usize;
     snap.each_row_with_rowid(|rowid, obs| {
+        if cfg.compact_empty_envelopes
+            && let Some(cat) = classify_empty_envelope(obs)
+        {
+            compaction.record(cat);
+            idx += 1;
+            return true;
+        }
         let score = observation_score(obs, idx, total);
         if cfg.verbatim_residue {
             match residue_candidate_pass(obs) {
@@ -672,14 +1079,29 @@ pub(crate) fn project_session_observations(
                 None => {}
             }
         }
-        if idx == 0 {
-            anchor0_rowid = Some(rowid);
+        if cfg.compact_empty_envelopes {
+            if first_substantive.is_none() {
+                first_substantive = Some((idx, score, rowid));
+            } else if let Some((prev_idx, prev_score, prev_rowid)) =
+                last_substantive.replace((idx, score, rowid))
+            {
+                top_k.insert(
+                    selection_key(prev_score, prev_idx, &even),
+                    prev_idx,
+                    prev_score,
+                    prev_rowid,
+                );
+            }
         } else {
-            last_rowid = Some(rowid);
-        }
-        // The anchors are selected outright; the heap holds the rest.
-        if !is_hard_anchor(total, idx) {
-            top_k.insert(selection_key(score, idx, &even), idx, score, rowid);
+            if idx == 0 {
+                anchor0_rowid = Some(rowid);
+            } else {
+                last_rowid = Some(rowid);
+            }
+            // The anchors are selected outright; the heap holds the rest.
+            if !is_hard_anchor(total, idx) {
+                top_k.insert(selection_key(score, idx, &even), idx, score, rowid);
+            }
         }
         idx += 1;
         true
@@ -693,31 +1115,68 @@ pub(crate) fn project_session_observations(
         0
     };
     let heap = top_k.finish();
-    let mut selected_idx: Vec<usize> = heap.iter().map(|(i, _, _)| *i).collect();
-    if limit >= 2 {
-        selected_idx.push(0);
-    }
-    selected_idx.push(total - 1);
-    selected_idx.sort_unstable();
-    let mut selected: Vec<(usize, i32)> = Vec::with_capacity(selected_idx.len());
-    let mut selected_rows: Vec<Observation> = Vec::with_capacity(selected_idx.len());
-    for &i in &selected_idx {
-        let rowid = if i == 0 {
-            anchor0_rowid.ok_or(StoreError::SessionCollision)?
-        } else if i == total - 1 {
-            last_rowid.ok_or(StoreError::SessionCollision)?
+    let (selected, selected_rows, anchors) = if cfg.compact_empty_envelopes {
+        let mut triples: Vec<(usize, i32, i64)> = Vec::new();
+        if limit == 1 {
+            if let Some(triple) = last_substantive.or(first_substantive) {
+                triples.push(triple);
+            }
         } else {
-            heap.iter()
-                .find(|(idx, _, _)| *idx == i)
-                .map(|(_, _, rowid)| *rowid)
-                .ok_or(StoreError::SessionCollision)?
+            triples.extend(heap);
+            if let Some(triple) = first_substantive {
+                triples.push(triple);
+            }
+            if let Some(triple) = last_substantive {
+                triples.push(triple);
+            }
+        }
+        triples.sort_unstable_by_key(|&(i, _, _)| i);
+        let mut selected: Vec<(usize, i32)> = Vec::with_capacity(triples.len());
+        let mut selected_rows: Vec<Observation> = Vec::with_capacity(triples.len());
+        for (i, score, rowid) in triples {
+            let observation = snap
+                .row_by_rowid(rowid)?
+                .ok_or(StoreError::SessionCollision)?;
+            selected.push((i, score));
+            selected_rows.push(observation);
+        }
+        let anchors = if limit == 1 {
+            (None, last_substantive.or(first_substantive).map(|t| t.0))
+        } else {
+            (
+                first_substantive.map(|t| t.0),
+                last_substantive.or(first_substantive).map(|t| t.0),
+            )
         };
-        let observation = snap
-            .row_by_rowid(rowid)?
-            .ok_or(StoreError::SessionCollision)?;
-        selected.push((i, observation_score(&observation, i, total)));
-        selected_rows.push(observation);
-    }
+        (selected, selected_rows, anchors)
+    } else {
+        let mut selected_idx: Vec<usize> = heap.iter().map(|(i, _, _)| *i).collect();
+        if limit >= 2 {
+            selected_idx.push(0);
+        }
+        selected_idx.push(total - 1);
+        selected_idx.sort_unstable();
+        let mut selected: Vec<(usize, i32)> = Vec::with_capacity(selected_idx.len());
+        let mut selected_rows: Vec<Observation> = Vec::with_capacity(selected_idx.len());
+        for &i in &selected_idx {
+            let rowid = if i == 0 {
+                anchor0_rowid.ok_or(StoreError::SessionCollision)?
+            } else if i == total - 1 {
+                last_rowid.ok_or(StoreError::SessionCollision)?
+            } else {
+                heap.iter()
+                    .find(|(idx, _, _)| *idx == i)
+                    .map(|(_, _, rowid)| *rowid)
+                    .ok_or(StoreError::SessionCollision)?
+            };
+            let observation = snap
+                .row_by_rowid(rowid)?
+                .ok_or(StoreError::SessionCollision)?;
+            selected.push((i, observation_score(&observation, i, total)));
+            selected_rows.push(observation);
+        }
+        (selected, selected_rows, (Some(0), Some(total - 1)))
+    };
     let position: BTreeMap<usize, usize> = selected
         .iter()
         .enumerate()
@@ -734,6 +1193,8 @@ pub(crate) fn project_session_observations(
     let projected = project_from_rows(
         total,
         selected,
+        anchors,
+        &compaction,
         &row_at,
         cfg,
         ResidueSource::Fetched {
@@ -759,6 +1220,23 @@ fn omission_marker(total: usize, selected: usize, cfg: &ObservationProjectionCon
     format!(
         "\n[{omitted} observations omitted from {} projection due to sample/count/character budget; selected {selected} of {total}; full originals remain in SQLite by observation id]\n",
         context_label(cfg)
+    )
+}
+
+fn compaction_footer_marker(
+    total: usize,
+    selected: usize,
+    compaction: &CompactionSummary,
+    truncated_bodies: usize,
+    cfg: &ObservationProjectionConfig,
+) -> String {
+    let collapsed = compaction.total();
+    let substantive_total = total.saturating_sub(collapsed);
+    let substantive_omitted = substantive_total.saturating_sub(selected);
+    format!(
+        "\n[Compacted {collapsed} empty hook envelopes before {} sampling ({}); selected {selected} of {substantive_total} substantive observations ({total} total); {substantive_omitted} substantive omitted, {truncated_bodies} bodies clipped; full originals remain in SQLite by observation id]\n",
+        context_label(cfg),
+        compaction.breakdown(),
     )
 }
 
@@ -1140,11 +1618,12 @@ struct RenderedProjection {
     blocks: Vec<(ObservationId, usize)>,
 }
 
-fn render_projection_rows<'a>(
+fn render_projection_rows_with_caps<'a>(
     total: usize,
     selected: &[usize],
     row_at: &dyn Fn(usize) -> Option<&'a Observation>,
-    per_body_excerpt_chars: usize,
+    per_row_caps: &BTreeMap<usize, usize>,
+    default_per_body_excerpt_chars: usize,
 ) -> RenderedProjection {
     let mut text = String::new();
     let mut truncated_bodies = 0usize;
@@ -1153,7 +1632,11 @@ fn render_projection_rows<'a>(
         let Some(obs) = row_at(*idx) else {
             continue;
         };
-        let block = render_observation_block(total, *idx, obs, per_body_excerpt_chars);
+        let cap = per_row_caps
+            .get(idx)
+            .copied()
+            .unwrap_or(default_per_body_excerpt_chars);
+        let block = render_observation_block(total, *idx, obs, cap);
         if block.truncated {
             truncated_bodies += 1;
         }
@@ -1310,10 +1793,13 @@ fn even_sample_indices(total: usize) -> BTreeSet<usize> {
 /// The weakest non-anchor selection pair — the base's `lowest_prunable_index`
 /// minimum over its full score vector, applied to the selected pairs: the
 /// lowest base score first, then the lowest index on a tie.
-fn lowest_prunable_pair(total: usize, selected: &[(usize, i32)]) -> Option<usize> {
+fn lowest_prunable_pair_with_anchors(
+    anchors: (Option<usize>, Option<usize>),
+    selected: &[(usize, i32)],
+) -> Option<usize> {
     selected
         .iter()
-        .filter(|(idx, _)| !is_hard_anchor(total, *idx))
+        .filter(|(idx, _)| Some(*idx) != anchors.0 && Some(*idx) != anchors.1)
         .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
         .map(|(idx, _)| *idx)
 }
