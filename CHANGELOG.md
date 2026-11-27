@@ -16,68 +16,53 @@ version in [`docs/changelog/`](docs/changelog/):
 - Paused queued session consolidation when its LLM route ran out of credit
   or quota. The pause survived restarts and kept pending jobs from spending
   retries before the route could accept work again. ([#2499](https://github.com/akitaonrails/ai-memory/pull/2499))
-
-### Fixed
-
+- Applied host-file permissions to `backup-agents` and `restore-agents` in
+  the POSIX container wrapper. Rootless Docker and Podman can now read and
+  write agent assets and archives under the invoking user's bind mounts.
+  These commands also use the existing host-file treatment on
+  SELinux-enforcing hosts.
+- Rejected pre-migration backups with missing or corrupt gzip trailers before
+  saving their receipts or starting the wiki migration.
+- File-based imports reject a `--manifest-out` path that resolves to one of
+  their input files. A dry run could otherwise replace the source document,
+  conversation, export, mapping file, or SQLite database with its manifest.
 - Fixed `reclaim-ledger-versions --drop-latest` answering "nothing to reclaim"
   when only recognized live ledger heads were selected: the preview and the
   `--confirm` report now count the selected heads' paths and rows, and report
   heads apart from superseded versions. (#2513)
-
-### Fixed
-
+- Stopped the `/web` Features page from reporting automatic learning as
+  "Scheduled" when only `[auto_improve] on_session_end` was set. The key has
+  no effect, since session-end triggering stays off and
+  `[auto_improve.scheduler]` runs reviews; the config template, the key's
+  documentation and the page's next step said otherwise. (#2515)
 - Scoped the project dashboard's summary query to the project being viewed,
   avoiding aggregates for unrelated projects during recurring refreshes.
-
-### Fixed
-
 - Preserved the current fallback session ID when `finalize-session` closes
   a different session. The fallback clears only when its own session-end
   is acknowledged, including when a later request in `--all` fails.
-
-### Fixed
-
 - Fixed `ai-memory-wikisync sync --apply` against servers started with
   `--http-stateful`. The companion initializes one MCP session before
   checking tool capabilities and reuses it for conditional writes and deletes.
-
-### Fixed
-
 - Native `antigravity-cli` `stop` hooks now emit `{"decision":""}` on stdout to
   match Antigravity's documented `Stop` response contract and the shell and
   PowerShell hook bundles. (#2521)
-
-### Fixed
-
 - `ai-memory run antigravity` now recognizes `--resume` and `-r` (added in
   Antigravity CLI 1.5.16 as aliases for `--conversation`) as explicit native
   session selectors, preventing linked-session overrides and preserving exact
   `finalize-session` targeting on exit. (#2522)
-
-### Fixed
-
 - Updated `install-hooks --agent antigravity-cli` finalization guidance and the
   Antigravity / Command Code documentation in `docs/support-matrix.md` and
   `docs/managed-workstreams.md` to cover `ai-memory run` automatic
   finalization (interactive and headless), `[sessions] idle_end_after_hours`,
   and headless `agy -p --output-format json` `conversation_id` finalization.
-
-### Fixed
-
 - Fixed `backup-agents` to archive Claude Desktop's `claude_desktop_config.json`
   on Linux, from `$XDG_CONFIG_HOME/Claude` where `install-mcp` writes it.
   `restore-agents` already restored the entry there. (#2528)
-
-### Fixed
-
 - Fixed `backup-agents` and `restore-agents` on Windows to use Devin's
   `%APPDATA%\devin` for its global `config.json`, `mcp_config.json` and skills,
   where `install-mcp`, `install-hooks` and `install-skills` write them. A backup
   no longer reads `%USERPROFILE%\.config\devin` in their place, and a restore
   writes the entries back under the destination's `%APPDATA%\devin`. (#2530)
-
-### Fixed
-
 - Forwarded `CODEX_HOME` and sibling agent config-home environment overrides
   (`COPILOT_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`,
   `KIRO_HOME`, `HERMES_HOME`) through the POSIX and PowerShell container
@@ -107,33 +92,6 @@ version in [`docs/changelog/`](docs/changelog/):
   detection now requires substantive observations past the end watermark, and
   ended-session consolidation jobs key their generation on
   `ended_observation_count`. (#2504)
-
-### Fixed
-
-- Applied host-file permissions to `backup-agents` and `restore-agents` in
-  the POSIX container wrapper. Rootless Docker and Podman can now read and
-  write agent assets and archives under the invoking user's bind mounts.
-  These commands also use the existing host-file treatment on
-  SELinux-enforcing hosts.
-
-### Fixed
-
-- Rejected pre-migration backups with missing or corrupt gzip trailers before
-  saving their receipts or starting the wiki migration.
-
-### Fixed
-
-- File-based imports reject a `--manifest-out` path that resolves to one of
-  their input files. A dry run could otherwise replace the source document,
-  conversation, export, mapping file, or SQLite database with its manifest.
-
-### Fixed
-
-- Stopped the `/web` Features page from reporting automatic learning as
-  "Scheduled" when only `[auto_improve] on_session_end` was set. The key has
-  no effect, since session-end triggering stays off and
-  `[auto_improve.scheduler]` runs reviews; the config template, the key's
-  documentation and the page's next step said otherwise. (#2515)
 
 ## [3.6.2] - 2026-11-25
 
