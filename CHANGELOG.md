@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   preview and repair ended sessions missing a summary, so observation
   retention can prune their old capture after the rule-based page is saved.
   Pass the returned `next_cursor` to `--after` to continue past a full batch,
-  including batches of lifecycle-only sessions.
+  including batches of lifecycle-only sessions (#2544).
 
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
