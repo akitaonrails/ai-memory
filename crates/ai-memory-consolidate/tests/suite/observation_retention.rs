@@ -643,3 +643,100 @@ async fn a_session_whose_rewritten_page_was_evicted_keeps_its_observations() {
         "raw capture whose rewritten summary page decay evicted is the last copy"
     );
 }
+
+#[tokio::test]
+async fn token_retention_dry_run_disabled_and_bounded_batches() {
+    use ai_memory_consolidate::{
+        ColdClusterDedup, LedgerRetention, run_sweep_with_token_tool_retention,
+    };
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let f = seed(&store).await;
+    let conn = aux(&store);
+    for (sid, id) in [
+        (f.consolidated, "one"),
+        (f.consolidated, "two"),
+        (f.unconsolidated, "open"),
+    ] {
+        conn.execute("INSERT INTO token_calls(session_id,call_id,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,observed_at) VALUES(?1,?2,10,2,0,0,1)", params![sid.as_bytes(), id]).unwrap();
+        conn.execute("INSERT INTO token_call_tools(session_id,call_id,tool_id,tool_name,relation) VALUES(?1,?2,'tool','test','requested')", params![sid.as_bytes(), id]).unwrap();
+    }
+    conn.execute("INSERT INTO token_call_tools(session_id,call_id,tool_id,tool_name,relation) VALUES(?1,'one','extra','test','requested')", params![f.consolidated.as_bytes()]).unwrap();
+    drop(conn);
+    let retention = ObservationRetention { days: 0, batch: 1 };
+    for (days, dry, matched, deleted, batches) in
+        [(0, false, 0, 0, 0), (1, true, 3, 0, 0), (1, false, 3, 3, 4)]
+    {
+        let report = run_sweep_with_token_tool_retention(
+            &store.reader,
+            &store.writer,
+            None,
+            f.ws,
+            f.proj,
+            &DecayParams::default(),
+            0.0,
+            retention,
+            false,
+            ColdClusterDedup::default(),
+            LedgerRetention::default(),
+            days,
+            dry,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                report.token_call_tools_prunable,
+                report.token_call_tools_pruned,
+                report.token_call_tool_prune_batches
+            ),
+            (matched, deleted, batches)
+        );
+    }
+    let n: i64 = aux(&store)
+        .query_row("SELECT COUNT(*) FROM token_calls", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 3);
+    let remaining_tools: i64 = aux(&store)
+        .query_row("SELECT COUNT(*) FROM token_call_tools", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining_tools, 1);
+    let read = store
+        .reader
+        .token_usage_report(f.ws, f.proj, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(read.call_count, 3);
+    let old_calls: Vec<_> = read
+        .calls
+        .iter()
+        .filter(|c| c.session_id == f.consolidated.to_string())
+        .collect();
+    assert_eq!(old_calls.len(), 2);
+    assert!(old_calls.iter().all(|c| c.tools.is_empty()));
+    let open_call = read
+        .calls
+        .iter()
+        .find(|c| c.session_id == f.unconsolidated.to_string())
+        .unwrap();
+    assert_eq!(open_call.tools.len(), 1);
+    assert!(
+        run_sweep_with_token_tool_retention(
+            &store.reader,
+            &store.writer,
+            None,
+            f.ws,
+            f.proj,
+            &DecayParams::default(),
+            0.0,
+            retention,
+            false,
+            ColdClusterDedup::default(),
+            LedgerRetention::default(),
+            -1,
+            false
+        )
+        .await
+        .is_err()
+    );
+}

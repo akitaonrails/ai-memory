@@ -144,6 +144,7 @@ The defaults for `lambda` through `hard_delete_after_days` come from `ai_memory_
 | `hard_delete_after_days` | `180` | `AI_MEMORY_DECAY__HARD_DELETE_AFTER_DAYS` | Grace period before an evicted version chain is deleted permanently. |
 | `breadth_weight` | `0.0` | `AI_MEMORY_DECAY__BREADTH_WEIGHT` | Weight for the number of distinct authenticated readers of a page. |
 | `observation_retention_days` | `0` (off) | `AI_MEMORY_DECAY__OBSERVATION_RETENTION_DAYS` | Age past which a consolidated session's raw observations may be pruned, in each project only while it holds a live page of that session. Irreversible. |
+| `token_call_tool_retention_days` | `0` (off) | `AI_MEMORY_DECAY__TOKEN_CALL_TOOL_RETENTION_DAYS` | Age past which tool references of calls in closed sessions are pruned within the project. Calls and session totals remain. |
 | `observation_prune_batch` | `5000` (`DEFAULT_OBSERVATION_PRUNE_BATCH`) | `AI_MEMORY_DECAY__OBSERVATION_PRUNE_BATCH` | Observation rows deleted per prune transaction. |
 | `ledger_retention_months` | `0` (off) | `AI_MEMORY_DECAY__LEDGER_RETENTION_MONTHS` | Whole UTC months after a month ends before the sweep deletes its `log-YYYY-MM.md` ledger. |
 | `compact_cold_episodic` | `false` | `AI_MEMORY_DECAY__COMPACT_COLD_EPISODIC` | Compact a cold episodic page to its abstract, summary and keep-token set instead of evicting it. |

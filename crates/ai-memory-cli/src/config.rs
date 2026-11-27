@@ -104,6 +104,8 @@ pub struct DecaySettings {
     /// Age past which a consolidated session's raw observations may be pruned.
     /// `0` disables the pass; nothing is deleted until an operator opts in.
     pub observation_retention_days: i64,
+    /// Age in days for closed-session token tool retention; zero disables it.
+    pub token_call_tool_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
     /// Age, in whole UTC calendar months after a month ends, past which the
@@ -149,6 +151,7 @@ impl Default for DecaySettings {
             hard_delete_after_days: base.hard_delete_after_days,
             breadth_weight: 0.0,
             observation_retention_days: 0,
+            token_call_tool_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
             ledger_retention_months: 0,
             compact_cold_episodic: false,
@@ -2935,6 +2938,11 @@ impl Config {
                  (0 disables observation pruning)"
             );
         }
+        if config.decay.token_call_tool_retention_days < 0 {
+            anyhow::bail!(
+                "decay.token_call_tool_retention_days must be greater than or equal to zero (0 disables token call tool pruning)"
+            );
+        }
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
         }
@@ -5330,6 +5338,7 @@ mod tests {
         // Observation pruning must stay OFF by default: an install that never
         // opts in keeps every raw observation it has today.
         assert_eq!(cfg.decay.observation_retention_days, 0);
+        assert_eq!(cfg.decay.token_call_tool_retention_days, 0);
         assert_eq!(cfg.decay.observation_prune_batch, 5_000);
         assert!(!cfg.decay.observation_retention().is_enabled());
         // Same contract for the hook event ledgers: kept unless opted in.
@@ -6400,6 +6409,8 @@ mod tests {
     fn load_rejects_destructive_invalid_observation_retention() {
         for (key, value) in [
             ("observation_retention_days", "-1"),
+            ("token_call_tool_retention_days", "-1"),
+            ("token_call_tool_retention_days", "\"invalid\""),
             ("observation_prune_batch", "0"),
         ] {
             let tmp = TempDir::new().unwrap();
@@ -6408,10 +6419,22 @@ mod tests {
             let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
                 .expect_err("invalid observation retention must fail closed");
             assert!(
-                error.to_string().contains(key),
+                format!("{error:#}").contains(key),
                 "unexpected error for {key} = {value}: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn token_call_tool_retention_config_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[decay]\ntoken_call_tool_retention_days = 17\n").unwrap();
+        let cfg = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.decay.token_call_tool_retention_days, 17);
+        let encoded = serde_json::to_string(&cfg.decay).unwrap();
+        let decoded: DecaySettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.token_call_tool_retention_days, 17);
     }
 
     /// A negative ledger age is rejected at load, like the observation age: a

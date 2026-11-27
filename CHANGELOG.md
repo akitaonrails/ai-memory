@@ -18,6 +18,12 @@ version in [`docs/changelog/`](docs/changelog/):
   Providers that return only JSON continue to contribute estimates.
   ([#2498](https://github.com/akitaonrails/ai-memory/pull/2498))
 
+- Added `[decay] token_call_tool_retention_days` (env
+  `AI_MEMORY_DECAY__TOKEN_CALL_TOOL_RETENTION_DAYS`, default `0` = off), a
+  forget-sweep pass that deletes the `token_call_tools` rows of closed-session
+  token calls older than the cutoff, in bounded batches per scope. Token calls
+  and `session_usage` totals are kept. (#2514)
+
 - Pi tool description and parameter overrides (`pi_tool_overrides` /
   `AI_MEMORY_PI_TOOL_OVERRIDES`): operators can point to a JSON file relative
   to the config directory (confined to that directory, max 64 KiB) to shorten

@@ -391,6 +391,7 @@ cold_threshold = 0.20
 hard_delete_after_days = 180
 breadth_weight = 0.0
 observation_retention_days = 0     # 0 = never prune raw observations
+token_call_tool_retention_days = 0      # 0 = never prune tools from closed-session calls
 observation_prune_batch = 5000     # rows per prune transaction
 ledger_retention_months = 0        # 0 = never delete hook event ledgers
 

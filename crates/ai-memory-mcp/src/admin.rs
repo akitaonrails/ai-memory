@@ -68,7 +68,7 @@ use ai_memory_consolidate::{
     ObservationRetention, SourceCounts, prune_sources_to_budget,
     render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
     run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report_with_breadth,
-    run_embedding_backfill, run_lint, run_sweep_with_ledgers,
+    run_embedding_backfill, run_lint,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
@@ -110,6 +110,7 @@ const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 struct SweepTuning {
     breadth_weight: f64,
     retention: ObservationRetention,
+    token_call_tool_retention_days: i64,
     /// Opt-in age bound for the hook event ledgers (disabled by default).
     ledger_retention: LedgerRetention,
     /// A2 opt-in: compact cold episodic pages instead of evicting them.
@@ -725,6 +726,25 @@ pub fn admin_router_with_sweep_tuning(
     ledger_retention: LedgerRetention,
     compact_cold_episodic: bool,
 ) -> Router {
+    admin_router_with_token_tool_retention(
+        state,
+        breadth_weight,
+        retention,
+        ledger_retention,
+        0,
+        compact_cold_episodic,
+    )
+}
+
+/// Build the admin router with an opt-in token call tool retention age.
+pub fn admin_router_with_token_tool_retention(
+    state: AdminState,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+    ledger_retention: LedgerRetention,
+    token_call_tool_retention_days: i64,
+    compact_cold_episodic: bool,
+) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
@@ -847,6 +867,7 @@ pub fn admin_router_with_sweep_tuning(
             breadth_weight,
             retention,
             ledger_retention,
+            token_call_tool_retention_days,
             compact_cold_episodic,
         }))
 }
@@ -4117,7 +4138,7 @@ async fn handle_forget_sweep(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep_with_ledgers(
+    ai_memory_consolidate::run_sweep_with_token_tool_retention(
         &state.reader,
         &state.writer,
         Some(&state.wiki),
@@ -4129,6 +4150,7 @@ async fn handle_forget_sweep(
         tuning.compact_cold_episodic,
         ColdClusterDedup::default(),
         tuning.ledger_retention,
+        tuning.token_call_tool_retention_days,
         req.dry_run,
     )
     .await

@@ -508,6 +508,13 @@ pub(crate) enum WriteCmd {
         cutoff_us: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
+    PruneTokenCallTools {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+        batch: usize,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     PruneConsolidatedObservations {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -2689,6 +2696,29 @@ impl WriterHandle {
             tombstone_id,
             expected_latest_id,
             cutoff_us,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete one bounded batch of old token call tools for closed sessions.
+    ///
+    /// # Errors
+    /// Returns a writer or database error.
+    pub async fn prune_token_call_tools(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+        batch: usize,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PruneTokenCallTools {
+            workspace_id,
+            project_id,
+            cutoff_us,
+            batch,
             reply: tx,
         })
         .await?;
@@ -5194,6 +5224,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     cutoff_us,
                 );
                 send_or_warn(reply, result, "hard_delete_decayed_page_chain");
+            }
+            WriteCmd::PruneTokenCallTools {
+                workspace_id,
+                project_id,
+                cutoff_us,
+                batch,
+                reply,
+            } => {
+                let result = ops::prune_token_call_tools(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    cutoff_us,
+                    batch,
+                );
+                send_or_warn(reply, result, "prune_token_call_tools");
             }
             WriteCmd::PruneConsolidatedObservations {
                 workspace_id,

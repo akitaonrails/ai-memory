@@ -1075,3 +1075,5 @@ diag-pi-tool-overrides-invalid-description = a descrição em pi_tool_overrides 
 diag-pi-tool-overrides-unknown-param = pi_tool_overrides para `{ $tool }` referencia o parâmetro desconhecido `{ $param }`
 diag-pi-tool-overrides-invalid-param-description = a descrição em pi_tool_overrides para `{ $tool }.{ $param }` não pode ser vazia e deve ter no máximo { $max } caracteres
 diag-pi-tool-overrides-missing-required-param = pi_tool_overrides para `{ $tool }` omite o parâmetro obrigatório `{ $param }`
+
+diag-decay-token-call-tool-retention-days-must-be-greater = decay.token_call_tool_retention_days precisa ser maior ou igual a zero (0 desativa a remoção de ferramentas das chamadas de tokens)

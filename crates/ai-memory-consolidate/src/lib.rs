@@ -100,7 +100,7 @@ pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
     LedgerRetention, MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,
     run_sweep_with_breadth, run_sweep_with_compaction, run_sweep_with_hygiene,
-    run_sweep_with_ledgers, run_sweep_with_options,
+    run_sweep_with_ledgers, run_sweep_with_options, run_sweep_with_token_tool_retention,
 };
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,
