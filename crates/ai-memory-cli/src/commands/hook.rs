@@ -12804,9 +12804,9 @@ mod tests {
         });
         let next_bytes = serde_json::to_vec(&next_payload).unwrap();
         #[cfg(not(windows))]
-        let user_cmd = "cat; printf '|user-bar'; exit 7";
+        let user_cmd = "cat; printf 'status-preview'; exit 7";
         #[cfg(windows)]
-        let user_cmd = "more & echo |user-bar & exit /b 7";
+        let user_cmd = "more & echo status-preview & exit /b 7";
         let b64 = base64::engine::general_purpose::STANDARD.encode(user_cmd);
         let mut out2 = Vec::new();
         let mut err2 = Vec::new();
@@ -12815,7 +12815,7 @@ mod tests {
         assert_eq!(code2, 7, "chained command exit code must be forwarded");
         let out_str = String::from_utf8_lossy(&out2);
         assert!(
-            out_str.contains("agy-status-1") && out_str.contains("|user-bar"),
+            out_str.contains("agy-status-1") && out_str.contains("status-preview"),
             "chained command must receive stdin and forward stdout: {out_str}"
         );
         let updated =

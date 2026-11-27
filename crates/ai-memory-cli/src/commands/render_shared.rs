@@ -2007,21 +2007,39 @@ pub(crate) fn build_antigravity_statusline_command(
     absolute_paths: bool,
     chain_command: Option<&str>,
 ) -> String {
-    use base64::Engine as _;
     let exe = if absolute_paths {
         embedded_exe_from(std::env::current_exe().ok())
     } else {
         PathBuf::from(FALLBACK_HOOK_EXE)
     };
+    // The status line uses cmd /c on Windows, like the lifecycle hooks.
+    // https://antigravity.google/docs/cli/statusline/#configuration
+    let quote = if cfg!(windows) {
+        NativeQuote::WindowsBare
+    } else {
+        NativeQuote::Posix
+    };
+    antigravity_statusline_command_with_exe(&exe, data_dir, chain_command, quote)
+}
+
+fn antigravity_statusline_command_with_exe(
+    exe: &Path,
+    data_dir: &Path,
+    chain_command: Option<&str>,
+    quote: NativeQuote,
+) -> String {
+    use base64::Engine as _;
+    let exe = exe.to_string_lossy();
+    let exe = strip_windows_verbatim_prefix(&exe);
     let mut cmd = format!(
-        "{} --data-dir {} hook --event statusline --agent antigravity-cli",
-        shell_quote(&exe.to_string_lossy()),
-        shell_quote(&data_dir.to_string_lossy()),
+        "{}{} hook --event statusline --agent antigravity-cli",
+        quote.path(&exe),
+        native_data_dir_arg(Some(data_dir), quote),
     );
     if let Some(chain) = chain_command.map(str::trim).filter(|s| !s.is_empty()) {
         let encoded = base64::engine::general_purpose::STANDARD.encode(chain);
         cmd.push_str(" --chain-command-b64 ");
-        cmd.push_str(&shell_quote(&encoded));
+        cmd.push_str(&quote.field(&encoded));
     }
     cmd
 }
@@ -5818,6 +5836,34 @@ if (inheritOnly) {
         assert!(
             !other_cmd.contains("^ "),
             "quoted agents must not caret-escape spaces: {other_cmd}"
+        );
+    }
+
+    #[test]
+    fn antigravity_statusline_command_uses_the_native_shell() {
+        let windows = antigravity_statusline_command_with_exe(
+            Path::new(r"C:\Users\Example\bin\ai-memory.exe"),
+            Path::new(r"C:\Users\Example\AppData\Local\ai-memory"),
+            Some("echo ok"),
+            NativeQuote::WindowsBare,
+        );
+        assert_eq!(
+            windows,
+            concat!(
+                r"C:\Users\Example\bin\ai-memory.exe --data-dir C:\Users\Example\AppData\Local\ai-memory",
+                " hook --event statusline --agent antigravity-cli --chain-command-b64 ZWNobyBvaw==",
+            )
+        );
+
+        let posix = antigravity_statusline_command_with_exe(
+            Path::new("/tmp/ai memory/bin/ai-memory"),
+            Path::new("/tmp/memory data"),
+            None,
+            NativeQuote::Posix,
+        );
+        assert_eq!(
+            posix,
+            "'/tmp/ai memory/bin/ai-memory' --data-dir '/tmp/memory data' hook --event statusline --agent antigravity-cli"
         );
     }
 
