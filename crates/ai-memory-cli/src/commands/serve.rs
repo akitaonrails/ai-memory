@@ -2031,7 +2031,6 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                         learning_scheduled: config.auto_improve.scheduler.enabled
                             && config.auto_improve.scheduler.interval_secs > 0
                             && config.auto_improve.scheduler.max_sessions_per_tick > 0,
-                        learning_on_session_end: config.auto_improve.on_session_end,
                         review_requires_approval: config.auto_improve.require_approval,
                         maintenance_enabled: config.maintenance.enabled,
                         retention_scheduled: config.maintenance.forget_sweep_interval_secs > 0,

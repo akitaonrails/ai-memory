@@ -1924,8 +1924,9 @@ pub struct AutoImproveSettings {
     /// proposals are staged for audit and immediately approved through the
     /// normal wiki write path.
     pub require_approval: bool,
-    /// Whether SessionEnd should schedule a reviewer run. Defaults off so hooks
-    /// stay cheap and fire-and-forget.
+    /// Accepted so existing configs keep loading; it has no effect. Session-end
+    /// triggering stays off (`docs/auto-improvement-loop.md`, upgrade contract):
+    /// `[auto_improve.scheduler]` reviews completed sessions outside hook latency.
     pub on_session_end: bool,
     /// Minimum observations before a session is worth reviewing.
     pub min_observations: usize,
