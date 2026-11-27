@@ -7743,10 +7743,12 @@ SELECT id, workspace_id, project_id, path, length(body), substr(body, 1, ?1) \
 /// measurement of what the confirmed run would do.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReclaimLedgerVersionsSummary {
-    /// Ledger `(workspace, project, path)` coordinates holding residue.
+    /// Distinct ledger `(workspace, project, path)` coordinates selected.
     pub ledger_paths: u64,
     /// `pages` rows selected for deletion.
     pub pages_deleted: u64,
+    /// Selected live ledger rows.
+    pub latest_deleted: u64,
     /// Bytes of page body those rows carried. Logical payload, not freed
     /// bytes: the file only shrinks when `compacted` ran.
     pub bytes_deleted: u64,
@@ -7881,6 +7883,7 @@ pub fn reclaim_ledger_versions(
     let mut summary = ReclaimLedgerVersionsSummary {
         ledger_paths: ledger_paths.len() as u64,
         pages_deleted: doomed.len() as u64,
+        latest_deleted: 0,
         bytes_deleted,
         dropped_latest: false,
         bytes_before,
@@ -7910,9 +7913,18 @@ pub fn reclaim_ledger_versions(
             }
             let id: Vec<u8> = row.get(0)?;
             latest.push(PageId::from_slice(&id)?);
+            let workspace: Vec<u8> = row.get(3)?;
+            let project: Vec<u8> = row.get(4)?;
+            ledger_paths.insert((
+                WorkspaceId::from_slice(&workspace)?.to_string(),
+                ProjectId::from_slice(&project)?.to_string(),
+                row.get(5)?,
+            ));
             bytes_deleted = bytes_deleted.saturating_add(row.get::<_, i64>(1)?.max(0) as u64);
         }
-        summary.pages_deleted += latest.len() as u64;
+        summary.latest_deleted = latest.len() as u64;
+        summary.ledger_paths = ledger_paths.len() as u64;
+        summary.pages_deleted += summary.latest_deleted;
         summary.bytes_deleted = bytes_deleted;
         summary.dropped_latest = !latest.is_empty();
         doomed.extend(latest);

@@ -336,6 +336,7 @@ async fn run_conversation(args: ConversationArgs) -> Result<()> {
         }
     }
 
+    validate_manifest_destination(args.manifest_out.as_deref(), &[&args.file])?;
     let workspace = args
         .workspace
         .clone()
@@ -961,6 +962,22 @@ fn write_manifest(path: &Path, entries: &[ManifestEntry]) -> Result<()> {
         .with_context(|| format!("write manifest {}", path.display()))
 }
 
+fn validate_manifest_destination(manifest: Option<&Path>, inputs: &[&Path]) -> Result<()> {
+    // A fresh output has no resolved file to compare. The atomic writer
+    // validates the output directory and reports write errors.
+    let Some(destination) = manifest.and_then(|path| path.canonicalize().ok()) else {
+        return Ok(());
+    };
+    if inputs.iter().any(|input| {
+        input
+            .canonicalize()
+            .is_ok_and(|source| source == destination)
+    }) {
+        bail!("--manifest-out must be different from the import input files");
+    }
+    Ok(())
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -1519,6 +1536,26 @@ mod tests {
                 {"role": "assistant", "content": "To make backpressure explicit."}
             ]
         })
+    }
+
+    #[tokio::test]
+    async fn conversation_manifest_cannot_replace_its_input() {
+        let temp = tempdir().unwrap();
+        let file = write_conversation(temp.path(), sample_conversation());
+        let original = fs::read(&file).unwrap();
+        let error = run_conversation(ConversationArgs {
+            file: file.clone(),
+            workspace: Some("w".into()),
+            server_url: DEFAULT_SERVER_URL.into(),
+            apply: false,
+            manifest_out: Some(file.clone()),
+            create_destination: false,
+            show_body: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("--manifest-out"), "{error:#}");
+        assert_eq!(fs::read(&file).unwrap(), original);
     }
 
     #[test]

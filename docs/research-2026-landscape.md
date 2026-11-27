@@ -129,10 +129,18 @@ The market has consolidated into recognizable camps:
 | **File-first wiki memory** | **us**, basic-memory, OKF, Letta's context repositories, Supermemory's memoryrepo | Markdown source of truth, derived indexes, human-editable |
 | File-first wiki (LLM-leaning) | **memU**, **EverOS** (formerly listed separately here as EverMemOS) | Markdown source of truth + derived vector/SQLite(+LanceDB) indexes, but LLM-required for the capture/distill flow; skill-distillation and offline consolidation (see below) |
 | Self-hosted coding-agent store | **Engram** | Single Go binary, SQLite+FTS5, MCP, project scope, session-summary handoffs; a structured-row store captured via agent MCP calls, not lifecycle hooks (see below) |
+| Code-linked shared memory | **ClickHouse Loom** | Self-hosted MCP and HTTP memory with namespace roles, indexed source links, and ClickHouse views for saved decisions and versions. |
 | Governed multi-agent / fleet memory | **Caura** | Shared fleet memory with visibility scopes, trust tiers, audit, governance on Postgres+pgvector; org-scale, not project-scale (see below) |
 | Shared memory server (proxy fan-in) | **TencentDB Agent Memory** | One proxy in front of many harnesses distilling Chat Memory / Skill / Wiki / CodeGraph; proxy interception, not MCP/hooks (see below) |
 | Code intelligence | **DeusData/codebase-memory-mcp** (~46.5K stars as of 2026-10-13) | Index the *codebase* (162 languages, tree-sitter → SQLite graph, static C binary) rather than the *session*. Adjacent, not competing: it remembers what the code is, not what you did (see `research-codebase-memory-mcp.md`) |
 | Agent-harness OS | **ECC** (~247K stars), plus the skills/agents-pack ecosystem | Install a whole plan→test→implement→review→**remember**→improve loop into the agent; memory is one thin pillar ("optimize the context window, persist everything else"), deliberately kept as *context, not policy*. Adjacent, not competing (see `research-ecc.md`) |
+
+**Code-linked shared memory: ClickHouse Loom.** A saved lesson can name an
+indexed function. Loom checks the link after indexing a source change and can
+return the changed commit. On an authenticated deployment, the SQL history
+view can show the token subject that wrote a decision version. The live store
+uses ClickHouse or optional Postgres. Markdown export is available for
+portability.
 
 **Fact-row store with hook capture: `doobidoo/mcp-memory-service`** (1.9K
 stars, 3.2K commits, active through August 2026). It is what we would be
@@ -1123,3 +1131,7 @@ benchmarks as a ranking; chasing agentmemory's tool-count
   - Caura's `docs/agent-collaboration-extension.md`, collaboration client
     README, and backend-v3.34.5 release metadata. The docs explicitly call the
     collaboration extension a beta preview and external effects at-least-once.
+
+- ClickHouse Loom (official sources): [linked source and revision checks](https://loom.clickhouse.com/docs/use-cases/memory-linked-to-code),
+  [SQL history and writer attribution](https://loom.clickhouse.com/docs/use-cases/self-hosted-clickhouse#audit-a-changed-decision-with-sql),
+  and [Markdown portability](https://loom.clickhouse.com/docs/features/integrations/okf#test-agent-memory-portability).

@@ -47,7 +47,8 @@ Copilot CLI also reads `~/.agents/skills`, `.agents/skills` and
 when it is set, as it resolves `.claude/` against `CLAUDE_CONFIG_DIR`.
 
 Claude Desktop config paths use the same platform-aware resolver as
-`install-mcp`, including packaged Windows installs. OpenCode uses
+`install-mcp`, including packaged Windows installs and
+`$XDG_CONFIG_HOME/Claude` on Linux. OpenCode uses
 `%USERPROFILE%\.config\opencode` on Windows too, as its
 [official troubleshooting guide](https://dev.opencode.ai/docs/troubleshooting/)
 documents.
@@ -67,6 +68,15 @@ files listed under `~/.kiro` use `KIRO_HOME`, the same homes `install-mcp`,
 `.grok/` and `.kiro/` paths, so global entries restore into the receiving
 machine's Grok or Kiro home. Project-scoped `.grok/` entries stay under the
 project.
+
+Devin files listed under `~/.config/devin` live in `%APPDATA%\devin` on
+Windows, as
+[Devin's configuration guide](https://docs.devin.ai/cli/reference/configuration/global-vs-local)
+documents and `install-mcp`, `install-hooks` and `install-skills` write them.
+Archives keep portable `.config/devin/` paths, so global entries restore into
+the receiving machine's Devin config root. Legacy `.devin/` entries keep their
+recorded destination under the user's home, and project `.devin/skills` stays
+under the project.
 
 ---
 

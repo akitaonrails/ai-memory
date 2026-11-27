@@ -52,7 +52,7 @@ pub async fn run(config: &Config, args: ReclaimLedgerVersionsArgs) -> Result<()>
     let dropped_latest = report["dropped_latest"].as_bool().unwrap_or(false);
     let compacted = report["compacted"].as_bool().unwrap_or(false);
 
-    if paths == 0 || rows == 0 {
+    if is_empty(paths, rows) {
         println!(
             "{}", i18n.text("cli-reclaim-ledger-versions-no-superseded-ledger-versions-to-reclaim-nothing-written-by-the-pre-2-1-1-in"));
         return Ok(());
@@ -60,7 +60,19 @@ pub async fn run(config: &Config, args: ReclaimLedgerVersionsArgs) -> Result<()>
 
     if dry_run {
         println!(
-            "{}", i18n.format("cli-reclaim-ledger-versions-would-delete-rows-superseded-version-s-of-the-hook-event-ledger-across-paths", &[("value0", format!("{}", rows)), ("value1", format!("{}", paths)), ("value2", human_bytes(body_bytes).to_string())]));
+            "{}", i18n.format(if dropped_latest { "cli-reclaim-ledger-versions-would-delete-total" } else { "cli-reclaim-ledger-versions-would-delete-rows-superseded-version-s-of-the-hook-event-ledger-across-paths" }, &[("value0", format!("{}", rows)), ("value1", format!("{}", paths)), ("value2", human_bytes(body_bytes).to_string())]));
+        if let Some(latest) = report["latest_deleted"].as_u64().filter(|_| dropped_latest) {
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-reclaim-ledger-versions-breakdown",
+                    &[
+                        ("value0", rows.saturating_sub(latest).to_string()),
+                        ("value1", latest.to_string())
+                    ]
+                )
+            );
+        }
         if dropped_latest {
             println!(
                 "{}",
@@ -85,7 +97,19 @@ pub async fn run(config: &Config, args: ReclaimLedgerVersionsArgs) -> Result<()>
     }
 
     println!(
-        "{}", i18n.format("cli-reclaim-ledger-versions-deleted-rows-superseded-ledger-version-s-across-paths-ledger-path-s-carrying", &[("value0", format!("{}", rows)), ("value1", format!("{}", paths)), ("value2", human_bytes(body_bytes).to_string())]));
+        "{}", i18n.format(if dropped_latest { "cli-reclaim-ledger-versions-deleted-total" } else { "cli-reclaim-ledger-versions-deleted-rows-superseded-ledger-version-s-across-paths-ledger-path-s-carrying" }, &[("value0", format!("{}", rows)), ("value1", format!("{}", paths)), ("value2", human_bytes(body_bytes).to_string())]));
+    if let Some(latest) = report["latest_deleted"].as_u64().filter(|_| dropped_latest) {
+        println!(
+            "{}",
+            i18n.format(
+                "cli-reclaim-ledger-versions-breakdown",
+                &[
+                    ("value0", rows.saturating_sub(latest).to_string()),
+                    ("value1", latest.to_string())
+                ]
+            )
+        );
+    }
     if dropped_latest {
         println!(
             "{}",
@@ -111,4 +135,20 @@ pub async fn run(config: &Config, args: ReclaimLedgerVersionsArgs) -> Result<()>
             "{}", i18n.text("cli-reclaim-ledger-versions-the-bytes-are-free-pages-now-run-ai-memory-compact-confirm-to-return-them-to"));
     }
     Ok(())
+}
+
+fn is_empty(_paths: u64, rows: u64) -> bool {
+    rows == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_empty;
+
+    #[test]
+    fn rows_determine_whether_the_report_is_empty() {
+        assert!(!is_empty(0, 1));
+        assert!(!is_empty(1, 1));
+        assert!(is_empty(1, 0));
+    }
 }

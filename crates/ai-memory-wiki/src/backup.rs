@@ -221,16 +221,7 @@ fn create_pre_migration_backup_inner(
 
     // Verify: re-open and count entries; a torn or unreadable archive
     // fails here and the caller aborts the migration.
-    let mut counted = 0usize;
-    {
-        let file = BufReader::new(File::open(&archive_path)?);
-        let dec = flate2::read::GzDecoder::new(file);
-        let mut ar = tar::Archive::new(dec);
-        for entry in ar.entries()? {
-            entry?;
-            counted += 1;
-        }
-    }
+    let counted = verify_archive_entries(&archive_path)?;
     let size_bytes = std::fs::metadata(&archive_path)?.len();
     if counted != expected || size_bytes == 0 {
         let _ = std::fs::remove_file(&archive_path);
@@ -306,6 +297,20 @@ fn finish_archive<W: Write>(
         .finish()?
         .into_inner()
         .map_err(std::io::IntoInnerError::into_error)
+}
+
+fn verify_archive_entries(path: &Path) -> std::io::Result<usize> {
+    let file = BufReader::new(File::open(path)?);
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut counted = 0;
+    for entry in archive.entries()? {
+        entry?;
+        counted += 1;
+    }
+    // Tar's end marker can arrive before gzip checks its checksum and size.
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())?;
+    Ok(counted)
 }
 
 #[cfg(test)]
@@ -390,6 +395,25 @@ mod tests {
         assert!(receipt.archive_present());
         let loaded = BackupReceipt::load(data.path()).unwrap();
         assert_eq!(loaded.archive_path, receipt.archive_path);
+    }
+
+    #[test]
+    fn verification_requires_an_intact_gzip_trailer() {
+        let data = data_dir_with_content();
+        let dest = TempDir::new().unwrap();
+        let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path())).unwrap();
+        let path = &receipt.archive_path;
+        assert_eq!(verify_archive_entries(path).unwrap(), receipt.entries);
+
+        let archive = std::fs::read(path).unwrap();
+        let trailer_start = archive.len() - 8;
+        let mut damaged_checksum = archive.clone();
+        damaged_checksum[trailer_start] ^= 1;
+
+        for bytes in [&archive[..trailer_start], damaged_checksum.as_slice()] {
+            std::fs::write(path, bytes).unwrap();
+            assert!(verify_archive_entries(path).is_err());
+        }
     }
 
     #[test]

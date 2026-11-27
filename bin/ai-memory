@@ -46,6 +46,13 @@
 #   AI_MEMORY_WRAPPER_SHA256_URL  wrapper checksum URL override (optional)
 #   CLAUDE_CONFIG_DIR       Claude Code config root (forwarded to the helper;
 #                           paths under $HOME are covered by the home bind mount)
+#   CODEX_HOME              Codex CLI config root (same forwarding rule)
+#   COPILOT_HOME            GitHub Copilot CLI config root (same)
+#   GEMINI_CLI_HOME         Gemini CLI config root (same)
+#   GROK_HOME               Grok CLI config root (same)
+#   KIMI_CODE_HOME          Kimi Code config root (same)
+#   KIRO_HOME               Kiro CLI config root (same)
+#   HERMES_HOME             Hermes config root (same)
 set -euo pipefail
 
 IMAGE="${AI_MEMORY_IMAGE:-docker.io/akitaonrails/ai-memory:latest}"
@@ -834,6 +841,13 @@ for var in \
   AI_MEMORY_HOOK_PLATFORM \
   AI_MEMORY_HOOKS_HOST_ROOT \
   CLAUDE_CONFIG_DIR \
+  CODEX_HOME \
+  COPILOT_HOME \
+  GEMINI_CLI_HOME \
+  GROK_HOME \
+  KIMI_CODE_HOME \
+  KIRO_HOME \
+  HERMES_HOME \
   CLAUDE_CODE_SESSION_ID \
   MUSE_SESSION_ID \
   ANTHROPIC_API_KEY \
@@ -896,10 +910,10 @@ case "${WRAPPER_SUBCOMMAND}" in
       WRITES_HOST_FILES=1
       ;;
     # uninstall edits the same host agent-config files the install-*
-    # commands write; backup writes its tarball to a host path. Both go
-    # through the same $HOME/$PWD bind mounts, so they need the same
+    # commands write. Backups and agent-asset restores also write to host
+    # paths through the same $HOME/$PWD bind mounts, so they need the same
     # rootless-Docker UID treatment.
-    install-instructions | install-skills | uninstall | backup)
+    install-instructions | install-skills | uninstall | backup | backup-agents | restore-agents)
       WRITES_HOST_FILES=1
       ;;
 esac

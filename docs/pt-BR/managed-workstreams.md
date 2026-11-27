@@ -683,7 +683,11 @@ outro workstream; a adoção continua sendo uma operação de bootstrap.
    e consolidação opcional em SessionEnd. Ele faz isso apenas para uma sessão nomeada
    na linha de comando, escolhida antes do spawn, ou vinculada durante a execução,
    nunca para uma que ele tenha precisado procurar. Se a finalização falhar, ele imprime o comando
-   exato `finalize-session` para ser executado.
+   exato `finalize-session` para ser executado. Fora de `ai-memory run`, uma execução
+   headless `agy -p --output-format json` emite `conversation_id` em stdout
+   ([documentação headless do Antigravity](https://antigravity.google/docs/cli/headless/)),
+   que scripts podem passar para
+   `ai-memory finalize-session --agent antigravity-cli --session-id <id>`.
 
 O próximo harness recebe um delta recente limitado porque nenhuma janela de contexto de agente
 pode absorver com segurança uma transcrição ilimitada. O ledger visível completo permanece
@@ -927,7 +931,7 @@ usuário de `--session`, `--resume`, `--continue` e bifurcações permanecem sob
 A API experimental de Mod sem sandbox não é utilizada.
 
 Um seletor nativo explícito como `--resume` do Claude, `--session` do OpenCode,
-`resume` do Codex, `--conversation` / `--continue` do Antigravity, ou
+`resume` do Codex, `--conversation` / `--resume` / `-r` / `--continue` do Antigravity, ou
 `--resume` / `--continue` / `--session-id` / `--connect` do Copilot tem prioridade.
 O ai-memory vincula a sessão nativa selecionada e redefine um cursor de adaptador não
 relacionado em vez de assumir que ele pertence à sessão antiga.
@@ -1207,8 +1211,9 @@ conversa iniciada um nível acima não é oferecida dentro de um subdiretório.
 
 `agy` não aceita ID escolhido pelo chamador para uma nova conversa, portanto uma inicialização nova
 não injeta seletor e o ID é vinculado pelos hooks ou descoberto após a saída; uma
-retomada vinculada passa `--conversation <id>`. `--continue` / `-c` é tratado como uma
-escolha explícita do usuário e nunca é substituído. `--yolo` mapeia para
+retomada vinculada passa `--conversation <id>`. `--resume` / `-r` (aliases de
+`--conversation`) e `--continue` / `-c` são tratados como escolhas explícitas
+do usuário e nunca são substituídos. `--yolo` mapeia para
 `--dangerously-skip-permissions`. Cargas úteis de etapas são blobs protobuf não documentados
 e sem versão, de modo que o ai-memory não decodifica o texto da conversa: o ledger de eventos visíveis
 para este harness vem da captura por hook de ciclo de vida, e a exportação de transcrição

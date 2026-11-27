@@ -340,12 +340,24 @@ fn exact(named: &[&str]) -> Vec<String> {
     expected
 }
 
-fn exe() -> String {
-    Path::new(BIN)
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned()
+fn assert_wrapped_command(wrapped: &[String], expected_args: &[&str]) {
+    let (program, args) = wrapped
+        .split_first()
+        .expect("the wrapped executable is present");
+    let program = Path::new(program);
+    // current_exe can preserve the launch spelling under an aliased target path.
+    assert!(
+        program.is_absolute(),
+        "expected an absolute path: {program:?}"
+    );
+    assert_eq!(
+        program.canonicalize().unwrap(),
+        Path::new(BIN).canonicalize().unwrap()
+    );
+    assert_eq!(
+        args, expected_args,
+        "the original arguments are wrapped verbatim after `--`"
+    );
 }
 
 /// A sandboxed test run would see itself as already jailed, where every jail
@@ -387,16 +399,9 @@ async fn jail_list_reexecs_under_ai_jail_with_exactly_the_listed_toggles() {
         exact(&["--gpu", "--ssh"]),
         "exactly the list: every other visible row is forced off"
     );
-    assert_eq!(
+    assert_wrapped_command(
         wrapped,
-        [
-            exe().as_str(),
-            "run",
-            "--no-autowire",
-            "claude",
-            "--jail=gpu,ssh"
-        ],
-        "the original invocation is wrapped verbatim after `--`"
+        &["run", "--no-autowire", "claude", "--jail=gpu,ssh"],
     );
     assert!(
         stderr(&output).contains("capabilities: GPU devices"),
@@ -476,10 +481,7 @@ async fn bare_jail_with_a_project_ai_jail_passes_no_toggles() {
     let argv = fixture.jail_argv().expect("ai-jail exec'd");
     let (flags, wrapped) = split_at_separator(&argv);
     assert_eq!(toggles(flags), Vec::<String>::new());
-    assert_eq!(
-        wrapped,
-        [exe().as_str(), "run", "--jail", "--no-autowire", "claude"]
-    );
+    assert_wrapped_command(wrapped, &["run", "--jail", "--no-autowire", "claude"]);
     assert!(
         stderr(&output).contains("plus the project .ai-jail"),
         "{}",
@@ -1438,15 +1440,9 @@ async fn ai_jail_3_gets_the_harness_and_grants_without_prompts() {
             "{absent}: {flags:?}"
         );
     }
-    assert_eq!(
+    assert_wrapped_command(
         wrapped,
-        [
-            exe().as_str(),
-            "run",
-            "--no-autowire",
-            "claude",
-            "--jail=github"
-        ]
+        &["run", "--no-autowire", "claude", "--jail=github"],
     );
     let status = fixture
         .recorded("ai-jail-status-argv.txt")

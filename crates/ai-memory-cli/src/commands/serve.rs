@@ -55,6 +55,9 @@ use crate::config::{
 };
 use ai_memory_mcp::auth::{AuthState, require_bearer};
 
+mod consolidation_cooldown;
+use consolidation_cooldown::{ConsolidationCooldown, route_fingerprint};
+
 /// 10 MB cap on inbound HTTP bodies. The /hook ingress accepts the
 /// agent's raw payload which can include a tool output excerpt
 /// (capped at 2 KB on our side via `truncate_excerpt`), but Claude
@@ -897,9 +900,9 @@ fn is_transport_unreachable_session_consolidation_error(
 /// provider configuration (`NotConfigured`), a schema failure (`Schema`), a
 /// malformed-request `4xx` — reproduces on identical inputs, so the job goes
 /// terminal and the heuristic page the SessionEnd hook already wrote remains.
-/// Exhausted credit or quota (`LlmError::is_quota_exhausted`) is the one
-/// exception for a direct provider. A fallback chain exhausted solely by
-/// transport failures also stays on the durable queue's backoff.
+/// Exhausted credit or quota pauses the queue until the route is eligible
+/// again. A fallback chain exhausted solely by transport failures also
+/// stays on the durable queue's backoff.
 ///
 /// A `ConsolidatorError::Serde` is not an `LlmError`: it is this crate's own
 /// JSON failure on an unchanged input and stays terminal on its own.
@@ -907,9 +910,8 @@ fn is_terminal_session_consolidation_error(
     error: &ai_memory_consolidate::ConsolidatorError,
 ) -> bool {
     match error {
-        // Exhausted credit or quota is not worth an in-process retry seconds
-        // later, but a top-up or quota reset can clear it within the queue's
-        // backoff window, so it keeps the job queued like a 429 always did.
+        // Exhausted credit or quota keeps the job pending until the route
+        // cooldown allows another attempt.
         ai_memory_consolidate::ConsolidatorError::Llm(llm) => {
             !llm.is_transient() && !llm.is_quota_exhausted() && !llm.is_transport_unreachable()
         }
@@ -1042,12 +1044,22 @@ async fn run_session_consolidation_worker(
     writer: WriterHandle,
     reader: ReaderPool,
     consolidator: Arc<Consolidator>,
+    mut billing_cooldown: ConsolidationCooldown,
     notify: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
     #[cfg(test)] completed: Arc<tokio::sync::Notify>,
 ) {
     loop {
         let now = jiff::Timestamp::now().as_microsecond();
+        if let Some(delay) = billing_cooldown.remaining(now) {
+            // New arrivals stay pending, without spending a queue attempt.
+            // Only an actual queued job can contact the provider at expiry.
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(delay) => {},
+            }
+            continue;
+        }
         let lease_micros =
             i64::try_from(SESSION_CONSOLIDATION_LEASE.as_micros()).unwrap_or(i64::MAX);
         let job = match writer
@@ -1099,6 +1111,7 @@ async fn run_session_consolidation_worker(
                 Ok(()) => {
                     match consolidated {
                         SessionPageConsolidation::Consolidated(outcome) => {
+                            billing_cooldown.clear(jiff::Timestamp::now().as_microsecond());
                             info!(
                                 session = %session_id,
                                 generation,
@@ -1145,6 +1158,35 @@ async fn run_session_consolidation_worker(
                 ),
             },
             Err(error) => {
+                let now = jiff::Timestamp::now().as_microsecond();
+                let billing_delays = match &error {
+                    ai_memory_consolidate::ConsolidatorError::Llm(llm) => {
+                        billing_cooldown.billing_delays(llm)
+                    }
+                    _ => None,
+                };
+                if let Some((delay, restart_delay)) = billing_delays {
+                    // Persist the pause before settling the job. A crash in
+                    // between leaves the existing expiring lease to recover.
+                    billing_cooldown.pause(now, delay, restart_delay);
+                    tracing::warn!(
+                        cooldown_secs = delay.as_secs(),
+                        "billing exhaustion paused queued session consolidation",
+                    );
+                    if matches!(
+                        &error,
+                        ai_memory_consolidate::ConsolidatorError::Llm(
+                            ai_memory_llm::LlmError::FallbackQuotaExhausted { attempted: 0, .. }
+                        )
+                    ) {
+                        // Another caller opened every circuit. This claim
+                        // reached no provider, so release it without a retry charge.
+                        if let Err(error) = writer.release_session_consolidation(job).await {
+                            tracing::warn!(%error, %session_id, generation, "failed to release session consolidation skipped by open quota circuits");
+                        }
+                        continue;
+                    }
+                }
                 let transport_unreachable =
                     is_transport_unreachable_session_consolidation_error(&error);
                 let max_attempts = if transport_unreachable {
@@ -1156,14 +1198,14 @@ async fn run_session_consolidation_worker(
                     || attempts >= max_attempts
                 {
                     None
+                } else if billing_delays.is_some() {
+                    // Route-level pause controls when this job can run. A
+                    // reconfigured route can begin draining it immediately.
+                    Some(now)
                 } else {
                     let delay = session_consolidation_retry_delay(attempts, transport_unreachable);
                     let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-                    Some(
-                        jiff::Timestamp::now()
-                            .as_microsecond()
-                            .saturating_add(delay_micros),
-                    )
+                    Some(now.saturating_add(delay_micros))
                 };
                 let terminal = retry_at.is_none();
                 if let Err(store_error) = writer
@@ -1625,10 +1667,16 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let (session_consolidation_notify, session_consolidation_task) =
                 if let Some(consolidator) = consolidator.clone() {
                     let notify = Arc::new(tokio::sync::Notify::new());
+                    let billing_cooldown = ConsolidationCooldown::open(
+                        &config.data_dir,
+                        route_fingerprint(config)?,
+                        Duration::from_secs(config.llm_quota_cooldown_secs),
+                    );
                     let task = tokio::spawn(run_session_consolidation_worker(
                         store.writer.clone(),
                         store.reader.clone(),
                         consolidator,
+                        billing_cooldown,
                         notify.clone(),
                         cancel.child_token(),
                         #[cfg(test)]
@@ -1984,7 +2032,6 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                         learning_scheduled: config.auto_improve.scheduler.enabled
                             && config.auto_improve.scheduler.interval_secs > 0
                             && config.auto_improve.scheduler.max_sessions_per_tick > 0,
-                        learning_on_session_end: config.auto_improve.on_session_end,
                         review_requires_approval: config.auto_improve.require_approval,
                         maintenance_enabled: config.maintenance.enabled,
                         retention_scheduled: config.maintenance.forget_sweep_interval_secs > 0,
@@ -5658,6 +5705,7 @@ mod tests {
         MalformedRequest,
         /// The provider is rate-limiting: a later attempt may clear it.
         RateLimited,
+        BillingExhausted(Option<Duration>),
     }
 
     /// Structured-output failure fixture: counts calls (proving the prompt
@@ -5725,6 +5773,11 @@ mod tests {
                         status: 429,
                         body: "rate limited".into(),
                         retry_after: None,
+                    },
+                    ConsolidationFailure::BillingExhausted(retry_after) => LlmError::Provider {
+                        status: 429,
+                        body: r#"{"error":{"code":"insufficient_quota"}}"#.into(),
+                        retry_after,
                     },
                 };
                 Err(error)
@@ -6120,6 +6173,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            test_consolidation_cooldown(&store),
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -6311,6 +6365,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            test_consolidation_cooldown(&store),
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -6430,6 +6485,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            test_consolidation_cooldown(&store),
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -6540,6 +6596,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            test_consolidation_cooldown(&store),
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -6641,6 +6698,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            test_consolidation_cooldown(&store),
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -6726,6 +6784,41 @@ mod tests {
             .get_or_create_project(workspace_id, "project", None)
             .await
             .unwrap();
+        let session_id = enqueue_test_session(&store, workspace_id, project_id).await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id,
+            project_id,
+            path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+            frontmatter,
+            body: "# Agent page\n\nWritten by the agent before the session ended.".into(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+            trust_class: None,
+        })
+        .await
+        .unwrap();
+        (tmp, store, wiki, workspace_id, project_id, session_id)
+    }
+
+    fn test_consolidation_cooldown(store: &Store) -> ConsolidationCooldown {
+        ConsolidationCooldown::open(
+            store.db_path().parent().unwrap(),
+            [0; 32],
+            ai_memory_llm::DEFAULT_QUOTA_COOLDOWN,
+        )
+    }
+
+    async fn enqueue_test_session(
+        store: &Store,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> SessionId {
         let session_id = SessionId::new();
         store
             .writer
@@ -6768,25 +6861,352 @@ mod tests {
             .enqueue_session_consolidation(workspace_id, project_id, session_id)
             .await
             .unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        wiki.write_page(WritePageRequest {
-            workspace_id,
-            project_id,
-            path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
-            frontmatter,
-            body: "# Agent page\n\nWritten by the agent before the session ended.".into(),
-            tier: Tier::Episodic,
-            pinned: false,
-            title: None,
-            admission_ctx: None,
-            author_id: None,
-            actor: ai_memory_core::ActorContext::anonymous(),
-            evidence: Vec::new(),
-            trust_class: None,
+        session_id
+    }
+
+    #[tokio::test]
+    async fn session_consolidation_billing_exhaustion_pauses_other_sessions() {
+        exercise_session_consolidation_billing_pause(false).await;
+    }
+
+    #[tokio::test]
+    async fn session_consolidation_billing_exhaustion_pauses_an_exhausted_chain() {
+        exercise_session_consolidation_billing_pause(true).await;
+    }
+
+    async fn exercise_session_consolidation_billing_pause(routed: bool) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(workspace, "test", None)
+            .await
+            .unwrap();
+        let first = enqueue_test_session(&store, workspace, project).await;
+        let second = enqueue_test_session(&store, workspace, project).await;
+        let first_page = format!("sessions/{first}.md");
+        write_test_page(
+            &Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
+            workspace,
+            project,
+            &first_page,
+            "heuristic",
+            Tier::Episodic,
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let longer_hint = Some(Duration::from_secs(1200));
+        let rejected_provider = |retry_after| {
+            Arc::new(FailingConsolidationLlm {
+                failure: ConsolidationFailure::BillingExhausted(retry_after),
+                calls: calls.clone(),
+            })
+        };
+        let exhausted_route = || -> Arc<dyn LlmProvider> {
+            if routed {
+                Arc::new(ai_memory_llm::FallbackLlmProvider::new(vec![
+                    ai_memory_llm::Candidate::new(
+                        "primary",
+                        "test",
+                        rejected_provider(longer_hint),
+                    ),
+                    ai_memory_llm::Candidate::new("fallback", "test", rejected_provider(None)),
+                ]))
+            } else {
+                rejected_provider(longer_hint)
+            }
+        };
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let start_worker = |store: &Store, llm, cooldown| {
+            let consolidator = Arc::new(Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
+                llm,
+                workspace,
+                project,
+            ));
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(run_session_consolidation_worker(
+                store.writer.clone(),
+                store.reader.clone(),
+                consolidator,
+                cooldown,
+                notify.clone(),
+                cancel.child_token(),
+                completed.clone(),
+            ));
+            (cancel, task)
+        };
+        let row = |store: &Store, id: SessionId| -> (String, usize) {
+            rusqlite::Connection::open(store.db_path())
+                .unwrap()
+                .query_row(
+                    "SELECT state, attempts FROM session_consolidation_jobs WHERE session_id = ?1",
+                    rusqlite::params![id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let db_path = store.db_path().to_owned();
+        let wait_for_retry = |expected_attempts| {
+            let db_path = db_path.clone();
+            async move {
+                let db = rusqlite::Connection::open(db_path).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let pending: bool = db
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM session_consolidation_jobs \
+                                 WHERE session_id = ?1 AND state = 'pending' AND attempts = ?2)",
+                                rusqlite::params![first.as_bytes(), expected_attempts],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        if pending {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the first job should settle for retry");
+            }
+        };
+        let requests_per_attempt = if routed { 2 } else { 1 };
+        let before_failure = jiff::Timestamp::now().as_microsecond();
+        let (cancel, worker) = start_worker(
+            &store,
+            exhausted_route(),
+            test_consolidation_cooldown(&store),
+        );
+        wait_for_retry(1).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cancel.cancel();
+        worker.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), requests_per_attempt);
+        assert_eq!(row(&store, second), ("pending".to_owned(), 0));
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(workspace, project, &first_page)
+                .await
+                .unwrap()
+                .is_some_and(|page| page.body.contains("heuristic"))
+        );
+        assert!(
+            test_consolidation_cooldown(&store)
+                .remaining(jiff::Timestamp::now().as_microsecond())
+                .unwrap()
+                > ai_memory_llm::DEFAULT_QUOTA_COOLDOWN,
+            "the longer retry hint should survive reopen"
+        );
+        store.close().await;
+        drop(store);
+
+        let store = Store::open(tmp.path()).unwrap();
+        let reopened_cooldown = test_consolidation_cooldown(&store);
+        assert!(
+            reopened_cooldown
+                .remaining(before_failure + 900_000_000)
+                .is_some(),
+            "reopening must preserve the longer hint even at the earlier candidate's deadline"
+        );
+        assert!(
+            reopened_cooldown
+                .remaining(jiff::Timestamp::now().as_microsecond() + 1_200_000_000)
+                .is_none(),
+            "the longest applicable hint still gives the persisted pause a finite deadline"
+        );
+        let (cancel, worker) = start_worker(&store, exhausted_route(), reopened_cooldown);
+        let (third, fourth) = tokio::join!(
+            enqueue_test_session(&store, workspace, project),
+            enqueue_test_session(&store, workspace, project),
+        );
+        notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        worker.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), requests_per_attempt);
+        for session in [second, third, fourth] {
+            assert_eq!(row(&store, session), ("pending".to_owned(), 0));
+        }
+
+        // Simulate the persisted deadline passing while the worker is stopped.
+        let expire = || {
+            test_consolidation_cooldown(&store).clear(jiff::Timestamp::now().as_microsecond());
+        };
+        expire();
+        let (cancel, worker) = start_worker(
+            &store,
+            exhausted_route(),
+            test_consolidation_cooldown(&store),
+        );
+        wait_for_retry(2).await;
+        cancel.cancel();
+        worker.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), requests_per_attempt * 2);
+        assert_eq!(row(&store, second), ("pending".to_owned(), 0));
+
+        let cooldown = if routed {
+            // Changing the configured route can also resume pending work.
+            ConsolidationCooldown::open(tmp.path(), [1; 32], ai_memory_llm::DEFAULT_QUOTA_COOLDOWN)
+        } else {
+            expire();
+            test_consolidation_cooldown(&store)
+        };
+        let recovered_route: Arc<dyn LlmProvider> = if routed {
+            Arc::new(ai_memory_llm::FallbackLlmProvider::new(vec![
+                ai_memory_llm::Candidate::new("primary", "test", rejected_provider(longer_hint)),
+                ai_memory_llm::Candidate::new(
+                    "fallback",
+                    "recovered",
+                    Arc::new(SuccessfulConsolidationLlm),
+                ),
+            ]))
+        } else {
+            Arc::new(SuccessfulConsolidationLlm)
+        };
+        let (cancel, worker) = start_worker(&store, recovered_route, cooldown);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .reader
+                .session_consolidation_queue()
+                .await
+                .unwrap()
+                .completed
+                < 4
+            {
+                completed.notified().await;
+            }
         })
         .await
-        .unwrap();
-        (tmp, store, wiki, workspace_id, project_id, session_id)
+        .expect("real queued work should drain after recovery");
+        cancel.cancel();
+        worker.await.unwrap();
+        for (session, attempts) in [(first, 3), (second, 1), (third, 1), (fourth, 1)] {
+            assert_eq!(row(&store, session), ("completed".to_owned(), attempts));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            requests_per_attempt * 2 + usize::from(routed),
+            "a healthy fallback should drain queued work after one primary billing failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_consolidation_preserves_last_attempt_when_quota_circuits_are_already_open() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(workspace, "test", None)
+            .await
+            .unwrap();
+        let session = enqueue_test_session(&store, workspace, project).await;
+        let attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS - 1;
+        for _ in 0..attempts {
+            let now = jiff::Timestamp::now().as_microsecond();
+            let job = store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .writer
+                .fail_session_consolidation(job, "fixture".into(), Some(now))
+                .await
+                .unwrap();
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(FailingConsolidationLlm {
+            failure: ConsolidationFailure::BillingExhausted(None),
+            calls: calls.clone(),
+        });
+        let chain = Arc::new(ai_memory_llm::FallbackLlmProvider::new(vec![
+            ai_memory_llm::Candidate::new("primary", "test", rejected.clone()),
+            ai_memory_llm::Candidate::new("fallback", "test", rejected),
+        ]));
+        // Another foreground consumer used the shared chain before the worker.
+        assert!(
+            chain
+                .complete_structured_raw(ChatRequest::user_prompt("fixture"), serde_json::json!({}))
+                .await
+                .unwrap_err()
+                .is_quota_exhausted()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            chain,
+            workspace,
+            project,
+        ));
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            test_consolidation_cooldown(&store),
+            Arc::new(tokio::sync::Notify::new()),
+            cancel.child_token(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let row = || -> (String, u32) {
+            db.query_row(
+                "SELECT state, attempts FROM session_consolidation_jobs WHERE session_id = ?1",
+                rusqlite::params![session.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let now = jiff::Timestamp::now().as_microsecond();
+                if test_consolidation_cooldown(&store).remaining(now).is_some()
+                    && row().0 != "running"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should persist the pause and release the claim");
+        cancel.cancel();
+        worker.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(row(), ("pending".to_owned(), attempts));
+
+        test_consolidation_cooldown(&store).clear(jiff::Timestamp::now().as_microsecond());
+        let page = run_worker_once(
+            &store,
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace,
+            project,
+            session,
+        )
+        .await;
+        assert!(page.contains("Durable worker completed"));
+        assert_eq!(row(), ("completed".to_owned(), attempts + 1));
     }
 
     /// Run the worker once over the queued job and return the session page body.
@@ -6813,6 +7233,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            test_consolidation_cooldown(store),
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -7124,6 +7545,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            test_consolidation_cooldown(&store),
             notify.clone(),
             cancel.child_token(),
             completed.clone(),

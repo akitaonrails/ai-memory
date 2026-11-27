@@ -275,6 +275,7 @@ pub(crate) async fn run(args: ClaudeMemArgs) -> Result<()> {
         bail!("--apply requires --manifest-out <path>");
     }
     let source = resolve_source(args.database.as_deref())?;
+    crate::validate_manifest_destination(args.manifest_out.as_deref(), &[&source, &args.mapping])?;
     let prefix = validate_dest_prefix(&args.dest_prefix)?;
     let mapping = Mapping::load(&args.mapping)?;
     let snapshot = snapshot_database(&source)?;
@@ -1359,6 +1360,33 @@ mod tests {
         let plan = plan_snapshot(&snapshot, &empty, DEFAULT_DEST_PREFIX).unwrap();
         assert!(plan.pages.is_empty());
         assert_eq!(plan.unmapped.get("api"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn claude_mem_manifest_cannot_replace_its_inputs() {
+        let (dir, database) = fixture(true);
+        let mapping = dir.path().join("mapping.json");
+        fs::write(
+            &mapping,
+            r#"{"projects":{"api":{"workspace":"acme","project":"api"}}}"#,
+        )
+        .unwrap();
+        for input in [&database, &mapping] {
+            let original = fs::read(input).unwrap();
+            let error = run(ClaudeMemArgs {
+                database: Some(database.clone()),
+                mapping: mapping.clone(),
+                dest_prefix: DEFAULT_DEST_PREFIX.into(),
+                server_url: DEFAULT_SERVER_URL.into(),
+                apply: false,
+                manifest_out: Some(input.clone()),
+                show_body: false,
+            })
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("--manifest-out"), "{error:#}");
+            assert_eq!(fs::read(input).unwrap(), original);
+        }
     }
 
     #[tokio::test]

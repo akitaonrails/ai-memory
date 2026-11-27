@@ -92,6 +92,7 @@ setup.
 | **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | No local reranker yet; LLM-optional means no VLM fact-extraction sophistication |
 | File-first wiki (LLM-leaning) | **memU**, **EverOS** | Markdown source of truth + derived vector/SQLite(+LanceDB) indexes; offline consolidation; skill distillation from session history; EverOS ships an MCP server and published benchmarks; memU auto-detects unknown agents | LLM-required for the core capture/distill flow (no zero-LLM default); Python stacks + a hosted-cloud option, vs one self-contained zero-LLM binary; memU has no MCP server and patches host instruction files rather than exposing a git-diffable wiki |
 | Self-hosted coding-agent store | **Engram** | Single Go binary, SQLite+FTS5, MCP stdio, project-scoped, `mem_session_summary` handoffs, git-sync across machines | Structured rows the agent saves through MCP tools (SQLite is the truth, git-syncs compressed chunks), not a hand-editable git-markdown wiki captured automatically from lifecycle hooks |
+| Code-linked shared memory | **ClickHouse Loom** | Self-hosted MCP with namespace-scoped access. Lessons can link to indexed definitions and name the commit that changed the source. SQL history can identify the credential behind each revision. | Requires a Loom server and ClickHouse. Live memory can use ClickHouse or Postgres, with Markdown available for export. |
 | Governed multi-agent / fleet memory | **Caura** | Shared fleet memory: agent/team/org visibility scopes, four trust tiers, audit log, PII flagging, contradiction/supersession, auto knowledge graph | Fleet-governance-first on Postgres+pgvector (LLM extraction), hosted option; ai-memory optimizes one project's git-backed wiki with `pages shared, batons owned`, not org-scale fleet governance |
 | Shared memory server (proxy fan-in) | **TencentDB Agent Memory** | One proxy in front of many harnesses distills chats/docs/code into Chat Memory / Skill / Wiki / CodeGraph assets; v2 adds per-asset access control (private / team / restricted / agent) | Proxy base-URL interception, not MCP or OS lifecycle hooks; the v2 hub needs an LLM; despite the name it needs no Tencent DB product (SQLite by default); a Node three-service stack vs one file-first binary |
 
@@ -375,6 +376,12 @@ ships something ai-memory does not, it is named.
   inference, backed by an opt-in real-model contention probe; hosted embedding
   providers keep their existing concurrency, and the reranker remains bounded
   and fail-open.
+- **From ClickHouse Loom (code-linked shared memory):** try ai-memory if the
+  team wants Git-backed, editable Markdown as its live store and claim-once
+  handoffs. Keep Loom in the evaluation if the team needs a saved lesson to
+  report when the indexed definition it describes has changed, or queries
+  its decision history in SQL. Check the data each workflow can carry before
+  switching.
 - **From Caura (governed multi-agent fleet memory):** a different buyer. Caura
   optimizes org-scale fleet governance (agent/team/org visibility scopes, four
   trust tiers, an audit log, PII flagging) on Postgres+pgvector with LLM

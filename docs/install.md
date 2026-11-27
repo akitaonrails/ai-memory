@@ -4152,7 +4152,8 @@ home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
 the host enforcement mode and the engine's advertised security options. For the
 short-lived helper commands that touch host files (`install-*`, `setup-agent`,
-`uninstall`, `backup`, `restore`, `bootstrap`, and `doctor`), it adds
+`uninstall`, `backup`, `restore`, `backup-agents`, `restore-agents`,
+`bootstrap`, and `doctor`), it adds
 `--security-opt label=disable`; thin-client commands remain confined when they
 use the named data volume and implicit configuration. An explicit `--config` path or a valid
 host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This

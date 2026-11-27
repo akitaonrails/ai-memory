@@ -461,6 +461,14 @@ pub(crate) fn clear_session_id(data_dir: &Path, agent: AgentKind) {
     let _ = fs::remove_file(session_id_state_path(data_dir, agent));
 }
 
+pub(crate) fn clear_matching_session_id(data_dir: &Path, agent: AgentKind, session_id: &str) {
+    if agent_needs_session_id_state(agent)
+        && stored_session_id(data_dir, agent).as_deref() == Some(session_id)
+    {
+        clear_session_id(data_dir, agent);
+    }
+}
+
 /// `<data_dir>/briefed/<key>` — records that the compiled project brief
 /// (`[briefing] inject_on_session_start`) was already delivered for this
 /// session by the user-prompt handoff path. kimi-code discards SessionStart
@@ -1360,6 +1368,8 @@ fn write_success_response<W: std::io::Write>(
         Ok(())
     } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
         writeln!(stdout, r#"{{"decision": "allow"}}"#)
+    } else if agent == AgentKind::AntigravityCli && event == HookEvent::Stop {
+        writeln!(stdout, r#"{{"decision":""}}"#)
     } else {
         writeln!(stdout, "{{}}")
     }
@@ -9163,6 +9173,69 @@ mod tests {
         .unwrap();
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
         assert!(!antigravity_transcript_prompts_captured(&data_dir, "agy-a"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_stop_emits_decision_field_on_capture_and_early_return() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data_dir, home, workspace) = (
+            tmp.path().join("data"),
+            tmp.path().join("home"),
+            tmp.path().join("repo"),
+        );
+        std::fs::create_dir_all(&workspace).unwrap();
+        let transcript = agy_transcript(&home, "agy-stop");
+        append_user_input(&transcript, 0, "check stop output");
+
+        // Early-return path: allowlist drops an unmarked repository.
+        let mut dropped_args = antigravity_hook_args("stop", &dead_server_url());
+        dropped_args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+        let mut dropped_stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir.clone()),
+            dropped_args,
+            agy_event_payload(
+                "agy-stop",
+                &workspace,
+                &transcript,
+                serde_json::json!({"terminationReason": "NO_TOOL_CALL", "fullyIdle": true}),
+            ),
+            &mut dropped_stdout,
+            |_, _| Ok(()),
+            Some(home.clone()),
+            RuntimeEnv::from_process(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(dropped_stdout).unwrap().trim(),
+            r#"{"decision":""}"#
+        );
+
+        // Normal capture path.
+        let mut captured_args = antigravity_hook_args("stop", &dead_server_url());
+        captured_args.capture_mode = Some(crate::cli::CaptureModeArg::Denylist);
+        let mut captured_stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir),
+            captured_args,
+            agy_event_payload(
+                "agy-stop",
+                &workspace,
+                &transcript,
+                serde_json::json!({"terminationReason": "NO_TOOL_CALL", "fullyIdle": true}),
+            ),
+            &mut captured_stdout,
+            |_, _| Ok(()),
+            Some(home),
+            RuntimeEnv::from_process(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(captured_stdout).unwrap().trim(),
+            r#"{"decision":""}"#
+        );
     }
 
     #[test]

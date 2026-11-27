@@ -89,6 +89,11 @@ struct CandidateEntry {
     state: Mutex<CandidateState>,
 }
 
+struct CandidateFailure {
+    description: String,
+    quota_until: Option<Instant>,
+}
+
 /// Ordered LLM provider fallback chain.
 ///
 /// Tries each eligible candidate in declaration order, advancing only on a
@@ -255,9 +260,10 @@ impl FallbackLlmProvider {
         }
     }
 
-    fn describe_failure(&self, index: usize, err: &LlmError) -> String {
-        let candidate = &self.entries[index].candidate;
-        match err.http_status() {
+    fn describe_failure(&self, index: usize, err: &LlmError) -> CandidateFailure {
+        let entry = &self.entries[index];
+        let candidate = &entry.candidate;
+        let description = match err.http_status() {
             Some(status) => format!(
                 "{}/{}: {} {status}",
                 candidate.provider,
@@ -270,18 +276,35 @@ impl FallbackLlmProvider {
                 candidate.model,
                 err.class()
             ),
+        };
+        let quota_until = match self.cooldown_for(err) {
+            Some((FailoverClass::QuotaExhausted, delay)) => {
+                let state = entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let deadline = Instant::now() + delay;
+                Some(
+                    state
+                        .circuit_open_until
+                        .map_or(deadline, |open| open.max(deadline)),
+                )
+            }
+            _ => None,
+        };
+        CandidateFailure {
+            description,
+            quota_until,
         }
     }
 
     /// Summary entry for a candidate skipped because its circuit is open, so
     /// an aggregate error with every circuit open still names the reason.
-    fn skipped_candidate(&self, index: usize) -> Option<(String, bool)> {
+    fn skipped_candidate(&self, index: usize) -> Option<(CandidateFailure, bool)> {
         let entry = &self.entries[index];
         let state = entry.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state
-            .circuit_open_until
-            .is_none_or(|until| Instant::now() >= until)
-        {
+        let until = state.circuit_open_until?;
+        if Instant::now() >= until {
             return None;
         }
 
@@ -290,18 +313,44 @@ impl FallbackLlmProvider {
             .circuit_reason
             .map_or("transient", FailoverClass::as_str);
         Some((
-            format!(
-                "{}/{}: skipped (circuit open: {reason})",
-                candidate.provider, candidate.model
-            ),
+            CandidateFailure {
+                description: format!(
+                    "{}/{}: skipped (circuit open: {reason})",
+                    candidate.provider, candidate.model
+                ),
+                quota_until: (state.circuit_reason == Some(FailoverClass::QuotaExhausted))
+                    .then_some(until),
+            },
             state.circuit_transport_unreachable,
         ))
     }
 
-    fn exhausted(attempted: usize, summary: Vec<String>, transport_unreachable: bool) -> LlmError {
-        let summary = summary.join("; ");
+    fn exhausted(
+        attempted: usize,
+        failures: Vec<CandidateFailure>,
+        transport_unreachable: bool,
+    ) -> LlmError {
+        let quota_until = if failures.iter().all(|failure| failure.quota_until.is_some()) {
+            let deadlines = failures.iter().filter_map(|failure| failure.quota_until);
+            deadlines.clone().min().zip(deadlines.max())
+        } else {
+            None
+        };
+        let summary = failures
+            .into_iter()
+            .map(|failure| failure.description)
+            .collect::<Vec<_>>()
+            .join("; ");
         if transport_unreachable {
             LlmError::FallbackTransportUnreachable { attempted, summary }
+        } else if let Some((first, last)) = quota_until {
+            let now = Instant::now();
+            LlmError::FallbackQuotaExhausted {
+                attempted,
+                summary,
+                retry_after: first.saturating_duration_since(now),
+                restart_retry_after: last.saturating_duration_since(now),
+            }
         } else {
             LlmError::AllCandidatesFailed { attempted, summary }
         }
@@ -1252,7 +1301,11 @@ mod tests {
         let primary = Arc::new(ScriptedLlm::err(
             "anthropic",
             "claude",
-            quota(400, ANTHROPIC_CREDIT_BODY),
+            LlmError::Provider {
+                status: 400,
+                body: ANTHROPIC_CREDIT_BODY.into(),
+                retry_after: Some(Duration::from_secs(1200)),
+            },
         ));
         let fallback = Arc::new(ScriptedLlm::err(
             "openai",
@@ -1268,10 +1321,25 @@ mod tests {
             .complete(ChatRequest::user_prompt("hi"))
             .await
             .expect_err("nothing is left to answer");
-        let LlmError::AllCandidatesFailed { attempted, summary } = &err else {
-            panic!("expected AllCandidatesFailed, got {err}");
+        let LlmError::FallbackQuotaExhausted {
+            attempted,
+            summary,
+            retry_after,
+            restart_retry_after,
+        } = &err
+        else {
+            panic!("expected FallbackQuotaExhausted, got {err}");
         };
         assert_eq!(*attempted, 2);
+        assert!(
+            (DEFAULT_QUOTA_COOLDOWN - Duration::from_secs(1)..=DEFAULT_QUOTA_COOLDOWN)
+                .contains(retry_after),
+            "the first eligible candidate accounts for each provider's retry hint"
+        );
+        assert!(
+            (Duration::from_secs(1199)..=Duration::from_secs(1200)).contains(restart_retry_after),
+            "a restart deadline must cover the candidate with the longer retry hint"
+        );
         assert!(
             summary.contains("anthropic/claude: quota-exhausted 400"),
             "{summary}"
@@ -1284,6 +1352,7 @@ mod tests {
         assert!(!rendered.contains("credit balance"), "{rendered}");
         assert!(!rendered.contains("insufficient_quota"), "{rendered}");
         assert!(!err.is_transient());
+        assert!(err.is_quota_exhausted());
 
         // While both windows are open nothing is sent, and the error still
         // says why instead of an empty summary.
@@ -1293,8 +1362,11 @@ mod tests {
             .expect_err("both circuits are open");
         assert_eq!(primary.calls(), 1);
         assert_eq!(fallback.calls(), 1);
-        let LlmError::AllCandidatesFailed { attempted, summary } = &err else {
-            panic!("expected AllCandidatesFailed, got {err}");
+        let LlmError::FallbackQuotaExhausted {
+            attempted, summary, ..
+        } = &err
+        else {
+            panic!("expected FallbackQuotaExhausted, got {err}");
         };
         assert_eq!(*attempted, 0);
         assert!(

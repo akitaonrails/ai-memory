@@ -176,6 +176,20 @@ fn read_manifest(path: &Path) -> Value {
 
 const CHAIN: &str = "imported/agentmemory/memories/mem-q1.md";
 
+#[tokio::test]
+async fn export_manifest_cannot_replace_its_inputs() {
+    let fixture = fixture_files(&fixture_export(), &fixture_mapping());
+    for input in [&fixture.file, &fixture.mapping] {
+        let original = fs::read(input).unwrap();
+        let mut dry = args(&fixture, crate::DEFAULT_SERVER_URL);
+        dry.apply = false;
+        dry.manifest_out = Some(input.clone());
+        let error = run(dry).await.unwrap_err();
+        assert!(error.to_string().contains("--manifest-out"), "{error:#}");
+        assert_eq!(fs::read(input).unwrap(), original);
+    }
+}
+
 #[test]
 fn manifest_counts_equal_the_fixture() {
     let plan = plan_fixture(&fixture_export(), &fixture_mapping(), false);

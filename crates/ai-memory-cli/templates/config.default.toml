@@ -620,8 +620,8 @@ include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"
 #
-# Also schedule a reviewer run on SessionEnd. Off by default so hooks stay
-# cheap and fire-and-forget.
+# Accepted for compatibility and has no effect: no review runs from the
+# SessionEnd hook. [auto_improve.scheduler] below reviews completed sessions.
 # on_session_end = false
 #
 # Wiki folder prefixes whose page bodies the reviewer may read. A project that

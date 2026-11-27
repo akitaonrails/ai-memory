@@ -947,7 +947,8 @@ It is dry-run by default and requires `--confirm` to write. Like `purge-*`, the
 logical delete alone does not shrink the file: pass `--compact` to rebuild the
 FTS index and `VACUUM`. `--drop-latest` (also content-gated) additionally
 reclaims the latest ledger version when you no longer need the in-wiki ledger at
-all.
+all. The preview and confirmed report count distinct selected paths and separate
+superseded versions from live heads.
 
 ### Event-ledger sweep (`forget-sweep`, opt-in)
 

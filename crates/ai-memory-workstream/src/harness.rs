@@ -1207,10 +1207,14 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
                 "--fork-session",
             ],
         ),
-        // `--continue` / `-c` resumes the most recent conversation without
-        // naming one; that is still an explicit user choice, so nothing may be
-        // injected over it.
-        ManagedHarness::Antigravity => has_flag(args, &["--conversation", "--continue", "-c"]),
+        // `--resume` / `-r` are aliases for `--conversation` (Antigravity CLI
+        // 1.5.16+); `--continue` / `-c` resumes the most recent conversation
+        // without naming one. All are explicit user choices, so nothing may be
+        // injected over them.
+        ManagedHarness::Antigravity => has_flag(
+            args,
+            &["--conversation", "--resume", "-r", "--continue", "-c"],
+        ),
         // A bare `--resume` opens Copilot's session picker and `--connect`
         // attaches to a remote session; both are explicit user choices.
         ManagedHarness::Copilot => has_flag(
@@ -1252,7 +1256,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         ManagedHarness::Grok => flag_value(args, &["--resume", "-r", "--session-id", "-s"]),
         // A bare `--continue` names no conversation: the id is only known
         // after the fact, from the conversation store.
-        ManagedHarness::Antigravity => flag_value(args, &["--conversation"]),
+        ManagedHarness::Antigravity => flag_value(args, &["--conversation", "--resume", "-r"]),
         ManagedHarness::Copilot => flag_value(args, &["--resume", "-r", "--session-id"]),
         ManagedHarness::Gemini => flag_value(args, &["--resume", "-r", "--session-id"]),
     }
@@ -4124,13 +4128,29 @@ mod tests {
 
     #[test]
     fn antigravity_explicit_selector_always_wins() {
-        for native in [
-            vec![OsString::from("--conversation"), OsString::from("chosen")],
-            vec![OsString::from("--conversation=chosen")],
+        for (native, expected_id) in [
+            (
+                vec![OsString::from("--conversation"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (
+                vec![OsString::from("--conversation=chosen")],
+                Some("chosen"),
+            ),
+            (
+                vec![OsString::from("--resume"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (vec![OsString::from("--resume=chosen")], Some("chosen")),
+            (
+                vec![OsString::from("-r"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (vec![OsString::from("-r=chosen")], Some("chosen")),
             // `--continue` names no conversation but is still the user's
             // explicit choice, so nothing may be injected over it.
-            vec![OsString::from("--continue")],
-            vec![OsString::from("-c")],
+            (vec![OsString::from("--continue")], None),
+            (vec![OsString::from("-c")], None),
         ] {
             let plan = build_launch_plan(
                 ManagedHarness::Antigravity,
@@ -4140,7 +4160,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
-            assert_ne!(plan.expected_session_id.as_deref(), Some("linked"));
+            assert_eq!(plan.expected_session_id.as_deref(), expected_id);
         }
     }
 

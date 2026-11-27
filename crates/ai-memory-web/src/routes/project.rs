@@ -107,11 +107,9 @@ async fn render(
     // accessible only through scoped API detail routes.
     let summary = state
         .reader
-        .list_projects_with_stats(viewer)
+        .project_stats_by_name(&workspace, &project, viewer)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .into_iter()
-        .find(|item| item.workspace_name == workspace && item.project_name == project);
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // Resolved once, reused for every scope-keyed lookup below (agent
     // breakdown, token total, session list). A project with no resolvable
     // scope yet (no sessions recorded) just shows none of those rather than

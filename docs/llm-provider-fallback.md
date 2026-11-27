@@ -218,9 +218,7 @@ OpenAI's `account_deactivated` or Anthropic's disabled organization.
 
 The consolidation and bootstrap retry loops do not re-send an exhausted-quota
 error two seconds later, even when it arrives as a `429`, because it is not
-transient. The SessionEnd consolidation queue keeps such a job on its bounded
-backoff instead of marking it terminal: a top-up or quota reset can clear it
-within that window, as it always could for a `429`.
+transient.
 
 A quota failure opens the candidate's circuit for `llm_quota_cooldown_secs`
 (default 900, accepted range 30 to 86400, env
@@ -231,7 +229,25 @@ neither shortens it nor changes its reason. The candidate gets no traffic while
 its circuit is open. The first real call after the window tries it again: if it
 answers, it takes over again and its circuit closes; if it is still exhausted,
 that call costs one rejected request and the window starts again. Nothing
-probes in the background, and a restart clears the state.
+probes in the background. A restart clears the individual candidate circuits.
+
+For queued SessionEnd and checkpoint consolidation, a direct billing failure
+or a chain exhausted entirely by quota pauses claims for that consolidation
+route. The server persists the pause in its data directory. New and existing
+jobs stay queued without spending attempts, and existing heuristic pages remain
+available. A working fallback can finish a job without pausing the queue.
+
+While the server is running, the worker resumes with the oldest due job when
+the first candidate is eligible. After a restart, the worker waits for the
+latest known deadline on the route so it honors each provider's retry hint
+after the individual circuits have reset. This can delay an earlier
+candidate until the later deadline. A real queued success clears the pause.
+
+Changing the consolidation route on restart also allows the worker to resume.
+Replacing a credential under the same name may leave the pause in effect
+until its deadline. If the route is still exhausted when work resumes, the
+worker pauses again and charges only that job's actual attempt against its
+retry limit. Recovery always uses a real queued job.
 
 Example, Anthropic as primary with OpenAI taking over when the Anthropic
 balance runs out:

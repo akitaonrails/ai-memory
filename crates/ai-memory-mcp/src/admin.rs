@@ -5847,6 +5847,8 @@ pub struct ReclaimLedgerVersionsReport {
     pub ledger_paths: u64,
     /// `pages` rows selected — removed, unless the run was a dry run.
     pub pages_deleted: u64,
+    /// Selected live ledger rows.
+    pub latest_deleted: u64,
     /// Bytes of page body those rows carried. Logical payload, not freed
     /// bytes: the file only shrinks when `compact` was set.
     pub bytes_deleted: u64,
@@ -5893,6 +5895,7 @@ async fn handle_reclaim_ledger_versions(
             let report = ReclaimLedgerVersionsReport {
                 ledger_paths: summary.ledger_paths,
                 pages_deleted: summary.pages_deleted,
+                latest_deleted: summary.latest_deleted,
                 bytes_deleted: summary.bytes_deleted,
                 bytes_reclaimed: summary.bytes_reclaimed(),
                 dropped_latest: summary.dropped_latest,

@@ -129,7 +129,7 @@ async fn contextual_states_report_effective_configuration_and_mask_admin_setting
     );
     let app = mounted(
         &store,
-        wiki,
+        wiki.clone(),
         Some(RuntimeFeatures {
             llm_configured: true,
             learning_scheduled: true,
@@ -149,6 +149,28 @@ async fn contextual_states_report_effective_configuration_and_mask_admin_setting
             .find(|v| v["id"] == "learning")
             .unwrap()["state"],
         "Scheduled"
+    );
+    // Only the effective scheduler makes learning automatic: no other key
+    // starts a review on its own.
+    let app = mounted(
+        &store,
+        wiki,
+        Some(RuntimeFeatures {
+            llm_configured: true,
+            learning_scheduled: false,
+            ..Default::default()
+        }),
+    );
+    let (_, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == "learning")
+            .unwrap()["state"],
+        "Manual only"
     );
 }
 

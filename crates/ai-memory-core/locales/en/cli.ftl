@@ -827,3 +827,6 @@ cli-run-project-split-explain = 🔀 This session lives in { $workspace }/{ $old
 cli-run-project-split-prompt = Rename and continue? [Y/n]{ " " }
 cli-run-project-split-repaired = Renamed { $workspace }/{ $old } → { $workspace }/{ $new }; starting the session again.
 cli-repair-split-done = Joined: { $workspace }/{ $project } now owns { $identity }; the empty project is kept as { $workspace }/{ $archived }.
+cli-reclaim-ledger-versions-breakdown = { $value0 } superseded version(s); { $value1 } live head(s).
+cli-reclaim-ledger-versions-would-delete-total = Would delete { $value0 } ledger row(s) across { $value1 } ledger path(s), carrying { $value2 } of page body.
+cli-reclaim-ledger-versions-deleted-total = Deleted { $value0 } ledger row(s) across { $value1 } ledger path(s), carrying { $value2 } of page body.
