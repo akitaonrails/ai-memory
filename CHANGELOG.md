@@ -35,6 +35,12 @@ version in [`docs/changelog/`](docs/changelog/):
   a different session. The fallback clears only when its own session-end
   is acknowledged, including when a later request in `--all` fails.
 
+### Fixed
+
+- Fixed `ai-memory-wikisync sync --apply` against servers started with
+  `--http-stateful`. The companion initializes one MCP session before
+  checking tool capabilities and reuses it for conditional writes and deletes.
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed

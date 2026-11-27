@@ -95,6 +95,8 @@ struct Fixture {
     any_project: bool,
     /// Arguments of every MCP tool call, in order.
     mcp_calls: Mutex<Vec<serde_json::Value>>,
+    /// Request order for the legacy stateful transport, when exercised.
+    mcp_session: Option<Mutex<Vec<serde_json::Value>>>,
     reads_by_path: Mutex<BTreeMap<String, usize>>,
     recent_calls: AtomicUsize,
     page_reads_200: AtomicUsize,
@@ -130,6 +132,7 @@ impl Fixture {
             full_listing_status: None,
             any_project: false,
             mcp_calls: Mutex::new(Vec::new()),
+            mcp_session: None,
             reads_by_path: Mutex::new(BTreeMap::new()),
             recent_calls: AtomicUsize::new(0),
             page_reads_200: AtomicUsize::new(0),
@@ -440,8 +443,42 @@ async fn mcp_handler(
     if !(accept.contains("application/json") && accept.contains("text/event-stream")) {
         return StatusCode::NOT_ACCEPTABLE.into_response();
     }
+    let method = request["method"].as_str().unwrap_or_default();
+    if let Some(session) = &fixture.mcp_session {
+        let mut requests = session.lock().unwrap();
+        if method != "initialize"
+            && (headers
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                != Some("fixture-session")
+                || requests.is_empty()
+                || (method != "notifications/initialized" && requests.len() < 2))
+        {
+            return (StatusCode::BAD_REQUEST, "MCP session must be initialized").into_response();
+        }
+        requests.push(request.clone());
+    }
     let id = &request["id"];
-    if request["method"] == "tools/list" {
+    if method == "initialize" {
+        let result = json!({"protocolVersion": "2025-03-26", "capabilities": {},
+                            "serverInfo": {"name": "fixture", "version": "3.6.2"}});
+        if fixture.mcp_session.is_some() {
+            let frame = json!({"jsonrpc": "2.0", "id": id, "result": result});
+            return (
+                [
+                    (header::CONTENT_TYPE.as_str(), "text/event-stream"),
+                    ("mcp-session-id", "fixture-session"),
+                ],
+                format!("data:\n\ndata: {frame}\n\n"),
+            )
+                .into_response();
+        }
+        return rpc_result(id, result);
+    }
+    if method == "notifications/initialized" {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    if method == "tools/list" {
         let mut properties = json!({"path": {"type": "string"}, "body": {"type": "string"}});
         if !fixture.old_server {
             properties["expected_page_id"] = json!({"type": "string"});
@@ -1089,6 +1126,66 @@ fn decision() -> FixturePage {
 
 const DECISION_FILE: &str =
     "---\ntitle: \"DB\"\ntags: [\"db\"]\npinned: true\n---\n# DB\nUse Postgres.\n";
+
+#[tokio::test]
+async fn sync_apply_reuses_a_stateful_mcp_session_for_writes_and_deletes() {
+    let mut obsolete = decision();
+    obsolete.path = "decisions/obsolete.md".to_string();
+    obsolete.pinned = false;
+    let (addr, fixture) = serve(Fixture {
+        mcp_session: Some(Mutex::new(Vec::new())),
+        ..Fixture::with_pages(vec![decision(), obsolete])
+    })
+    .await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("initial export");
+    assert!(
+        fixture
+            .mcp_session
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+
+    fs::write(
+        dest.join("decisions/db.md"),
+        DECISION_FILE.replace("Postgres", "SQLite"),
+    )
+    .unwrap();
+    fs::remove_file(dest.join("decisions/obsolete.md")).unwrap();
+    bidi::run(&deleting_args(addr, &dest, None), SyncMode::Apply)
+        .await
+        .expect("apply through stateful MCP");
+
+    let requests = fixture.mcp_session.as_ref().unwrap().lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call",
+            "tools/call"
+        ]
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter_map(|request| request["id"].as_u64())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        fixture.page("decisions/db.md").unwrap().body,
+        "# DB\nUse SQLite.\n"
+    );
+    assert!(fixture.page("decisions/obsolete.md").is_none());
+}
 
 /// The reproduction from #1708: a destination exported from project `a` is
 /// reused for project `b`, whose (empty) listing made every page of `a` read
