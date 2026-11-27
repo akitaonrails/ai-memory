@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved hook fallback IDs when the server discards a `finalize-session`
+  event and reported the refusal. (#2519)
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
