@@ -173,7 +173,7 @@ pub use routes::LlmProviders;
 pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, LlmSubject, LlmWorkload,
-    ReasoningEffort, Role, Usage,
+    ReasoningEffort, Role, StructuredResponse, Usage,
 };
 
 // Integration tests compile into this crate's test harness instead of a

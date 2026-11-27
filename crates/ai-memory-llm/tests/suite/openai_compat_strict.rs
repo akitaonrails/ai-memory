@@ -183,11 +183,13 @@ async fn strict_success_returns_directly_and_makes_one_call() {
         .await;
 
     let provider = strict_provider(server.uri());
-    let value = provider
-        .complete_structured_raw(tiny_request(), tiny_schema())
+    let response = provider
+        .complete_structured_with_usage(tiny_request(), tiny_schema(), None)
         .await
         .expect("strict success path");
-    assert_eq!(value, json!({"ok": true}));
+    assert_eq!(response.value, json!({"ok": true}));
+    let usage = response.usage.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (1, 1));
     assert_eq!(
         responder.count(),
         1,

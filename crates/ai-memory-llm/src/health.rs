@@ -16,7 +16,9 @@ use crate::embedding::Embedder;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::routes::LlmProviders;
-use crate::types::{ChatRequest, ChatResponse, LlmOperationId, LlmWorkload, Usage};
+use crate::types::{
+    ChatRequest, ChatResponse, LlmOperationId, LlmWorkload, StructuredResponse, Usage,
+};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 
@@ -294,9 +296,7 @@ pub struct LlmWorkloadHealthSnapshot {
     pub reported_input_tokens: u64,
     /// Provider-reported output tokens when the provider returned usage.
     pub reported_output_tokens: u64,
-    /// Calls for which the provider returned token usage. Structured-output
-    /// providers currently return JSON without usage, so estimates remain the
-    /// comparable measurement for those workloads.
+    /// Calls for which the provider returned token usage.
     pub usage_reported_calls: u64,
     /// Outcome of the most recent call, or `unknown` before the first call.
     pub status: ProviderHealthStatus,
@@ -833,18 +833,10 @@ impl LlmProvider for HealthRecordingLlmProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        let estimated_input = estimate_structured_input_tokens(&request, &schema);
-        let started = Instant::now();
-        let result = self.inner.complete_structured_raw(request, schema).await;
-        self.record(
-            LlmWorkload::Unspecified,
-            started,
-            estimated_input,
-            &result,
-            estimate_json_tokens,
-            |_| None,
-        );
-        result
+        Ok(self
+            .complete_structured_with_usage(request, schema, None)
+            .await?
+            .value)
     }
 
     async fn complete_structured_raw_with_operation_id(
@@ -853,20 +845,34 @@ impl LlmProvider for HealthRecordingLlmProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, Some(operation_id))
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
         let estimated_input = estimate_structured_input_tokens(&request, &schema);
         let started = Instant::now();
-        let workload = operation_id.workload();
+        let workload = operation_id
+            .as_ref()
+            .map_or(LlmWorkload::Unspecified, LlmOperationId::workload);
         let result = self
             .inner
-            .complete_structured_raw_with_operation_id(request, schema, operation_id)
+            .complete_structured_with_usage(request, schema, operation_id)
             .await;
         self.record(
             workload,
             started,
             estimated_input,
             &result,
-            estimate_json_tokens,
-            |_| None,
+            |response| estimate_json_tokens(&response.value),
+            |response| response.usage,
         );
         result
     }

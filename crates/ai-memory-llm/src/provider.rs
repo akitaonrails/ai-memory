@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::error::LlmResult;
-use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId, StructuredResponse};
 
 /// Provider-agnostic chat-completion + structured-output API.
 ///
@@ -64,6 +64,24 @@ pub trait LlmProvider: Send + Sync {
         _operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
         self.complete_structured_raw(request, schema).await
+    }
+
+    /// Structured completion with optional provider-reported usage. Forward
+    /// the caller's original entry point for providers that return JSON only.
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
+        let value = match operation_id {
+            Some(id) => {
+                self.complete_structured_raw_with_operation_id(request, schema, id)
+                    .await?
+            }
+            None => self.complete_structured_raw(request, schema).await?,
+        };
+        Ok(StructuredResponse { value, usage: None })
     }
 
     /// Per-candidate health entries for an ordered LLM fallback chain.

@@ -624,9 +624,10 @@ closes a segment, and a window spanning restarts adds its segments.
 coarse four-characters-per-token estimate so structured and plain calls remain
 comparable. `reported_input_tokens` and `reported_output_tokens` count only
 responses for which the provider supplied usage; `usage_reported_calls` shows
-that coverage. Structured-output provider adapters currently return decoded
-JSON without usage, so their reported counters can remain zero even when the
-estimate is nonzero.
+that coverage. For structured output, the counters use the token counts on
+the response that supplied the decoded JSON. An explicit zero counts as a
+report. Providers that return only text, such as Cursor Agent, contribute
+only to the estimates.
 
 The telemetry stores no prompt, completion, scope, project, or caller-supplied
 label. A fallback chain is measured as one provider-interface invocation, not

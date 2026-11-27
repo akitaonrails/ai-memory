@@ -573,9 +573,10 @@ fecha um segmento, e uma janela que abrange reinicializações soma seus segment
 grosseira de quatro caracteres por token para que chamadas estruturadas e normais permaneçam
 comparáveis. `reported_input_tokens` e `reported_output_tokens` contam apenas
 respostas para as quais o provedor forneceu o consumo (usage); `usage_reported_calls` exibe
-essa cobertura. Adaptadores de provedores de saída estruturada atualmente retornam JSON
-decodificado sem dados de consumo, portanto seus contadores informados podem permanecer zerados mesmo quando a
-estimativa não for zero.
+essa cobertura. Para saídas estruturadas, os contadores usam o consumo informado
+na resposta que forneceu o JSON decodificado. Um zero explícito conta como consumo
+informado. Provedores que retornam apenas texto, como o Cursor Agent, contribuem
+somente para as estimativas.
 
 A telemetria não armazena prompt, conclusão, escopo, projeto ou rótulo fornecido pelo
 chamador. Uma cadeia de fallback é medida como uma invocação de interface de provedor, não

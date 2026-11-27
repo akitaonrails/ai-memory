@@ -24,7 +24,9 @@ use crate::error::{LlmError, LlmResult};
 use crate::google_auth::GoogleAdcTokenSource;
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Role, Usage};
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, Role, StructuredResponse, Usage,
+};
 
 /// Default Gemini API base.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -236,9 +238,15 @@ struct GeminiResponsePart {
 #[derive(Debug, Deserialize)]
 struct GeminiUsage {
     #[serde(rename = "promptTokenCount", default)]
-    prompt_token_count: u32,
+    prompt_token_count: Option<u32>,
     #[serde(rename = "candidatesTokenCount", default)]
-    candidates_token_count: u32,
+    candidates_token_count: Option<u32>,
+}
+
+impl GeminiUsage {
+    fn reported(self) -> Option<Usage> {
+        Usage::from_counts(self.prompt_token_count, self.candidates_token_count)
+    }
 }
 
 #[async_trait]
@@ -265,6 +273,18 @@ impl LlmProvider for GeminiProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
+        Ok(self
+            .complete_structured_with_usage(request, schema, None)
+            .await?
+            .value)
+    }
+
+    async fn complete_structured_with_usage(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        _operation_id: Option<LlmOperationId>,
+    ) -> LlmResult<StructuredResponse> {
         let prepared = prepare_schema_for_gemini(schema)?;
         let body = self.build_request(&request, Some(prepared));
         let response: GeminiResponse = self.post(&body).await?;
@@ -282,13 +302,16 @@ impl LlmProvider for GeminiProvider {
                 completion_tokens: response
                     .usage_metadata
                     .as_ref()
-                    .map(|usage| usage.candidates_token_count),
+                    .and_then(|usage| usage.candidates_token_count),
             });
         }
         let text = first_text(&response).ok_or_else(|| {
             LlmError::UnexpectedShape("gemini response had no candidate text".into())
         })?;
-        serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
+        Ok(StructuredResponse {
+            value: serde_json::from_str(&text)?,
+            usage: response.usage_metadata.and_then(GeminiUsage::reported),
+        })
     }
 }
 
@@ -332,10 +355,7 @@ impl GeminiProvider {
         let model = response.model_version.unwrap_or_else(|| self.model.clone());
         ChatResponse {
             text,
-            usage: response.usage_metadata.map(|u| Usage {
-                input_tokens: u.prompt_token_count,
-                output_tokens: u.candidates_token_count,
-            }),
+            usage: response.usage_metadata.and_then(GeminiUsage::reported),
             model,
         }
     }

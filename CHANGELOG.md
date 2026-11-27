@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Included provider-reported input and output tokens from successful structured
+  completions in workload health. An explicit zero counts as a usage report.
+  Providers that return only JSON continue to contribute estimates.
+  ([#2498](https://github.com/akitaonrails/ai-memory/pull/2498))
+
 - Pi tool description and parameter overrides (`pi_tool_overrides` /
   `AI_MEMORY_PI_TOOL_OVERRIDES`): operators can point to a JSON file relative
   to the config directory (confined to that directory, max 64 KiB) to shorten
