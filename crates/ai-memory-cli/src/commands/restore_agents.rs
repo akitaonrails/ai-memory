@@ -17,7 +17,9 @@ use tracing::info;
 
 use crate::cli::{AgentBackupScope, McpClient, RestoreAgentsArgs};
 use crate::commands::backup_agents::matches_agent_filter;
-use crate::commands::path_util::{agent_config_home, claude_config_dir, home_dir};
+use crate::commands::path_util::{
+    agent_config_home, claude_config_dir, devin_user_config_dir_in, home_dir,
+};
 use crate::config::Config;
 
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
@@ -90,6 +92,10 @@ pub fn run(config: &Config, args: RestoreAgentsArgs) -> Result<()> {
     let claude_override = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
     let codex_override = agent_config_home(config.runtime_env.var_os("CODEX_HOME"));
     let copilot_override = agent_config_home(std::env::var_os("COPILOT_HOME"));
+    // Only Windows moves Devin's user config, to %APPDATA%\devin; elsewhere
+    // the archived `.config/devin/` entries already land under the home.
+    let devin_override =
+        devin_user_config_dir_in(config.runtime_env.var_os("APPDATA"), None, cfg!(windows));
     let gemini_override = agent_config_home(config.runtime_env.var_os("GEMINI_CLI_HOME"));
     let grok_override = agent_config_home(config.runtime_env.var_os("GROK_HOME"));
     let kiro_override = agent_config_home(config.runtime_env.var_os("KIRO_HOME"));
@@ -97,6 +103,7 @@ pub fn run(config: &Config, args: RestoreAgentsArgs) -> Result<()> {
         claude: claude_override.as_deref(),
         codex: codex_override.as_deref(),
         copilot: copilot_override.as_deref(),
+        devin: devin_override.as_deref(),
         gemini: gemini_override.as_deref(),
         grok: grok_override.as_deref(),
         kiro: kiro_override.as_deref(),
@@ -384,6 +391,8 @@ struct TargetOverrides<'a> {
     codex: Option<&'a Path>,
     /// `COPILOT_HOME`.
     copilot: Option<&'a Path>,
+    /// `%APPDATA%\devin`, Devin's user config root on Windows.
+    devin: Option<&'a Path>,
     /// `GEMINI_CLI_HOME`.
     gemini: Option<&'a Path>,
     /// `GROK_HOME`.
@@ -448,6 +457,12 @@ fn resolve_target(
     if entry.agent == AgentKind::CopilotCli
         && let Some(custom_dir) = overrides.copilot
         && let Some(relative) = entry.target_relative.strip_prefix(".copilot/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
+    if entry.agent == AgentKind::Devin
+        && let Some(custom_dir) = overrides.devin
+        && let Some(relative) = entry.target_relative.strip_prefix(".config/devin/")
     {
         return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
     }
@@ -922,5 +937,58 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(fs::read(existing).unwrap(), b"old");
         assert!(!created.exists());
+    }
+
+    /// Devin's user config moves to `%APPDATA%\devin` only on Windows
+    /// (<https://docs.devin.ai/cli/reference/configuration/global-vs-local>),
+    /// so `run` sets `overrides.devin` there and nowhere else.
+    #[test]
+    fn devin_user_config_entries_follow_the_windows_root() {
+        let home = Path::new("/home/alice");
+        let cwd = Path::new("/repo");
+        let appdata_devin = Path::new("/appdata/devin");
+        let entry = |scope, target_relative: &str| AgentBackupEntry {
+            agent: AgentKind::Devin,
+            asset_kind: ai_memory_core::agent_backup::AgentAssetKind::McpConfig,
+            scope,
+            archive_path: "devin/asset".to_string(),
+            target_relative: target_relative.to_string(),
+            sanitized: false,
+            sha256: None,
+            mode: None,
+        };
+        let resolve = |scope, target_relative, devin| {
+            let overrides = TargetOverrides {
+                claude: None,
+                codex: None,
+                copilot: None,
+                devin,
+                gemini: None,
+                grok: None,
+                kiro: None,
+            };
+            resolve_target(&entry(scope, target_relative), home, cwd, overrides).unwrap()
+        };
+        let global = AgentAssetScope::Global;
+        let windows = Some(appdata_devin);
+
+        let (base, target) = resolve(global, ".config/devin/mcp_config.json", windows);
+        assert_eq!(base, appdata_devin);
+        assert_eq!(target, appdata_devin.join("mcp_config.json"));
+        let (base, target) = resolve(global, ".config/devin/skills/demo/SKILL.md", windows);
+        assert_eq!(base, appdata_devin);
+        assert_eq!(target, appdata_devin.join("skills/demo/SKILL.md"));
+
+        // Controls: no Windows root, a legacy `.devin/` entry, a project entry.
+        let (base, target) = resolve(global, ".config/devin/mcp_config.json", None);
+        assert_eq!(base, home);
+        assert_eq!(target, home.join(".config/devin/mcp_config.json"));
+        let (base, target) = resolve(global, ".devin/config.json", windows);
+        assert_eq!(base, home);
+        assert_eq!(target, home.join(".devin/config.json"));
+        let project = AgentAssetScope::Project;
+        let (base, target) = resolve(project, ".devin/skills/demo/SKILL.md", windows);
+        assert_eq!(base, cwd);
+        assert_eq!(target, cwd.join(".devin/skills/demo/SKILL.md"));
     }
 }

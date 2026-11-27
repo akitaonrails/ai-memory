@@ -69,6 +69,15 @@ files listed under `~/.kiro` use `KIRO_HOME`, the same homes `install-mcp`,
 machine's Grok or Kiro home. Project-scoped `.grok/` entries stay under the
 project.
 
+Devin files listed under `~/.config/devin` live in `%APPDATA%\devin` on
+Windows, as
+[Devin's configuration guide](https://docs.devin.ai/cli/reference/configuration/global-vs-local)
+documents and `install-mcp`, `install-hooks` and `install-skills` write them.
+Archives keep portable `.config/devin/` paths, so global entries restore into
+the receiving machine's Devin config root. Legacy `.devin/` entries keep their
+recorded destination under the user's home, and project `.devin/skills` stays
+under the project.
+
 ---
 
 ## 3. Architecture & CLI Design

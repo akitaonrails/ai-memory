@@ -627,6 +627,57 @@ fn kiro_cli_assets_follow_kiro_home_on_backup_and_restore() {
     assert!(!destination.join("agents/stale.json").exists());
 }
 
+/// Devin reads its user config from `%APPDATA%\devin` on Windows
+/// (<https://docs.devin.ai/cli/reference/configuration/global-vs-local>), where
+/// `install-mcp`, `install-hooks` and `install-skills` write it.
+#[cfg(windows)]
+#[test]
+fn devin_assets_follow_appdata_on_windows_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // `command_with_env` points APPDATA at home/AppData/Roaming.
+    let devin = home.path().join("AppData/Roaming/devin");
+    let fixtures = [
+        ("config.json", r#"{"hooks":{}}"#),
+        ("mcp_config.json", r#"{"mcpServers":{}}"#),
+        ("skills/example/SKILL.md", "# Example Devin skill"),
+    ];
+    for (relative, body) in fixtures {
+        let path = devin.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_skill = home.path().join(".config/devin/skills/stale/SKILL.md");
+    fs::create_dir_all(inactive_skill.parent().unwrap()).unwrap();
+    fs::write(inactive_skill, "# Stale skill").unwrap();
+
+    let archive = project.path().join("devin-appdata.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    let destination = restored_home.path().join("AppData/Roaming/devin");
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert!(!restored_home.path().join(".config/devin").exists());
+    assert!(!destination.join("skills/stale").exists());
+}
+
 /// Gemini CLI reads project skills from `.gemini/skills` inside the repository,
 /// alongside the user-level `~/.gemini/skills` the installer writes.
 #[test]
@@ -1977,6 +2028,49 @@ fn restore_agents_rejects_a_symlinked_parent_inside_a_relocated_home() {
     }
 }
 
+/// On Windows the restore's symlink check starts from `%APPDATA%\devin`, so a
+/// symlinked directory inside it must still refuse the restore.
+#[cfg(windows)]
+#[test]
+fn restore_agents_rejects_a_symlinked_parent_inside_the_windows_devin_root() {
+    let _guard = cli_test_lock();
+    let source_home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let asset = source_home
+        .path()
+        .join("AppData/Roaming/devin/skills/demo/SKILL.md");
+    fs::create_dir_all(asset.parent().unwrap()).unwrap();
+    fs::write(&asset, "# Devin skill").unwrap();
+    let archive = project.path().join("backup.tar.gz");
+    let backup = command_with_env(source_home.path(), project.path())
+        .args(backup_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restore_home = tempfile::tempdir().unwrap();
+    let devin = restore_home.path().join("AppData/Roaming/devin");
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir_all(&devin).unwrap();
+    match std::os::windows::fs::symlink_dir(outside.path(), devin.join("skills")) {
+        Ok(()) => {}
+        // ERROR_PRIVILEGE_NOT_HELD: Windows policy denies symlink creation.
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            eprintln!("skipping symlink restore assertion: Windows privilege unavailable");
+            return;
+        }
+        Err(error) => panic!("failed to create test directory link: {error}"),
+    }
+    let restore = command_with_env(restore_home.path(), project.path())
+        .args(restore_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+
+    assert!(!restore.status.success());
+    assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
+    assert!(!outside.path().join("demo/SKILL.md").exists());
+}
+
 #[test]
 fn restore_agents_rejects_oversized_entries_from_the_header() {
     let _guard = cli_test_lock();
@@ -2562,6 +2656,13 @@ fn every_documented_skill_root_survives_a_backup_and_restore() {
         format!("# parity {root}")
     };
     let asset_path = |base: &Path, root: &str, file_name: &str| {
+        // Devin's user config lives in %APPDATA%\devin on Windows, which
+        // `command_with_env` points at home/AppData/Roaming.
+        let root = if cfg!(windows) && root == ".config/devin/skills" {
+            "AppData/Roaming/devin/skills"
+        } else {
+            root
+        };
         let dir = base.join(root);
         if file_name != "SKILL.md" {
             return dir.join(file_name);
