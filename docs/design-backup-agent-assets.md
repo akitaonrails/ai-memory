@@ -47,7 +47,8 @@ Copilot CLI also reads `~/.agents/skills`, `.agents/skills` and
 when it is set, as it resolves `.claude/` against `CLAUDE_CONFIG_DIR`.
 
 Claude Desktop config paths use the same platform-aware resolver as
-`install-mcp`, including packaged Windows installs. OpenCode uses
+`install-mcp`, including packaged Windows installs and
+`$XDG_CONFIG_HOME/Claude` on Linux. OpenCode uses
 `%USERPROFILE%\.config\opencode` on Windows too, as its
 [official troubleshooting guide](https://dev.opencode.ai/docs/troubleshooting/)
 documents.

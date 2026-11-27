@@ -48,19 +48,19 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
     command
 }
 
-fn claude_desktop_config_in(home: &Path) -> Option<PathBuf> {
+fn claude_desktop_config_in(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
+        home.join("Library/Application Support/Claude/claude_desktop_config.json")
     }
     #[cfg(target_os = "windows")]
     {
-        Some(home.join("AppData/Roaming/Claude/claude_desktop_config.json"))
+        home.join("AppData/Roaming/Claude/claude_desktop_config.json")
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = home;
-        None
+        // `command_with_env` points XDG_CONFIG_HOME at `home/.config`.
+        home.join(".config/Claude/claude_desktop_config.json")
     }
 }
 
@@ -146,10 +146,8 @@ fn backup_and_restore_agents_round_trip() {
     fs::write(&opencode_config, r#"{"mcp":{}}"#).unwrap();
 
     let desktop_config = claude_desktop_config_in(home.path());
-    if let Some(path) = &desktop_config {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, r#"{"mcpServers":{"desktop":{}}}"#).unwrap();
-    }
+    fs::create_dir_all(desktop_config.parent().unwrap()).unwrap();
+    fs::write(&desktop_config, r#"{"mcpServers":{"desktop":{}}}"#).unwrap();
 
     // Antigravity / Gemini
     let agy_mcp = home.path().join(".gemini/config/mcp_config.json");
@@ -274,13 +272,10 @@ fn backup_and_restore_agents_round_trip() {
             .join(".config/opencode/opencode.json")
             .exists()
     );
-    if desktop_config.is_some() {
-        assert!(
-            claude_desktop_config_in(restore_home.path())
-                .unwrap()
-                .exists()
-        );
-    }
+    assert_eq!(
+        fs::read_to_string(claude_desktop_config_in(restore_home.path())).unwrap(),
+        r#"{"mcpServers":{"desktop":{}}}"#
+    );
 }
 
 #[test]
