@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   only exists on the 1.x to 2.0 OKF path, so the boot now reads the schema
   position read-only and warns with the current and target versions when any
   other migration would run without a backup. Fresh installs, up-to-date
-  stores and an unreadable schema never warn or block startup.
+  stores and an unreadable schema never warn or block startup (#2545).
 
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
