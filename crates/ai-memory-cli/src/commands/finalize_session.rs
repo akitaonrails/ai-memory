@@ -118,14 +118,11 @@ pub(crate) async fn finalize(
             args.all_owners,
         )
         .await?;
+        // A different session may have started while the server handled this
+        // one. Retire only the fallback for the acknowledged session.
+        super::hook::clear_matching_session_id(&config.data_dir, agent, &session.session_id);
         finalized.push(session.session_id.clone());
     }
-
-    // Agents with hook-maintained session state (ZCode: no SessionEnd event)
-    // keep a stored id in `<data_dir>/hook-state/<agent>-session-id`; once the
-    // session is finalized server-side, the stored id must go too, or the next
-    // agent session would inherit the closed id.
-    super::hook::clear_session_id(&config.data_dir, agent);
 
     Ok((workspace, project, finalized))
 }
@@ -683,6 +680,84 @@ mod tests {
             reopen: false,
             json: false,
         }
+    }
+
+    #[tokio::test]
+    async fn finalize_retires_only_the_acknowledged_fallback_session() {
+        use std::collections::HashMap;
+        use std::fs;
+
+        use axum::extract::Query;
+        use axum::response::IntoResponse as _;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use serde_json::{Value, json};
+
+        let temp = TempDir::new().unwrap();
+        let fallback = temp.path().join("hook-state/zcode-session-id");
+        fs::create_dir(fallback.parent().unwrap()).unwrap();
+        let older = SessionId::new();
+        let active = SessionId::new();
+        let refused = SessionId::new();
+
+        let app = Router::new()
+            .route(
+                "/admin/open-sessions",
+                get(
+                    move |Query(query): Query<HashMap<String, String>>| async move {
+                        let sessions = if query["all"] == "true" {
+                            vec![
+                                json!({"session_id": active}),
+                                json!({"session_id": refused}),
+                            ]
+                        } else {
+                            vec![json!({"session_id": query["session_id"]})]
+                        };
+                        Json(json!({"sessions": sessions}))
+                    },
+                ),
+            )
+            .route(
+                "/hook/batch",
+                post(move |Json(items): Json<Vec<Value>>| async move {
+                    if items[0]["body"]["session_id"] == refused.to_string() {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        Json(json!({"accepted": 1})).into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            server_url,
+            ..Config::default()
+        };
+        let mut args = finalize_args(Some("workspace"), Some("project"));
+        args.agent = AgentKind::Zcode;
+        args.session_id = Some(older);
+
+        fs::write(&fallback, active.to_string()).unwrap();
+        let (_, _, finalized) = finalize(&config, &args).await.unwrap();
+        assert_eq!(finalized, vec![older.to_string()]);
+        assert_eq!(fs::read_to_string(&fallback).unwrap(), active.to_string());
+
+        fs::write(&fallback, refused.to_string()).unwrap();
+        args.session_id = Some(refused);
+        let error = finalize(&config, &args).await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error:#}");
+        assert_eq!(fs::read_to_string(&fallback).unwrap(), refused.to_string());
+
+        fs::write(&fallback, active.to_string()).unwrap();
+        args.session_id = None;
+        args.all = true;
+        let error = finalize(&config, &args).await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error:#}");
+        assert!(!fallback.exists());
+
+        server.abort();
     }
 
     #[tokio::test]

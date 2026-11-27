@@ -29,6 +29,12 @@ version in [`docs/changelog/`](docs/changelog/):
 - Scoped the project dashboard's summary query to the project being viewed,
   avoiding aggregates for unrelated projects during recurring refreshes.
 
+### Fixed
+
+- Preserved the current fallback session ID when `finalize-session` closes
+  a different session. The fallback clears only when its own session-end
+  is acknowledged, including when a later request in `--all` fails.
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
