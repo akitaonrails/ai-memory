@@ -107,6 +107,18 @@ jobs:
               - 'crates/ai-memory-cli/src/commands/render_shared.rs'
               - 'crates/ai-memory-cli/src/commands/service_host.rs'
               - 'crates/ai-memory-cli/src/commands/user_service.rs'
+              # The remaining CLI command modules that carry #[cfg(windows)]
+              # code, so a PR touching only them still runs the native Windows
+              # job instead of relying on the `windows` label.
+              - 'crates/ai-memory-cli/src/commands/hook_drain_process.rs'
+              - 'crates/ai-memory-cli/src/commands/hook_spool.rs'
+              - 'crates/ai-memory-cli/src/commands/install_mcp.rs'
+              - 'crates/ai-memory-cli/src/commands/opencode_dialect.rs'
+              - 'crates/ai-memory-cli/src/commands/path_util.rs'
+              - 'crates/ai-memory-cli/src/commands/recovery.rs'
+              - 'crates/ai-memory-cli/src/commands/run.rs'
+              - 'crates/ai-memory-cli/src/commands/setup.rs'
+              - 'crates/ai-memory-cli/src/commands/upgrade.rs'
               # The Windows wrapper launcher and its packaging fixtures: a
               # wrapper change is Windows-only code that no Linux job runs.
               - 'bin/ai-memory.ps1'
