@@ -47,6 +47,13 @@ version in [`docs/changelog/`](docs/changelog/):
   match Antigravity's documented `Stop` response contract and the shell and
   PowerShell hook bundles. (#2521)
 
+### Fixed
+
+- `ai-memory run antigravity` now recognizes `--resume` and `-r` (added in
+  Antigravity CLI 1.5.16 as aliases for `--conversation`) as explicit native
+  session selectors, preventing linked-session overrides and preserving exact
+  `finalize-session` targeting on exit. (#2522)
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
