@@ -170,6 +170,26 @@ pub fn model_present(models_root: &Path) -> bool {
     model_present_for(models_root, DEFAULT_LOCAL_MODEL)
 }
 
+/// Build the client that downloads local embedding model files.
+///
+/// Bound the fetch so a stalled connection can't hang startup forever (#602).
+/// Unlike the inference clients' flat 120s, these are large model files
+/// (~87-470 MB total), so a 120s *total* cap would spuriously fail a
+/// slow-but-working download: bound the connection stall tightly and give the
+/// body a generous ceiling instead.
+///
+/// The checksum pin protects the bytes, but a redirect to a cleartext origin
+/// would put the download on the wire unprotected. Follow a redirect only when
+/// it stays on HTTPS, which keeps a model host's CDN hop working.
+fn model_download_client() -> LlmResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(crate::redirect::https_only_redirects())
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .map_err(|e| LlmError::UnexpectedShape(e.to_string()))
+}
+
 /// Download the files for `spec` with pinned checksums (atomic: tmp +
 /// verify + rename). Skips files already present and valid; a present
 /// file with a wrong checksum is replaced.
@@ -180,16 +200,7 @@ pub fn model_present(models_root: &Path) -> bool {
 pub async fn fetch_model_for(models_root: &Path, spec: &LocalModelSpec) -> LlmResult<()> {
     let dir = model_dir_for(models_root, spec);
     std::fs::create_dir_all(&dir).map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
-    // Bound the fetch so a stalled connection can't hang startup forever
-    // (#602). Unlike the inference clients' flat 120s, these are large
-    // model files (~87-470 MB total), so a 120s *total* cap would spuriously
-    // fail a slow-but-working download: bound the connection stall tightly
-    // and give the body a generous ceiling instead.
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(900))
-        .build()
-        .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
+    let client = model_download_client()?;
     for (name, pinned) in spec.files {
         let dest = dir.join(name);
         if let Ok(existing) = std::fs::read(&dest)
@@ -791,5 +802,41 @@ mod tests {
             dot(&db, &storage) > dot(&db, &weather),
             "semantic neighbour must beat the unrelated sentence"
         );
+    }
+
+    #[tokio::test]
+    async fn model_download_client_refuses_a_cleartext_redirect() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Two loopback listeners: the first redirects to the second over
+        // cleartext `http`, which the policy must refuse.
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let elsewhere_addr = elsewhere.local_addr().unwrap();
+        let target = format!("http://{elsewhere_addr}/model.bin");
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            let response =
+                format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n");
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let client = model_download_client().expect("client builds");
+        let error = client
+            .get(format!("http://{origin_addr}/model.bin"))
+            .send()
+            .await
+            .expect_err("a cleartext redirect must be refused");
+
+        let rendered = error.to_string();
+        assert!(
+            error.is_redirect() || rendered.contains("non-https origin"),
+            "unexpected error: {rendered}"
+        );
+        drop(elsewhere);
+        serving.await.unwrap();
     }
 }
