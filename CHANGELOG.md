@@ -83,6 +83,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `O_NOFOLLOW | O_NONBLOCK` opens, and are never read from repository
   `.ai-memory.toml` files or hook payloads. (#2453)
 
+- Added a background mode to `POST /admin/compact` (`"background": true`,
+  answered `202`) and a `GET /admin/compact` status route, so a compaction that
+  outlasts a proxy timeout is followed instead of cut off with `524`. Both forms
+  share one single-flight slot and answer `409` while a compaction runs.
+
 ### Fixed
 
 - Completed the English and Brazilian Portuguese help and installer

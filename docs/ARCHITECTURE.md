@@ -1007,6 +1007,20 @@ series, and scope is never a label. The route sits behind the same
 `require_root_for_multiuser_admin` gate as every `/admin/*` route: root-only once
 the deployment distinguishes operators. Counters reset on restart.
 
+### `POST /admin/compact` and `GET /admin/compact`
+
+The synchronous form (`{"confirm": true}`) waits for the FTS rebuild and
+`VACUUM` and returns 200 with `CompactReport`. The background form adds
+`"background": true`, returns 202 with a `CompactJobStatus` in `running`, and
+runs the writer's compaction on a task of its own; `GET /admin/compact` reads
+the last job from an in-memory `CompactJobs` slot (see
+`ai-memory-mcp/src/compact_job.rs`), so it answers even while the writer is
+held by that `VACUUM`. States are `idle`, `running`, `succeeded` and `failed`;
+the slot keeps the last success duration for the next job. Both POST forms
+claim the same single-flight slot: a concurrent caller gets 409 with the
+running job's status. A process restart forgets the slot, and both routes sit
+behind the same root-only admin gate.
+
 ### LLM workload telemetry
 
 The root-protected `GET /admin/status` snapshot includes a bounded

@@ -32,6 +32,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),

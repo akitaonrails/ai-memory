@@ -43,6 +43,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -80,6 +81,7 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -676,6 +678,7 @@ async fn move_project_carries_source_embedding() {
         .with_embedder(embedder.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -981,6 +984,7 @@ async fn true_move_notifies_admission_with_destination_names() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -1043,6 +1047,7 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         .with_embedder(embedder.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -1277,6 +1282,7 @@ async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
 /// routers — e.g. a move then a re-run — against the same SQLite file).
 fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
     AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -1783,6 +1789,7 @@ async fn true_move_aborts_when_admission_rejects() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -1888,6 +1895,7 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -2012,6 +2020,7 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
