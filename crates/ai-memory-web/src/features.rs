@@ -20,6 +20,10 @@ pub struct RuntimeFeatures {
     pub learning_scheduled: bool,
     /// Proposals wait for manual approval.
     pub review_requires_approval: bool,
+    /// Path prefixes whose proposals wait for manual approval
+    /// (`[auto_improve] require_approval_prefixes`); blank entries are
+    /// ignored and an empty or blank-only list changes nothing.
+    pub review_approval_prefixes: Vec<String>,
     /// Scheduled maintenance is enabled.
     pub maintenance_enabled: bool,
     /// Retention sweeps have a nonzero configured cadence.
@@ -35,7 +39,7 @@ pub struct RuntimeFeatures {
 pub(crate) struct FeatureState {
     pub id: &'static str,
     pub title: &'static str,
-    pub state: &'static str,
+    pub state: String,
     pub detail: &'static str,
     pub next_step: &'static str,
     pub guide: &'static str,
@@ -57,16 +61,16 @@ pub(crate) async fn states(
         .is_ok();
     let runtime = state.runtime.as_ref();
     let mut rows = Vec::new();
-    let mut push = |id, title, status, detail, next_step, guide, private| {
+    let mut push = |id, title, status: &str, detail, next_step, guide, private| {
         rows.push(if private && !admin {
             FeatureState {
-                id, title, state: "Restricted",
+                id, title, state: "Restricted".to_string(),
                 detail: "Administrator access is required to inspect this installation setting.",
                 next_step: "Ask the administrator to inspect this feature. The guide remains available.",
                 guide,
             }
         } else {
-            FeatureState { id, title, state: status, detail, next_step, guide }
+            FeatureState { id, title, state: status.to_string(), detail, next_step, guide }
         });
     };
     push(
@@ -203,16 +207,30 @@ pub(crate) async fn states(
             "features#learning-and-proposal-review",
             true,
         );
+        // The review row carries a dynamic state (the configured prefix
+        // list), so it is built directly instead of going through the
+        // static-state push helper.
+        let review_state = if r.review_requires_approval {
+            "Manual approval required".to_string()
+        } else if ai_memory_core::auto_improve_prefixes_active(&r.review_approval_prefixes) {
+            format!(
+                "Manual approval for: {}",
+                r.review_approval_prefixes
+                    .iter()
+                    .filter(|p| !p.trim().is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            "Automatic approval configured".to_string()
+        };
         push(
             "review",
             "Proposal approval",
-            if r.review_requires_approval {
-                "Manual approval required"
-            } else {
-                "Automatic approval configured"
-            },
+            &review_state,
             "This is the configured policy for validated proposals, not a count of pending proposals.",
-            "Review the pending-writes audit trail; set auto_improve.require_approval to change the policy.",
+            "Review the pending-writes audit trail; set auto_improve.require_approval or auto_improve.require_approval_prefixes to change the policy.",
             "features#learning-and-proposal-review",
             true,
         );

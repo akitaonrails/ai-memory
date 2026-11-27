@@ -23,7 +23,12 @@ O que isso significa para você:
 - **Servidor compartilhado / de equipe**: defina `[auto_improve] require_approval =
   true`. Em um servidor no qual várias pessoas confiam, um LLM não deve
   aplicar automaticamente edições que ninguém revisou. As propostas então aguardam em
-  `_pending/` até que um humano aprove cada uma.
+  `_pending/` até que um humano aprove cada uma. Se só parte da wiki
+  precisa dessa proteção, `require_approval_prefixes` (por exemplo
+  `["_rules/"]`) segura apenas as propostas sob os prefixos configurados,
+  enquanto o resto de cada execução é aprovado automaticamente. As duas chaves
+  cobrem só propostas do auto-improve: a consolidação comum escreve uma página
+  de tipo `rule` em `_rules/` pelo próprio caminho, sem revisão.
 - **Custo**: uma chamada de LLM delimitada por sessão concluída que passe pelos
   filtros preliminares (mínimo de observações/duração); os tamanhos de prompt
   e de saída são delimitados em `[auto_improve]`.
@@ -44,7 +49,8 @@ notas de implementação, mantidas para aprofundamento.
 > execuções direcionadas e atualização de pendências. Ambos os caminhos registram propostas validadas na
 > trilha de auditoria de gravações pendentes e as aprovam automaticamente pelo caminho normal de escrita da wiki
 > por padrão. Administradores podem definir `[auto_improve] require_approval = true` para
-> revisão manual.
+> revisão manual, ou `require_approval_prefixes` para segurar só as propostas
+> sob um conjunto de prefixos de caminho.
 
 ## Resumo Executivo
 
@@ -222,7 +228,13 @@ O recurso entregue é um revisor de aprendizado baseado em auditoria:
 A autoaprovação é o padrão, mas ainda assim registra propostas preparadas e as aplica
 através do mesmo caminho de aprovação. Administradores que desejarem uma fila humana definem
 `[auto_improve] require_approval = true`; administradores que não quiserem nenhuma revisão automática definem
-`[auto_improve.scheduler] enabled = false`.
+`[auto_improve.scheduler] enabled = false`. Administradores que querem proteger só uma
+parte da wiki definem `require_approval_prefixes` (por exemplo `["_rules/"]`):
+propostas cujo caminho de destino armazenado começa com um prefixo configurado
+ficam pendentes, enquanto o resto da mesma execução é aprovado automaticamente.
+`require_approval = true` continua segurando todas as propostas; a decisão lê o
+caminho de destino armazenado, nunca o caminho que o modelo informou, e um detalhe
+armazenado ilegível é segurado, não aprovado.
 
 Alvos de alto impacto também podem ser protegidos por um portal de avaliação (eval gate) executável fornecido pelo operador.
 O `[auto_improve.eval]` vem desativado por padrão; quando ativado, propostas cujos
@@ -380,6 +392,7 @@ Os nomes exatos podem mudar, mas a estrutura deve ser explícita e conservadora:
 ```toml
 [auto_improve]
 require_approval = false      # true leaves proposals pending for manual review
+# require_approval_prefixes = ["_rules/"]  # holds only the matching proposals
 min_observations = 8
 min_session_duration_secs = 120
 min_confidence = 0.75
@@ -460,8 +473,10 @@ e o passe de experiência entre sessões seguem a mesma opção.
 
 `[auto_improve.scheduler]` controla se e com que frequência o servidor inicia a
 revisão em segundo plano. `[auto_improve] require_approval` controla se propostas validadas
-são aplicadas automaticamente ou deixadas pendentes. Elas intencionalmente não
-implicam uma à outra.
+são aplicadas automaticamente ou deixadas pendentes. `require_approval_prefixes`
+refina essa política: com a chave global desligada, só as propostas cujo caminho
+de destino armazenado começa com um dos prefixos ficam pendentes. Elas
+intencionalmente não implicam uma à outra.
 
 `max_rejection_context` e `rejection_context_days` limitam o resumo do buffer persistente
 de rejeição incluído em prompts futuros do revisor. O buffer é delimitado por

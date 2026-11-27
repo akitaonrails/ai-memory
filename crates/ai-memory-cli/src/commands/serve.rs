@@ -1541,6 +1541,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_contradiction_band(config.contradiction_band_min, config.contradiction_band_max)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
+        .with_auto_improve_require_approval_prefixes(
+            config.auto_improve.require_approval_prefixes.clone(),
+        )
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
             config.consolidation.output_language.clone(),
@@ -1826,6 +1829,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     wiki: wiki.clone(),
                     llm_providers,
                     auto_improve_require_approval: config.auto_improve.require_approval,
+                    auto_improve_require_approval_prefixes: config
+                        .auto_improve
+                        .require_approval_prefixes
+                        .clone(),
                     auto_improve_review_config: auto_improve_review_config_from_settings(
                         &config.auto_improve,
                         config.consolidation.output_language.clone(),
@@ -2033,6 +2040,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                             && config.auto_improve.scheduler.interval_secs > 0
                             && config.auto_improve.scheduler.max_sessions_per_tick > 0,
                         review_requires_approval: config.auto_improve.require_approval,
+                        review_approval_prefixes: config
+                            .auto_improve
+                            .require_approval_prefixes
+                            .clone(),
                         maintenance_enabled: config.maintenance.enabled,
                         retention_scheduled: config.maintenance.forget_sweep_interval_secs > 0,
                         human_login: human_mode,
@@ -2620,6 +2631,7 @@ async fn start_maintenance_scheduler(
                 output_language.clone(),
             ),
             require_approval: auto_improve.require_approval,
+            require_approval_prefixes: auto_improve.require_approval_prefixes.clone(),
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
             experience: (scheduler.experience_every_sessions > 0).then(|| {

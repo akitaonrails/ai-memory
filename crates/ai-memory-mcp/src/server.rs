@@ -89,6 +89,45 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
     }
 }
 
+/// Decide whether one staged auto-improve proposal is held by the configured
+/// prefixes, reading the STORED target path (the row an operator can audit)
+/// rather than the path the model claimed. Fails closed: a read error or a
+/// missing row holds the proposal as pending, and the warning carries the id
+/// and any store error, never proposal content.
+async fn auto_improve_held_by_prefixes(
+    reader: &ReaderPool,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    proposal_id: ai_memory_core::AutoImproveProposalId,
+    prefixes: &[String],
+) -> bool {
+    match reader
+        .auto_improve_proposal_detail(ws, proj, proposal_id)
+        .await
+    {
+        Ok(Some(detail)) => ai_memory_core::auto_improve_requires_approval(
+            false,
+            prefixes,
+            detail.summary.target_path.as_str(),
+        ),
+        Ok(None) => {
+            tracing::warn!(
+                %proposal_id,
+                "auto-improve approval check found no stored proposal; holding it pending"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                %proposal_id,
+                error = %e,
+                "auto-improve approval check could not read the stored proposal; holding it pending"
+            );
+            true
+        }
+    }
+}
+
 /// Caps a handoff list and returns it with how many of `items` it kept (the
 /// rest were dropped for the item-count or total-chars budget).
 fn cap_handoff_list(
@@ -716,6 +755,12 @@ pub struct AiMemoryServer {
     /// otherwise it immediately approves validated proposals through the normal
     /// wiki write path.
     auto_improve_require_approval: bool,
+    /// If non-blank, `memory_auto_improve` stages proposals for manual
+    /// approval when their stored target path starts with one of these
+    /// prefixes, while the rest are still approved
+    /// (`[auto_improve] require_approval_prefixes`). Blank entries are
+    /// ignored; `auto_improve_require_approval = true` holds every proposal.
+    auto_improve_require_approval_prefixes: Vec<String>,
     /// Server-configured defaults used by manual MCP auto-improvement. This
     /// keeps manual runs at least as strict as the operator's configured
     /// Phase 1/2 budgets instead of falling back to compiled defaults.
@@ -2485,6 +2530,7 @@ impl AiMemoryServer {
             ),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: default_auto_improve_review_config(),
             schema_dialect: SchemaDialect::default(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
@@ -2664,6 +2710,15 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_auto_improve_require_approval(mut self, require_approval: bool) -> Self {
         self.auto_improve_require_approval = require_approval;
+        self
+    }
+
+    /// Configure the path prefixes whose auto-improve proposals wait for
+    /// manual approval while the rest are approved automatically
+    /// (`[auto_improve] require_approval_prefixes`).
+    #[must_use]
+    pub fn with_auto_improve_require_approval_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.auto_improve_require_approval_prefixes = prefixes;
         self
     }
 
@@ -5277,7 +5332,7 @@ impl AiMemoryServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        description = "Run manual auto-improvement for one completed session and apply or stage validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session that has not already produced an auto-improvement run in the current project; repeated implicit calls advance through the remaining sessions, including after a preflight skip. Pass `session_id` to rerun a specific session. The server also schedules background review for newly completed sessions in every project when an LLM provider is configured. Admins can set `[auto_improve.scheduler] enabled = false` to stop automatic review, or `[auto_improve] require_approval = true` to leave scheduled and manual proposals pending for review."
+        description = "Run manual auto-improvement for one completed session and apply or stage validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session that has not already produced an auto-improvement run in the current project; repeated implicit calls advance through the remaining sessions, including after a preflight skip. Pass `session_id` to rerun a specific session. The server also schedules background review for newly completed sessions in every project when an LLM provider is configured. Admins can set `[auto_improve.scheduler] enabled = false` to stop automatic review, or `[auto_improve] require_approval = true` to leave scheduled and manual proposals pending for review, or `[auto_improve] require_approval_prefixes = [\"_rules/\"]` to leave only the proposals whose target path starts with a configured prefix pending while the rest are auto-approved."
     )]
     async fn memory_auto_improve(
         &self,
@@ -5498,8 +5553,33 @@ impl AiMemoryServer {
             sidecar_paths.push(path.display().to_string());
         }
         let mut outcomes = Vec::with_capacity(staged.proposal_ids.len());
+        // The prefixes only matter when the global switch is off; when it is
+        // on, every proposal is held without a store read (unchanged
+        // behaviour).
+        let prefix_hold = !self.auto_improve_require_approval
+            && ai_memory_core::auto_improve_prefixes_active(
+                &self.auto_improve_require_approval_prefixes,
+            );
         for (proposal_id, sidecar_path) in staged.proposal_ids.iter().zip(sidecar_paths.iter()) {
             if self.auto_improve_require_approval {
+                outcomes.push(serde_json::json!({
+                    "id": proposal_id.to_string(),
+                    "sidecar_path": sidecar_path,
+                    "status": "pending",
+                    "page_id": null,
+                }));
+                continue;
+            }
+            if prefix_hold
+                && auto_improve_held_by_prefixes(
+                    &self.reader,
+                    ws,
+                    proj,
+                    *proposal_id,
+                    &self.auto_improve_require_approval_prefixes,
+                )
+                .await
+            {
                 outcomes.push(serde_json::json!({
                     "id": proposal_id.to_string(),
                     "sidecar_path": sidecar_path,
@@ -5543,10 +5623,26 @@ impl AiMemoryServer {
                 }
             }
         }
+        // Prefix-only retention leaves some proposals pending without the
+        // global switch: report the run as approval-required, and name the
+        // policy.
+        let approval_required =
+            self.auto_improve_require_approval || outcomes.iter().any(|o| o["status"] == "pending");
+        let approval_policy = if self.auto_improve_require_approval {
+            "manual".to_string()
+        } else if approval_required {
+            ai_memory_core::auto_improve_approval_policy(
+                false,
+                &self.auto_improve_require_approval_prefixes,
+            )
+            .to_string()
+        } else {
+            "auto_approve".to_string()
+        };
         ok_json(&serde_json::json!({
             "run_id": staged.run_id.to_string(),
-            "approval_required": self.auto_improve_require_approval,
-            "approval_policy": if self.auto_improve_require_approval { "manual" } else { "auto_approve" },
+            "approval_required": approval_required,
+            "approval_policy": approval_policy,
             "session_id": session_id.to_string(),
             "summary": report.summary,
             "warnings": report.warnings,
@@ -29453,6 +29549,79 @@ mod tests {
 
     /// A provider that fails the auto-improve review with a private body:
     /// the `McpError` must carry only the redacted class/status summary.
+    /// Reviews one session into a patch/create under `_rules/` and a create
+    /// under `gotchas/`, so the MCP decision point sees both sides of the
+    /// prefix match in one call.
+    struct PrefixHoldMcpLlm;
+
+    #[async_trait::async_trait]
+    impl ai_memory_llm::LlmProvider for PrefixHoldMcpLlm {
+        fn name(&self) -> &'static str {
+            "fake-prefix-hold"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Ok(ai_memory_llm::ChatResponse {
+                text: String::new(),
+                usage: None,
+                model: self.model().to_string(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "one rule and one gotcha",
+                "proposals": [
+                    {
+                        "operation": "create_or_update",
+                        "path": "_rules/existing.md",
+                        "title": "Existing rule",
+                        "kind": "rule",
+                        "confidence": 0.93,
+                        "rationale": "The scope should be extended.",
+                        "evidence": [{"page": "session", "quote": "durable lesson"}],
+                        "edit_mode": "patch",
+                        "edits": [
+                            {"op": "append", "anchor": "## Scope", "content": "Added by the review."}
+                        ]
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "_rules/x.md",
+                        "title": "Durable Rule",
+                        "kind": "rule",
+                        "confidence": 0.92,
+                        "rationale": "The session established an explicit rule.",
+                        "evidence": [{"page": "sessions/test.md", "quote": "always run the gate"}],
+                        "body_markdown": "# Durable Rule\n\nAlways run the gate before release."
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "gotchas/y.md",
+                        "title": "Release Gotcha",
+                        "kind": "gotcha",
+                        "confidence": 0.9,
+                        "rationale": "A reproducible pitfall surfaced in the session.",
+                        "evidence": [{"page": "sessions/test.md", "quote": "the deploy failed"}],
+                        "body_markdown": "# Release Gotcha\n\nDeploy fails without the gate."
+                    }
+                ],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
     struct AutoImproveSentinelLlm;
 
     fn auto_improve_sentinel_error() -> ai_memory_llm::LlmError {
@@ -29806,6 +29975,192 @@ mod tests {
     /// only `proposal_ids` shows a successful run of N-1 proposals with nothing
     /// saying the Nth ever existed — the silent drop the per-proposal skip was
     /// introduced to end.
+    /// `memory_auto_improve` honors the prefix policy the same way the admin
+    /// route does: prefix-matching proposals stay pending and write no page,
+    /// the sibling is applied, and the response names the policy.
+    #[tokio::test]
+    async fn memory_auto_improve_holds_prefix_matching_proposal_and_applies_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        wiki.write_page(ai_memory_wiki::WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: ai_memory_core::PagePath::new("_rules/existing.md").unwrap(),
+            frontmatter: serde_json::json!({"kind": "rule"}),
+            body: "# Existing rule\n\nBase text.\n\n## Scope\n\nApplies here.\n".into(),
+            tier: ai_memory_core::Tier::Working,
+            pinned: false,
+            title: Some("Existing rule".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+            trust_class: None,
+        })
+        .await
+        .unwrap();
+        let base_body = store
+            .reader
+            .page_body_by_ids(ws, proj, "_rules/existing.md")
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = seeded_auto_improve_session(&store, ws, proj).await;
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PrefixHoldMcpLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+            .with_auto_improve_require_approval_prefixes(vec!["_rules/".to_string()]);
+
+        let json = call_tool_json(
+            server
+                .memory_auto_improve(
+                    Parameters(AutoImproveArgs {
+                        session_id: Some(session_id.to_string()),
+                        dry_run: None,
+                        stage: None,
+                        mode: None,
+                        project: None,
+                        workspace: None,
+                        min_observations: Some(1),
+                        min_session_duration_secs: Some(0),
+                        min_confidence: Some(0.75),
+                        max_input_tokens: None,
+                        max_proposals: Some(5),
+                        include_raw_fallback: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .expect("a prefix hold must not fail the run"),
+        );
+        assert_eq!(
+            json["approval_required"], true,
+            "a run with any held proposal reports approval_required"
+        );
+        assert_eq!(
+            json["approval_policy"], "manual_for_prefixes",
+            "prefix-only retention names its own policy"
+        );
+        let proposals = json["proposals"].as_array().expect("proposals array");
+        assert_eq!(proposals.len(), 3, "every proposal must stage");
+        let stored = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap();
+        let resp_status: std::collections::HashMap<String, String> = proposals
+            .iter()
+            .map(|p| {
+                (
+                    p["id"].as_str().unwrap().to_string(),
+                    p["status"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        let status_of = |path: &str| -> String {
+            let row = stored
+                .iter()
+                .find(|p| p.target_path.as_str() == path)
+                .unwrap_or_else(|| panic!("{path} must have staged"));
+            resp_status[&row.id.to_string()].clone()
+        };
+        assert_eq!(status_of("_rules/x.md"), "pending");
+        assert_eq!(status_of("_rules/existing.md"), "pending");
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "_rules/existing.md")
+                .await
+                .unwrap()
+                .map(|page| page.body),
+            Some(base_body.body),
+            "a held patch must not write its target page"
+        );
+        assert_eq!(status_of("gotchas/y.md"), "approved");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "_rules/x.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "a held proposal must not write its target page"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "gotchas/y.md")
+                .await
+                .unwrap()
+                .is_some(),
+            "the sibling proposal is applied"
+        );
+    }
+
+    /// Fail closed at the MCP decision point: a missing row or an unreadable
+    /// table holds the proposal pending, never approves it.
+    #[tokio::test]
+    async fn memory_auto_improve_holds_a_proposal_whose_detail_is_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+        let prefixes = vec!["_rules/".to_string()];
+
+        let missing = ai_memory_core::AutoImproveProposalId::new();
+        assert!(
+            auto_improve_held_by_prefixes(&server.reader, ws, proj, missing, &prefixes).await,
+            "an unreadable detail must hold the proposal"
+        );
+
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE auto_improve_proposals RENAME TO auto_improve_proposals_broken",
+        )
+        .unwrap();
+        let broken =
+            auto_improve_held_by_prefixes(&server.reader, ws, proj, missing, &prefixes).await;
+        conn.execute_batch(
+            "ALTER TABLE auto_improve_proposals_broken RENAME TO auto_improve_proposals",
+        )
+        .unwrap();
+        assert!(
+            broken,
+            "a read error must hold the proposal, not approve it"
+        );
+    }
+
     #[tokio::test]
     async fn memory_auto_improve_reports_a_collided_proposal_instead_of_dropping_it() {
         // The default parts carry no operator, matching the unattributed

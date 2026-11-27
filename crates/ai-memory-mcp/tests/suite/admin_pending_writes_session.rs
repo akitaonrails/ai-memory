@@ -175,6 +175,7 @@ fn admin_state(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
             overrides: Default::default(),
         },
         auto_improve_require_approval: true,
+        auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),

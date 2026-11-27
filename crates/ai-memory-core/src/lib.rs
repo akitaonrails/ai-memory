@@ -8,6 +8,7 @@
 pub mod active_project;
 pub mod actor;
 pub mod agent_backup;
+pub mod auto_improve_approval;
 pub mod compaction_recap;
 pub mod error;
 pub mod excerpt;
@@ -69,6 +70,9 @@ pub use actor::{
 pub use agent_backup::{
     AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
     AgentBackupManifest, HostInfo,
+};
+pub use auto_improve_approval::{
+    auto_improve_approval_policy, auto_improve_prefixes_active, auto_improve_requires_approval,
 };
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{
