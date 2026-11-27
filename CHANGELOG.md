@@ -13,8 +13,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- Named the workspace and project when pending writes were empty.
-- Included the source page in skipped relation warnings.
+- Named the workspace and project when pending writes were empty (#2542).
+- Included the source page in skipped relation warnings (#2542).
 
 ## [3.6.4] - 2026-11-27
 
