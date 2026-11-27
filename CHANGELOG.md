@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.6.4] - 2026-11-27
+
 ### Fixed
 
 - Paused queued session consolidation when its LLM route ran out of credit
@@ -6545,7 +6547,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.4...HEAD
+[3.6.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.4
 [3.6.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.3
 [3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
 [3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
