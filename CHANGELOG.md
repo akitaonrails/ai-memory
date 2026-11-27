@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Applied the readable-repository filter to `page_meta_by_id` and
   `page_meta_by_path`, so a page in a restricted project is not resolved for a
   viewer who cannot read that project. Also ordered the path lookup by
-  workspace and project name so the result is deterministic.
+  workspace and project name so the result is deterministic ([#2536](https://github.com/akitaonrails/ai-memory/pull/2536))
 
 ## [3.6.4] - 2026-11-27
 
