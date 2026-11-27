@@ -1,5 +1,9 @@
 //! refinery-driven schema migrations.
 
+use std::path::Path;
+
+use rusqlite::{Connection, OpenFlags};
+
 use crate::error::{StoreError, StoreResult};
 
 refinery::embed_migrations!("migrations");
@@ -125,6 +129,75 @@ fn max_supported_version() -> i32 {
         .map(refinery::Migration::version)
         .max()
         .unwrap_or(0)
+}
+
+/// Where a store's schema sits relative to this binary's embedded
+/// migrations, as read from the file without touching it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaStatus {
+    /// Highest version recorded in the store's applied-migration history.
+    pub current: i32,
+    /// Highest version embedded in this binary.
+    pub target: i32,
+}
+
+impl SchemaStatus {
+    /// True when the store still needs at least one embedded migration.
+    #[must_use]
+    pub fn has_pending_migrations(&self) -> bool {
+        self.current < self.target
+    }
+}
+
+/// Read the store's schema position without migrating the database.
+///
+/// Opens `<data_dir>/db/memory.sqlite` read-only (never with CREATE, so an
+/// absent file stays absent), reads the highest applied version from
+/// refinery's history table, and compares it with the highest embedded
+/// version. The database file itself is not written. On a WAL store SQLite
+/// may still create or touch its `-wal`/`-shm` companions and take its usual
+/// read locks, as any reader does.
+///
+/// `Ok(None)` when the database file is absent or carries no applied
+/// migration history yet (a fresh install has nothing to report); `Err` on
+/// I/O or SQLite failure. A boot caller treats `Err` as "no report": log it
+/// and keep starting, never block startup on this read.
+pub fn schema_status(data_dir: &Path) -> StoreResult<Option<SchemaStatus>> {
+    let db_path = data_dir.join("db").join(crate::DB_FILENAME);
+    let metadata = match std::fs::metadata(&db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    // Read-only and without CREATE: this report must not manufacture or
+    // write the database it reads.
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_history: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'refinery_schema_history')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_history {
+        return Ok(None);
+    }
+    let current: i32 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM refinery_schema_history",
+        [],
+        |row| row.get(0),
+    )?;
+    // No applied migration: a blank or first-boot database is a fresh
+    // install, not a store that needs a pre-migration backup warning.
+    if current == 0 {
+        return Ok(None);
+    }
+    Ok(Some(SchemaStatus {
+        current,
+        target: max_supported_version(),
+    }))
 }
 
 /// Translate refinery's two `MissingVersion` cases without confusing a
@@ -3426,5 +3499,55 @@ mod tests {
         for table in ["pages_cjk_fts", "observations_cjk_fts"] {
             assert_eq!(arabic_matches(&conn, table), 1, "{table} after V114");
         }
+    }
+
+    /// The boot-time pre-migration backup warning reads the schema version
+    /// without migrating: absent database and blank file report `None` (a
+    /// fresh install never warns), a current store reports nothing pending,
+    /// and a store stopped partway through the embedded migrations reports
+    /// the exact applied ceiling with the gap to the target.
+    #[test]
+    fn schema_status_reports_absent_fresh_and_old_stores_without_touching_them() {
+        // Absent database file.
+        let absent = tempfile::TempDir::new().unwrap();
+        assert!(
+            matches!(schema_status(absent.path()), Ok(None)),
+            "an absent database must report nothing to warn about"
+        );
+
+        // A file with no applied migration history: a blank database is a
+        // fresh install, and the read must not have created or grown it.
+        let blank_dir = tempfile::TempDir::new().unwrap();
+        let blank = blank_dir.path().join("db").join("memory.sqlite");
+        std::fs::create_dir_all(blank.parent().unwrap()).unwrap();
+        std::fs::write(&blank, b"").unwrap();
+        assert!(matches!(schema_status(blank_dir.path()), Ok(None)));
+        assert_eq!(std::fs::read(&blank).unwrap(), b"");
+
+        // A current store: every embedded migration applied, nothing pending.
+        let current_dir = tempfile::TempDir::new().unwrap();
+        let current = current_dir.path().join("db").join("memory.sqlite");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        {
+            let mut conn = Connection::open(&current).unwrap();
+            run(&mut conn).unwrap();
+        }
+        let status = schema_status(current_dir.path()).unwrap().unwrap();
+        assert_eq!(status.current, max_supported_version());
+        assert_eq!(status.target, max_supported_version());
+        assert!(!status.has_pending_migrations());
+
+        // An older store: only part of the embedded migrations applied.
+        let old_dir = tempfile::TempDir::new().unwrap();
+        let old = old_dir.path().join("db").join("memory.sqlite");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        {
+            let mut conn = Connection::open(&old).unwrap();
+            run_to(&mut conn, 50).unwrap();
+        }
+        let status = schema_status(old_dir.path()).unwrap().unwrap();
+        assert_eq!(status.current, 50);
+        assert!(status.has_pending_migrations());
+        assert!(status.current < status.target);
     }
 }

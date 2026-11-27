@@ -1077,3 +1077,4 @@ diag-pi-tool-overrides-invalid-param-description = a descrição em pi_tool_over
 diag-pi-tool-overrides-missing-required-param = pi_tool_overrides para `{ $tool }` omite o parâmetro obrigatório `{ $param }`
 
 diag-decay-token-call-tool-retention-days-must-be-greater = decay.token_call_tool_retention_days precisa ser maior ou igual a zero (0 desativa a remoção de ferramentas das chamadas de tokens)
+diag-about-to-migrate-the-database-schema-without-a = prestes a migrar o esquema do banco sem um novo backup: esta inicialização não criou um pacote anterior à migração (esquema atual { $current }, esquema destino { $target }). Execute `ai-memory backup` com o binário anterior antes de atualizar para manter um snapshot restaurável

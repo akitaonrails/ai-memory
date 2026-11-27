@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a boot warning when pending SQLite schema migrations are about to run
+  without a pre-migration package created by this boot. The automatic snapshot
+  only exists on the 1.x to 2.0 OKF path, so the boot now reads the schema
+  position read-only and warns with the current and target versions when any
+  other migration would run without a backup. Fresh installs, up-to-date
+  stores and an unreadable schema never warn or block startup.
+
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
   Providers that return only JSON continue to contribute estimates.
