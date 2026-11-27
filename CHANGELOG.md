@@ -49,6 +49,11 @@ version in [`docs/changelog/`](docs/changelog/):
   These commands also use the existing host-file treatment on
   SELinux-enforcing hosts.
 
+### Fixed
+
+- Rejected pre-migration backups with missing or corrupt gzip trailers before
+  saving their receipts or starting the wiki migration.
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
