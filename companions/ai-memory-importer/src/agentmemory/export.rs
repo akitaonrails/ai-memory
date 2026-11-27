@@ -409,6 +409,10 @@ pub(crate) async fn run(args: ExportArgs) -> Result<()> {
     if args.apply && args.manifest_out.is_none() {
         bail!("--apply requires --manifest-out <path>");
     }
+    crate::validate_manifest_destination(
+        args.manifest_out.as_deref(),
+        &[&args.file, &args.mapping],
+    )?;
     let prefix = validate_dest_prefix(&args.dest_prefix)?;
     let mapping = Mapping::load(&args.mapping)?;
     let plan = plan(
