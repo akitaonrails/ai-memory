@@ -7026,7 +7026,12 @@ mod tests {
                 expected,
                 "disk title (batch={batch})"
             );
-            let indexed = store.reader.page_meta_by_id(id).await.unwrap().unwrap();
+            let indexed = store
+                .reader
+                .page_meta_by_id(id, None)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(indexed.title, expected, "indexed title (batch={batch})");
             assert_eq!(
                 wiki.reindex_page(
@@ -9113,7 +9118,7 @@ mod tests {
 
         let meta = store
             .reader
-            .page_meta_by_path("notes/note.md")
+            .page_meta_by_path("notes/note.md", None)
             .await
             .unwrap()
             .expect("page exists");
