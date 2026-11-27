@@ -4426,10 +4426,3 @@ write to `~/.local/share/ai-memory/hooks/`.
   every client in the [README Support Matrix](../README.md#support-matrix)
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually
   running inside ai-memory
-
-Tool references on token calls can be retained indefinitely (the default) or
-pruned by setting `[decay] token_call_tool_retention_days` to a positive day
-count, or setting `AI_MEMORY_DECAY__TOKEN_CALL_TOOL_RETENTION_DAYS`. The forget
-sweep prunes tool references of older calls only for closed sessions in the
-selected project, in batches using `observation_prune_batch`. Calls and session
-usage totals remain. A dry run reports matching tool references without deletion.

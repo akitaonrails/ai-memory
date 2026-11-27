@@ -10886,15 +10886,19 @@ pub(crate) mod tests {
     fn token_retention_preserves_scope_boundary_tools_and_totals() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let other_ws = get_or_create_workspace(&mut conn, "other-ws").unwrap();
+        let other_ws_proj = get_or_create_project(&mut conn, &other_ws, "default", None).unwrap();
         let closed = SessionId::new();
         let open = SessionId::new();
         let foreign = SessionId::new();
-        for (sid, project, ended) in [
-            (closed, proj, true),
-            (open, proj, false),
-            (foreign, other, true),
+        let foreign_ws = SessionId::new();
+        for (sid, workspace, project, ended) in [
+            (closed, ws, proj, true),
+            (open, ws, proj, false),
+            (foreign, ws, other, true),
+            (foreign_ws, other_ws, other_ws_proj, true),
         ] {
-            begin_session(&mut conn, &hook_session(sid, ws, project, None)).unwrap();
+            begin_session(&mut conn, &hook_session(sid, workspace, project, None)).unwrap();
             if ended {
                 conn.execute(
                     "UPDATE sessions SET ended_at=1 WHERE id=?1",
@@ -10917,10 +10921,10 @@ pub(crate) mod tests {
             0
         );
         let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
-        assert_eq!(count("SELECT COUNT(*) FROM token_calls"), 6);
-        assert_eq!(count("SELECT COUNT(*) FROM token_call_tools"), 5);
+        assert_eq!(count("SELECT COUNT(*) FROM token_calls"), 8);
+        assert_eq!(count("SELECT COUNT(*) FROM token_call_tools"), 7);
         assert_eq!(count("SELECT input_tokens FROM session_usage"), 25);
-        for sid in [open, foreign] {
+        for sid in [open, foreign, foreign_ws] {
             let n: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM token_call_tools WHERE session_id=?1 AND call_id='old'",

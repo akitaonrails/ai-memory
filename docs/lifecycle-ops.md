@@ -21,6 +21,7 @@ on a homelab box where mistakes are harder to undo.
 | `repair-backfill-timestamps --project --confirm` | ✅ yes | no | yes, if the operator kept the audit row or the CLI's before/after report (nothing else) | Corrects `sessions.started_at`/`ended_at` for sessions an older `backfill` imported before it carried the transcript's own event time. The CLI reads the operator's local transcripts read-only and posts candidate `(session_id, started_at, ended_at)` tuples to `POST /admin/repair-session-times`, which validates each one against `(workspace, project)` (a candidate outside that scope is `not_found` and untouched), only rewrites a row whose `started_at` postdates the candidate's own end (`not_flattened` otherwise, so a correctly hook-captured session or a re-run is a no-op), refuses negative/inverted/future-dated times, and never assigns an end time to a session still open. Without `--confirm` the server validates and reports inside a rolled-back transaction, so it is a real dry run; a confirmed run writes one `audit_log` row per request with the before/after times. Touches only the two timestamp columns of rows already in scope; `observations` and pages (including the session's own page frontmatter) are untouched. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `forget-sweep` event-ledger pass (`[decay] ledger_retention_months`) | ✅ yes | old hook event ledger *files* (`log-YYYY-MM.md`) from disk, nothing in the database | no ai-memory command restores a ledger (`restore-page` restores pages only); the content stays in the wiki's git history when a checkpoint captured it, recoverable with plain git until the repository is compacted | **Off by default** (`0`). Runs inside the forget sweep, so `--dry-run` previews it: the report lists `ledgers_prunable` and `ledger_bytes_prunable`. Online through the admin API. Only a file whose name is `log-YYYY-MM.md` **and** whose content opens with a ledger hook entry qualifies; `log.md`, the current month and the previous month are never deleted, whatever the setting. Each removal consults the blocking admission chain (`delete_event_ledger` op); a `reject`-policy webhook keeps the file and the report counts it in `ledgers_undeleted`. |
+| `forget-sweep` token-call tool pass (`[decay] token_call_tool_retention_days`) | ✅ yes | tool reference rows (`token_call_tools`) of old calls in closed sessions; `token_calls` and `session_usage` totals stay intact | no | **Off by default** (`0`). Runs inside the forget sweep, so `--dry-run` previews it: the report lists `token_call_tools_prunable`. Prunes only closed sessions in the selected workspace/project in bounded `observation_prune_batch` transactions. |
 | `reclaim-ledger-versions` | ✅ yes | superseded pre-#660 ledger page *versions* only | no (the latest page version stays) | Dry-run by default; needs `--confirm` to delete. Online through the writer actor, safe alongside the live writer. Content-gated: only non-latest, non-decay `log.md`/`log-YYYY-MM.md` versions whose body opens with a ledger hook entry are removed; a real page that merely shares the name is untouched. `--compact` additionally rebuilds FTS and `VACUUM`s to reclaim the freed bytes. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path (--from REV \| --page-id UUID)` | ✅ yes | overwrites one markdown page version | yes (restore another retained version) | Restores one page from wiki git history or a retained SQLite page version, reindexes it, and writes a post-restore checkpoint. `--page-id` reaches source history preserved by `merge-project`; it does not restore other DB state. |
@@ -1000,6 +1001,18 @@ The sweep deletes the file from disk. The wiki's git repository keeps the
 blobs a checkpoint already captured; deleting a ledger does not shrink
 `wiki/.git` (that needs the repository to be compacted, which ai-memory does not
 do).
+
+### Token-call tool sweep (`forget-sweep`, opt-in)
+
+Tool references on token calls (`token_call_tools`) can be retained indefinitely
+(the default) or pruned by setting `[decay] token_call_tool_retention_days` to a
+positive day count, or setting `AI_MEMORY_DECAY__TOKEN_CALL_TOOL_RETENTION_DAYS`.
+The forget sweep prunes tool references of older calls only for closed sessions
+in the selected workspace and project, in bounded batches using
+`observation_prune_batch`. Calls (`token_calls`) and session usage totals
+(`session_usage`) remain intact. A dry run (`--dry-run` / `dry_run=true`)
+reports matching tool references in `token_call_tools_prunable` without deleting
+anything.
 
 ### `repair-backfill-timestamps`
 

@@ -235,6 +235,11 @@ a partir dos caminhos de hooks.
    os mesmos contadores por meio do mesmo caminho limitado e isento de FTS, de modo que uma página
    aberta diretamente por um humano ou exibida pelo grafo resiste ao decaimento como um acerto
    de consulta (design-memory-aging.md C1).
+   Uma passagem opcional de ferramentas de chamadas de token exclui referências de
+   ferramentas pertencentes a chamadas mais antigas que
+   `[decay] token_call_tool_retention_days` em sessões encerradas do escopo
+   selecionado, usando transações do tamanho de lote de observações. As chamadas e
+   `session_usage` são mantidos. O dry-run conta sem excluir. Zero desativa a passagem.
 7. A varredura de esquecimento executa sob demanda e no cronograma de `[maintenance]`
    do servidor: páginas além do TTL de seu frontmatter `expires_at:` são
    excluídas permanentemente pela camada da wiki (arquivo + linhas, fixadas ou não);
@@ -867,7 +872,7 @@ entrada de longa duração ali é o comportamento esperado da política, não um
 | `memory_write_pages_batch` | destrutiva | Grava de 1 a 100 versões completas de páginas atomicamente em um projeto existente, selecionado por `workspace` + `project` ou `project_id` estável. Toda entrada é condicional (`create_only` ou `expected_page_id`), caminhos duplicados são recusados, cada corpo é limitado a 1 MiB e o total a 8 MiB. Admissão, sanitização, atribuição, atualizações de índice e reversão usam a mesma fronteira `Wiki::apply_batch_if`; uma incompatibilidade retorna seu índice de requisição/id atual e não grava nada. Destinado a importações de companheiros limitadas, não para notas rotineiras de agentes. |
 | `memory_delete_page` | destrutiva | Exclui uma única página pelo `path` exato; `scope: "profile"` exclui do perfil entre projetos do chamador. Dispara a cadeia de admissão (op=delete); idempotente. `expected_page_id` opcional exclui apenas se essa ainda for a versão mais recente; caso contrário, nada é excluído e a chamada retorna `reason: "precondition_failed"`. |
 | `memory_restore_page` | destrutiva | Somente Admin, assim como `/admin/restore-page`. Sem `rev`, lista os checkpoints git que alteraram `path`. Com `rev`, grava essa versão (corpo e metadados de frontmatter) de volta pelo caminho `memory_write_page` (sanitizador, admissão, slots, substituição), incluindo uma página excluída. Resumos de sessão expurgados são recusados antes da escrita. Páginas de projeto apenas, não `scope: "profile"`. |
-| `memory_forget_sweep` | destrutiva | Passagem de retenção: despeja páginas frias através da camada da wiki, expurga ancestralidade de lápides antigas e exclui permanentemente páginas com TTL expirado. `dry_run=true` para pré-visualização. |
+| `memory_forget_sweep` | destrutiva | Passagem de retenção: exclui permanentemente páginas com TTL expirado, despeja páginas frias através da camada da wiki, expurga ancestralidade de lápides antigas e, quando habilitado, poda observações brutas de sessões consolidadas (`observation_retention_days`), livros-razão antigos de eventos de hooks (`ledger_retention_months`) e o contexto de ferramentas de chamadas de token antigas em sessões encerradas (`token_call_tool_retention_days`; chamadas e totais da sessão são mantidos). `dry_run=true` para pré-visualização. |
 | `memory_lint` | destrutiva | Constatações de contradição baseadas em regras + LLM → `wiki/_lint/`. Também executa um **detector de candidatos de similaridade sem LLM** (design-memory-aging.md A5): páginas semânticas/procedurais frias cujos embeddings já armazenados estejam na faixa de similaridade de cosseno de `contradiction_band_min`–`contradiction_band_max` (padrão 0.4–0.75; "mesmo tópico, não uma quase duplicata"; no/acima do máximo é desduplicação A3, abaixo do mínimo não relacionado) recebem uma constatação consultiva `similarity_candidate`. Similaridade por si só nunca alega contradição ou substituição; arestas explícitas de `contradicts` ainda emitem `contradiction`. A varredura é limitada (uma carga de embeddings sobre o conjunto frio limitado, constatações limitadas, determinística), uma operação sem efeito limpa quando nenhum embedder estiver configurado e apenas consultiva (nunca exclui/edita/substitui uma página e não persiste arestas, invariantes #13, #16, #2), não necessitando de migração. Em um armazenamento de idioma único ou domínio único, a similaridade de fundo entre páginas não relacionadas pode ficar acima do piso padrão; eleve `contradiction_band_min` (`config.toml` ou `AI_MEMORY_CONTRADICTION_BAND_MIN`) para reduzir essa fila de revisão. |
 | `memory_install_self_routing` | somente leitura | Retorna o trecho canônico e enxuto de roteamento mais os payloads de Agent Skills gerenciadas e dicas de destino para instalações em CLAUDE.md / AGENTS.md. |
 
@@ -1338,6 +1343,7 @@ cold_threshold = 0.20              # below this → remove file + retain tombsto
 hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 observation_retention_days = 0     # 0 = never prune raw observations
+token_call_tool_retention_days = 0      # 0 = never prune tools of closed-session calls
 observation_prune_batch = 5000     # rows per prune transaction
 ledger_retention_months = 0        # 0 = never delete hook event ledgers; N > 0 =
                                    # delete a log-YYYY-MM.md N whole months after

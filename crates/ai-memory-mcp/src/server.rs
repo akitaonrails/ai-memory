@@ -4840,7 +4840,9 @@ impl AiMemoryServer {
         (token_call_tool_retention_days = 0); when off, token_call_tools_pruned \
         is 0. The report's expired / hard_deleted / observations_pruned counts come \
         from passes 1, 3 and 4; ledgers_prunable / ledgers_pruned and their \
-        byte counts from pass 5. Pass dry_run=true to preview."
+        byte counts from pass 5; token_call_tools_prunable / \
+        token_call_tools_pruned / token_call_tool_prune_batches from pass 6. \
+        Pass dry_run=true to preview."
     )]
     async fn memory_forget_sweep(
         &self,
