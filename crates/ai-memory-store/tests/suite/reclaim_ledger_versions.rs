@@ -584,3 +584,79 @@ async fn an_empty_store_reports_nothing_and_touches_nothing() {
     assert!(!report.dropped_latest);
     assert!(!report.compacted, "no rows went, so no VACUUM was needed");
 }
+
+#[tokio::test]
+async fn selected_paths_include_heads_once_and_preview_matches_delete() {
+    for (history, drop_latest, expected_paths, expected_rows, expected_heads) in [
+        (false, true, 1, 1, 1),
+        (true, false, 1, 1, 0),
+        (true, true, 1, 2, 1),
+        (false, false, 0, 0, 0),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        write_page(
+            &store,
+            ws,
+            proj,
+            "log-2026-08.md",
+            &ledger_body("2026-08-01T00:00:00Z"),
+        )
+        .await;
+        if history {
+            write_page(
+                &store,
+                ws,
+                proj,
+                "log-2026-08.md",
+                &ledger_body("2026-08-02T00:00:00Z"),
+            )
+            .await;
+        }
+        write_page(&store, ws, proj, "log-2026-09.md", &prose_body()).await;
+        let preview = store
+            .writer
+            .reclaim_ledger_versions(true, drop_latest, Compaction::Skip)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                preview.ledger_paths,
+                preview.pages_deleted,
+                preview.latest_deleted
+            ),
+            (expected_paths, expected_rows, expected_heads)
+        );
+        assert_eq!(versions(&store, proj, "log-2026-09.md")[0].1, prose_body());
+        let applied = store
+            .writer
+            .reclaim_ledger_versions(false, drop_latest, Compaction::Skip)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                applied.ledger_paths,
+                applied.pages_deleted,
+                applied.latest_deleted,
+                applied.bytes_deleted
+            ),
+            (
+                preview.ledger_paths,
+                preview.pages_deleted,
+                preview.latest_deleted,
+                preview.bytes_deleted
+            )
+        );
+        assert_eq!(versions(&store, proj, "log-2026-09.md")[0].1, prose_body());
+    }
+}

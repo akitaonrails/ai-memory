@@ -17,6 +17,13 @@ version in [`docs/changelog/`](docs/changelog/):
   or quota. The pause survived restarts and kept pending jobs from spending
   retries before the route could accept work again. ([#2499](https://github.com/akitaonrails/ai-memory/pull/2499))
 
+### Fixed
+
+- Fixed `reclaim-ledger-versions --drop-latest` answering "nothing to reclaim"
+  when only recognized live ledger heads were selected: the preview and the
+  `--confirm` report now count the selected heads' paths and rows, and report
+  heads apart from superseded versions. (#2513)
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
