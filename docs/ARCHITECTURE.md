@@ -1104,6 +1104,7 @@ purge-project               rename-project       move-project
 merge-project               move-session          uninstall
 upgrade                     auth                  user
 completions                 handoffs             purge-session
+backfill-session-summaries
 compact                     api-key              export-okf
 message                     doctor               backfill
 project                     reclaim-ledger-versions  repair-split

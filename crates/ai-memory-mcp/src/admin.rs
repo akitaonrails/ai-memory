@@ -28,6 +28,7 @@
 //! - `POST /admin/purge-project`  — delete a project's rows and wiki files
 //!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
 //! - `POST /admin/purge-session`  — delete one session and what it derived.
+//! - `POST /admin/sessions/backfill-summaries` — preview or backfill ended session summaries.
 //! - `POST /admin/repair-session-times` — correct `started_at`/`ended_at` of
 //!   already-imported sessions from caller-supplied candidate times (the CLI
 //!   computes them from local transcripts; see `ai-memory
@@ -96,6 +97,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
@@ -804,6 +806,10 @@ pub fn admin_router_with_token_tool_retention(
         .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/purge-session", post(handle_purge_session))
+        .route(
+            "/admin/sessions/backfill-summaries",
+            post(handle_session_summary_backfill),
+        )
         .route("/admin/rename-project", post(handle_rename_project))
         .route(
             "/admin/adopt-project-identity",
@@ -4686,6 +4692,164 @@ pub struct PurgeSessionReport {
     /// was touched, no admission webhook ran, and no audit row was written.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+}
+
+/// Request for `POST /admin/sessions/backfill-summaries`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SessionSummaryBackfillRequest {
+    /// Select sessions ended strictly more than this many days ago.
+    pub ended_before_days: u64,
+    /// Maximum number of sessions selected in one request.
+    #[serde(default = "default_backfill_limit")]
+    pub limit: u32,
+    /// Resume after the last session examined by the preceding request.
+    pub after: Option<String>,
+    /// Restrict to this workspace, paired with `project`.
+    pub workspace: Option<String>,
+    /// Restrict to this project, paired with `workspace`.
+    pub project: Option<String>,
+    /// Apply changes. Defaults to preview.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+const fn default_backfill_limit() -> u32 {
+    200
+}
+
+/// Counts and bounded sample returned by the session summary backfill.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct SessionSummaryBackfillReport {
+    /// Number of sessions in the selection.
+    pub selected: usize,
+    /// Summaries planned in preview or applied in a confirmed request.
+    pub substantive: usize,
+    /// Selected sessions that contained only lifecycle markers.
+    pub lifecycle_only: usize,
+    /// Selected substantive sessions whose capture, page, or eligibility moved.
+    pub skipped_changed: usize,
+    /// Up to 20 selected session IDs in selection order.
+    pub sample_session_ids: Vec<SessionId>,
+    /// Pass this cursor as `after` to resume. A short or empty batch returns null.
+    pub next_cursor: Option<String>,
+}
+
+const MAX_SESSION_SUMMARY_BACKFILL_CURSOR_BYTES: usize = 256;
+
+fn decode_session_summary_backfill_cursor(encoded: &str) -> Option<(i64, SessionId)> {
+    if encoded.len() > MAX_SESSION_SUMMARY_BACKFILL_CURSOR_BYTES {
+        return None;
+    }
+    let json = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+async fn handle_session_summary_backfill(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<SessionSummaryBackfillRequest>,
+) -> Result<Json<SessionSummaryBackfillReport>, (StatusCode, Json<serde_json::Value>)> {
+    let bad_request = |message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": message})),
+        )
+    };
+    if req.ended_before_days == 0 {
+        return Err(bad_request("ended_before_days must be at least 1"));
+    }
+    if !(1..=2000).contains(&req.limit) {
+        return Err(bad_request("limit must be between 1 and 2000"));
+    }
+    let after = req
+        .after
+        .as_deref()
+        .map(|cursor| {
+            decode_session_summary_backfill_cursor(cursor).ok_or_else(|| {
+                bad_request("after must be a valid backfill cursor of at most 256 bytes")
+            })
+        })
+        .transpose()?;
+    let scope = match (req.workspace.as_deref(), req.project.as_deref()) {
+        (Some(workspace), Some(project))
+            if !workspace.trim().is_empty() && !project.trim().is_empty() =>
+        {
+            Some(lookup_ws_proj_no_create(&state, workspace, project).await?)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(bad_request(
+                "workspace and project must be provided together and cannot be empty",
+            ));
+        }
+    };
+    let day_us = 86_400_000_000_i128;
+    let now = i128::from(jiff::Timestamp::now().as_microsecond());
+    let cutoff =
+        i64::try_from(now - i128::from(req.ended_before_days) * day_us).unwrap_or(i64::MIN);
+    let candidates = state
+        .reader
+        .session_summary_backfill_candidates(cutoff, req.limit, scope, after)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "session summary backfill selection failed");
+            internal_err("session summary backfill selection failed")
+        })?;
+    let next_cursor = if candidates.len() == req.limit as usize {
+        candidates.last().map(|last| {
+            let position = serde_json::json!([last.ended_at, last.session_id]);
+            URL_SAFE_NO_PAD.encode(position.to_string())
+        })
+    } else {
+        None
+    };
+    let mut report = SessionSummaryBackfillReport {
+        next_cursor,
+        selected: candidates.len(),
+        sample_session_ids: candidates
+            .iter()
+            .take(20)
+            .map(|candidate| candidate.session_id)
+            .collect(),
+        ..Default::default()
+    };
+    // Each candidate uses its own writer transaction, so live ingestion can
+    // interleave throughout the batch.
+    let mut failure = None;
+    for candidate in candidates {
+        if !candidate.substantive {
+            report.lifecycle_only += 1;
+        } else if !req.confirm {
+            report.substantive += 1;
+        } else {
+            let session = candidate.session_id;
+            match ai_memory_hooks::idle_end::backfill_ended_session_summary(
+                &state.reader,
+                &state.writer,
+                &state.wiki,
+                candidate,
+            )
+            .await
+            {
+                Ok(true) => report.substantive += 1,
+                Ok(false) => report.skipped_changed += 1,
+                Err(error) => {
+                    tracing::error!(%session, %error, "session summary backfill failed");
+                    failure = Some(internal_err("session summary backfill failed"));
+                    break;
+                }
+            }
+        }
+    }
+    if req.confirm
+        && report.substantive > 0
+        && let Err(error) = state.wiki.commit_all("backfill ended session summaries")
+    {
+        tracing::warn!(%error, "session summary backfill wiki checkpoint failed");
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(Json(report)),
+    }
 }
 
 /// `POST /admin/purge-session` — delete one session and everything derived
@@ -15640,6 +15804,494 @@ mod tests {
         (tmp, store, router)
     }
 
+    const BACKFILL_ROUTE: &str = "/admin/sessions/backfill-summaries";
+
+    async fn seed_summary_backfill_cursor_fixture(
+        store: &Store,
+        count: usize,
+    ) -> (WorkspaceId, ProjectId, Vec<SessionId>) {
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        let old = jiff::Timestamp::now().as_microsecond() - 60 * 86_400_000_000;
+        let ids: Vec<SessionId> = (1..=count)
+            .map(|index| {
+                format!("00000000-0000-4000-8000-{index:012x}")
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        for (index, &id) in ids.iter().enumerate().rev() {
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: Some(old),
+                    id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                    origin: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(old),
+                        session_id: id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if index + 1 == count {
+                            ObservationKind::UserPrompt
+                        } else {
+                            ObservationKind::SessionStart
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: "Cursor fixture".into(),
+                        body: "Synthetic work behind the lifecycle batch.".into(),
+                        importance: 5,
+                        file_path: None,
+                        trust_class: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .writer
+                .close_abandoned_sessions(old + 1)
+                .await
+                .unwrap(),
+            count as u64
+        );
+        (ws, proj, ids)
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_cursor_crosses_a_full_lifecycle_batch_with_tied_times() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let (ws, proj, ids) = seed_summary_backfill_cursor_fixture(&store, 23).await;
+        let post = |body| admin_call(&router, "POST", BACKFILL_ROUTE, "root-token", Some(body));
+        let first_request = serde_json::json!({"ended_before_days": 30, "limit": 22});
+        let (status, first) = post(first_request.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["selected"], 22);
+        assert_eq!(first["lifecycle_only"], 22);
+        assert_eq!(first["sample_session_ids"], serde_json::json!(&ids[..20]));
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("a full batch must return a cursor");
+        let (status, second) = post(serde_json::json!({
+            "ended_before_days": 30, "limit": 22, "after": cursor
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            second["sample_session_ids"],
+            serde_json::json!([ids[22]]),
+            "the cursor must go after the last examined row, even beyond the ID sample"
+        );
+        assert_eq!(second["selected"], 1);
+        assert_eq!(second["substantive"], 1);
+        assert_eq!(second["lifecycle_only"], 0);
+
+        let mut confirmed = first_request;
+        confirmed["workspace"] = "default".into();
+        confirmed["project"] = "backfill".into();
+        confirmed["confirm"] = true.into();
+        let (status, first_confirmed) = post(confirmed.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first_confirmed, first);
+        confirmed["after"] = cursor.into();
+        let (status, second_confirmed) = post(confirmed.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second_confirmed, second);
+        assert!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, format!("sessions/{}.md", ids[22]))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, format!("sessions/{}.md", ids[21]))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (status, repeat) = post(confirmed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repeat["selected"], 0);
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_cursor_is_null_at_end_of_queue() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        seed_summary_backfill_cursor_fixture(&store, 1).await;
+        let post = |body| admin_call(&router, "POST", BACKFILL_ROUTE, "root-token", Some(body));
+
+        let (status, short) = post(serde_json::json!({"ended_before_days": 30, "limit": 2})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(short["selected"], 1);
+        assert_eq!(
+            short.get("next_cursor"),
+            Some(&serde_json::Value::Null),
+            "a short final batch must explicitly return a null cursor"
+        );
+
+        let (status, full) = post(serde_json::json!({"ended_before_days": 30, "limit": 1})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(full["selected"], 1);
+        let cursor = full["next_cursor"]
+            .as_str()
+            .expect("an exactly full batch returns a cursor");
+        let (status, empty) = post(serde_json::json!({
+            "ended_before_days": 30, "limit": 1, "after": cursor,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(empty["selected"], 0);
+        assert_eq!(
+            empty.get("next_cursor"),
+            Some(&serde_json::Value::Null),
+            "an empty batch must explicitly return a null cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_cursor_rejects_malformed_values() {
+        let (_tmp, router) = user_admin_dual_auth_router("root-token");
+        let encode = |value: &str| URL_SAFE_NO_PAD.encode(value);
+        let valid_id = "00000000-0000-4000-8000-000000000001";
+        for cursor in [
+            String::new(),
+            "not base64!".into(),
+            encode("not JSON"),
+            URL_SAFE_NO_PAD.encode([0xff]),
+            encode("null"),
+            encode("[1]"),
+            encode(r#"[1,"bad UUID"]"#),
+            encode(&format!(r#"["1","{valid_id}"]"#)),
+            encode(&format!(r#"[9223372036854775808,"{valid_id}"]"#)),
+            encode(&format!(r#"[1,"{valid_id}",0]"#)),
+            encode(&format!("{:215}", format!(r#"[1,"{valid_id}"]"#))),
+        ] {
+            let (status, _) = admin_call(
+                &router,
+                "POST",
+                BACKFILL_ROUTE,
+                "root-token",
+                Some(serde_json::json!({"ended_before_days": 1, "after": cursor})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "cursor {cursor:?}");
+        }
+        let max_size = encode(&format!("{:192}", format!(r#"[1,"{valid_id}"]"#)));
+        assert_eq!(max_size.len(), 256);
+        let (status, _) = admin_call(
+            &router,
+            "POST",
+            BACKFILL_ROUTE,
+            "root-token",
+            Some(serde_json::json!({"ended_before_days": 1, "after": max_size})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a valid cursor may use up to 256 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_route_shares_purge_authorization_and_rejects_invalid_requests() {
+        let (_tmp, router) = user_admin_dual_auth_router("root-token");
+        let db_user = issue_api_key(&router, "backfill-reader").await;
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(db_user.as_str()), StatusCode::FORBIDDEN),
+        ] {
+            for uri in [BACKFILL_ROUTE, "/admin/purge-session"] {
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json");
+                if let Some(bearer) = bearer {
+                    builder = builder.header("authorization", format!("Bearer {bearer}"));
+                }
+                let response = router
+                    .clone()
+                    .oneshot(
+                        builder
+                            .body(Body::from(r#"{"ended_before_days":1}"#))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{uri}");
+            }
+        }
+
+        for (body, expected) in [
+            (serde_json::json!({}), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                serde_json::json!({"ended_before_days": -1}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 1.5}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({"ended_before_days": "1"}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 0}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 1, "limit": 0}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 1, "limit": 2001}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 1, "workspace": "default"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 1, "project": "scratch"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 1, "workspace": " ", "project": "scratch"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"ended_before_days": 1, "workspace": "default", "project": "missing"}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let (status, _) = admin_call(
+                &router,
+                "POST",
+                BACKFILL_ROUTE,
+                "root-token",
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(status, expected, "{body}");
+        }
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            BACKFILL_ROUTE,
+            "root-token",
+            Some(serde_json::json!({"ended_before_days": u64::MAX, "limit": 2000})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "selected": 0, "substantive": 0, "lifecycle_only": 0,
+                "skipped_changed": 0, "sample_session_ids": [], "next_cursor": null
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_route_preview_is_read_only_then_confirm_writes_and_retries() {
+        let (tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let day = 86_400_000_000_i64;
+        let mut ids = Vec::new();
+        for index in 0..24 {
+            let id = SessionId::new();
+            let project = if index == 23 { other } else { proj };
+            let ts = now - 60 * day + 10 * index;
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: Some(ts),
+                    id,
+                    workspace_id: ws,
+                    project_id: project,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                    origin: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(ts),
+                        session_id: id,
+                        workspace_id: ws,
+                        project_id: project,
+                        kind: if index == 22 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: "private fixture title".into(),
+                        body: "Private fixture body for the summary.".into(),
+                        importance: 5,
+                        file_path: None,
+                        trust_class: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(
+            store
+                .writer
+                .close_abandoned_sessions(now - 30 * day)
+                .await
+                .unwrap(),
+            24
+        );
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        db.execute("UPDATE sessions SET ended_observation_count = 0", [])
+            .unwrap();
+        let snapshot = || {
+            db.query_row(
+                "SELECT (SELECT COUNT(*) FROM pages), (SELECT COUNT(*) FROM handoffs),
+                        (SELECT COUNT(*) FROM session_consolidation_jobs),
+                        (SELECT COUNT(*) FROM sessions WHERE summary_page_id IS NOT NULL OR ended_observation_count != 0)",
+                [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+            ).unwrap()
+        };
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let path = PagePath::new(format!("sessions/{}.md", ids[0])).unwrap();
+        let file = wiki.abs_path(ws, proj, &path);
+        let scoped = serde_json::json!({"ended_before_days": 30, "workspace": "default", "project": "backfill"});
+        let (status, preview) = admin_call(
+            &router,
+            "POST",
+            BACKFILL_ROUTE,
+            "root-token",
+            Some(scoped.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            snapshot(),
+            (0, 0, 0, 0),
+            "preview must leave the database unchanged"
+        );
+        assert!(!file.exists(), "preview must leave the wiki unchanged");
+        assert_eq!(
+            preview,
+            serde_json::json!({
+                "selected": 23, "substantive": 22, "lifecycle_only": 1,
+                "skipped_changed": 0, "sample_session_ids": &ids[..20], "next_cursor": null
+            })
+        );
+
+        let started = std::time::Instant::now();
+        let mut confirm = scoped.clone();
+        confirm["confirm"] = true.into();
+        let (status, report) = admin_call(
+            &router,
+            "POST",
+            BACKFILL_ROUTE,
+            "root-token",
+            Some(confirm.clone()),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report, preview);
+        assert_eq!(snapshot(), (22, 0, 0, 22));
+        assert_eq!(
+            wiki.read_page(ws, proj, &path).unwrap().frontmatter["session_id"],
+            ids[0].to_string()
+        );
+        let bytes: u64 = ids[..22]
+            .iter()
+            .map(|id| {
+                let path = PagePath::new(format!("sessions/{id}.md")).unwrap();
+                std::fs::metadata(wiki.abs_path(ws, proj, &path))
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        eprintln!("backfill HTTP sample: 22 summaries in {elapsed:?}, {bytes} wiki bytes");
+
+        let prune = store
+            .writer
+            .prune_consolidated_observations(ws, proj, now - 30 * day, 100)
+            .await
+            .unwrap();
+        assert_eq!(prune.deleted, 22);
+        let (status, retry) =
+            admin_call(&router, "POST", BACKFILL_ROUTE, "root-token", Some(confirm)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            retry,
+            serde_json::json!({
+                "selected": 1, "substantive": 0, "lifecycle_only": 1,
+                "skipped_changed": 0, "sample_session_ids": [ids[22]], "next_cursor": null
+            })
+        );
+        let (status, unscoped) = admin_call(
+            &router,
+            "POST",
+            BACKFILL_ROUTE,
+            "root-token",
+            Some(serde_json::json!({"ended_before_days": 30})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            unscoped["sample_session_ids"],
+            serde_json::json!(&ids[22..])
+        );
+    }
+
     async fn post_disable_user(
         router: &Router,
         root_token: &str,
@@ -15841,6 +16493,11 @@ mod tests {
                 "POST",
                 "/admin/purge-project",
                 serde_json::json!({"workspace": "default", "project": "scratch", "confirm": true}),
+            ),
+            (
+                "POST",
+                "/admin/sessions/backfill-summaries",
+                serde_json::json!({"ended_before_days": 30}),
             ),
             (
                 "POST",

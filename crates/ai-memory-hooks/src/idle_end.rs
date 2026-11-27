@@ -42,7 +42,8 @@ use std::collections::HashSet;
 
 use ai_memory_core::{PageId, SessionId};
 use ai_memory_store::{
-    IdleEndAction, IdleEndCandidate, IdleEndResult, PagePrecondition, ReaderPool, WriterHandle,
+    ConditionalUpsert, IdleEndAction, IdleEndCandidate, IdleEndResult, PagePrecondition,
+    ReaderPool, SessionSummaryBackfillCandidate, WriterHandle,
 };
 use ai_memory_wiki::{ConditionalWrite, Wiki, WritePageRequest};
 use tracing::{debug, info, warn};
@@ -329,26 +330,15 @@ async fn summary_page_decision(
         session.session_id,
     )
     .await?;
-    let mut page = synthesize_session_page(
-        session.workspace_id,
-        session.project_id,
+    let request = summary_page_request(
+        input.reader,
+        (session.workspace_id, session.project_id),
         session.session_id,
         session.agent_kind,
+        session.actor_user.clone(),
         &digest,
-    );
-    // Attribute the write to the operator who OWNED the session, read back
-    // from the session row — the server process is the writer, not the
-    // author.
-    let actor = stored_session_identity(session.actor_user.clone())?.1;
-    // Zero-LLM session pages get the same title-collision backstop the LLM and
-    // `memory_write_page` paths already apply (#2300).
-    crate::synth::disambiguate_session_page_title(
-        input.reader,
-        &actor,
-        session.session_id,
-        &mut page,
     )
-    .await;
+    .await?;
     // The precondition is the version the tick SAW WHEN IT READ THE
     // SESSION (the selection), captured before any write in this tick: a
     // real SessionEnd that lands the page after the selection changes the
@@ -357,28 +347,7 @@ async fn summary_page_decision(
         Some(seen) => PagePrecondition::Latest(seen),
         None => PagePrecondition::Absent,
     };
-    match input
-        .wiki
-        .write_page_if(
-            WritePageRequest {
-                workspace_id: page.workspace_id,
-                project_id: page.project_id,
-                path: page.path.clone(),
-                frontmatter: page.frontmatter_json.clone(),
-                body: page.body.clone(),
-                tier: page.tier,
-                pinned: page.pinned,
-                title: None,
-                admission_ctx: None,
-                author_id: None,
-                actor,
-                evidence: Vec::new(),
-                trust_class: page.trust_class,
-            },
-            precondition,
-        )
-        .await
-    {
+    match input.wiki.write_page_if(request, precondition).await {
         Ok(ConditionalWrite::Written(page_id)) => {
             Ok((PageDecision::Written(page_id), observation_count))
         }
@@ -392,6 +361,82 @@ async fn summary_page_decision(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// Backfill a selected substantive session using the idle-end summary.
+///
+/// Returns false if its capture, page, or eligibility changed since selection.
+///
+/// # Errors
+/// Propagates store, wiki, or stored-identity errors.
+pub async fn backfill_ended_session_summary(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: &Wiki,
+    session: SessionSummaryBackfillCandidate,
+) -> anyhow::Result<bool> {
+    let ws = session.workspace_id;
+    let proj = session.project_id;
+    let id = session.session_id;
+    if session.seen_page_id.is_some() && wiki.session_page_written_by_agent(ws, proj, id)? {
+        return Ok(matches!(
+            writer.backfill_session_summary(session, None).await?,
+            ConditionalUpsert::Upserted(_)
+        ));
+    }
+    let (digest, count) = match SessionDigest::load_with_count(reader, ws, proj, id).await {
+        Ok(snapshot) => snapshot,
+        Err(ai_memory_store::StoreError::SessionCollision) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if count != session.observation_count {
+        return Ok(false);
+    }
+    let request = summary_page_request(
+        reader,
+        (ws, proj),
+        id,
+        session.agent_kind,
+        session.actor_user.clone(),
+        &digest,
+    )
+    .await?;
+    Ok(matches!(
+        wiki.write_backfilled_session_summary(request, session)
+            .await?,
+        ConditionalWrite::Written(_)
+    ))
+}
+
+async fn summary_page_request(
+    reader: &ReaderPool,
+    (workspace_id, project_id): (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId),
+    session_id: SessionId,
+    agent_kind: ai_memory_core::AgentKind,
+    actor_user: Option<String>,
+    digest: &SessionDigest,
+) -> anyhow::Result<WritePageRequest> {
+    let mut page =
+        synthesize_session_page(workspace_id, project_id, session_id, agent_kind, digest);
+    // The persisted session owner, rather than the maintenance caller, is
+    // the author and the identity used by the title collision backstop.
+    let actor = stored_session_identity(actor_user)?.1;
+    crate::synth::disambiguate_session_page_title(reader, &actor, session_id, &mut page).await;
+    Ok(WritePageRequest {
+        workspace_id: page.workspace_id,
+        project_id: page.project_id,
+        path: page.path,
+        frontmatter: page.frontmatter_json,
+        body: page.body,
+        tier: page.tier,
+        pinned: page.pinned,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor,
+        evidence: Vec::new(),
+        trust_class: page.trust_class,
+    })
 }
 
 /// The session page path, the same `sessions/<id>.md` rule the rest of the

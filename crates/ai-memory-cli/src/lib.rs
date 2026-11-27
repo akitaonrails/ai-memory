@@ -246,6 +246,9 @@ async fn dispatch(
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
         Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
+        Command::BackfillSessionSummaries(args) => {
+            commands::backfill_session_summaries::run(&config, args).await
+        }
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::RepairSplit(args) => commands::repair_split::run(&config, args).await,
         Command::MoveProject(args) => commands::move_project::run(&config, args).await,

@@ -3828,7 +3828,7 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for any filesystem, parsing, or store error.
     pub async fn write_page(&self, req: WritePageRequest) -> WikiResult<PageId> {
-        match self.write_page_inner(req, None).await? {
+        match self.write_page_inner(req, None, None).await? {
             ConditionalWrite::Written(id) => Ok(id),
             ConditionalWrite::Mismatch { .. } => Err(ai_memory_wiki_error(
                 "an unconditional page write reported a precondition mismatch",
@@ -3853,13 +3853,39 @@ impl Wiki {
         req: WritePageRequest,
         precondition: PagePrecondition,
     ) -> WikiResult<ConditionalWrite> {
-        self.write_page_inner(req, Some(precondition)).await
+        self.write_page_inner(req, Some(precondition), None).await
+    }
+
+    /// Write a rule-based summary and attach it to the selected ended session.
+    /// A lost session CAS rolls back both the index mutation and the installed file.
+    ///
+    /// # Errors
+    /// As [`Self::write_page`].
+    pub async fn write_backfilled_session_summary(
+        &self,
+        req: WritePageRequest,
+        candidate: ai_memory_store::SessionSummaryBackfillCandidate,
+    ) -> WikiResult<ConditionalWrite> {
+        let precondition = candidate
+            .seen_page_id
+            .map_or(PagePrecondition::Absent, PagePrecondition::Latest);
+        // Complete the single file/SQLite write even if the request future
+        // is dropped while the writer owns its command. A normal response
+        // waits for this task, and cancellation never starts further pages.
+        let wiki = self.clone();
+        tokio::spawn(async move {
+            wiki.write_page_inner(req, Some(precondition), Some(candidate))
+                .await
+        })
+        .await
+        .map_err(|error| WikiError::Io(std::io::Error::other(error)))?
     }
 
     async fn write_page_inner(
         &self,
         req: WritePageRequest,
         precondition: Option<PagePrecondition>,
+        backfill: Option<ai_memory_store::SessionSummaryBackfillCandidate>,
     ) -> WikiResult<ConditionalWrite> {
         self.confined_page_path(
             req.workspace_id,
@@ -3915,7 +3941,11 @@ impl Wiki {
         // frontmatter/body here propagate to both the on-disk markdown
         // (via emit below) and the store's `frontmatter_json` / `body`
         // (via the upsert below) atomically. See `crate::admission`.
-        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+        // A backfill is an internal, deterministic repair without provider
+        // calls or asynchronous notifications.
+        let resolved_ctx = if backfill.is_none()
+            && let Some(chain) = &self.admission_chain
+        {
             let mut ctx = admission_ctx.unwrap_or_default();
             // Single identity source: the webhook actor is the same
             // `ActorContext` used for on-disk attribution (req.actor),
@@ -3974,6 +4004,7 @@ impl Wiki {
             body: final_body.clone(),
         })?;
 
+        let is_backfill = backfill.is_some();
         let page_id = {
             let _guard = self.mutation_lock.read().await;
             // Serialize with any concurrent write to this same path, so the
@@ -3982,8 +4013,10 @@ impl Wiki {
             // (#607). Different paths still proceed concurrently.
             let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
             self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
-            self.ensure_project_workspace(workspace_id, project_id)
-                .await?;
+            if !is_backfill {
+                self.ensure_project_workspace(workspace_id, project_id)
+                    .await?;
+            }
             if let (Some(precondition), Some(reader)) = (precondition, &self.store_reader) {
                 let current = reader
                     .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
@@ -4012,16 +4045,26 @@ impl Wiki {
                 evidence,
                 trust_class,
             };
-            let written = match precondition {
-                None => self
+            let written = match (backfill, precondition) {
+                (Some(candidate), _) => {
+                    self.writer
+                        .backfill_session_summary(candidate, Some(page))
+                        .await
+                }
+                (None, None) => self
                     .writer
                     .upsert_page(page)
                     .await
                     .map(ConditionalUpsert::Upserted),
-                Some(precondition) => self.writer.upsert_page_if(page, precondition).await,
+                (None, Some(precondition)) => self.writer.upsert_page_if(page, precondition).await,
             };
             match written {
-                Ok(ConditionalUpsert::Upserted(id)) => id,
+                Ok(ConditionalUpsert::Upserted(id)) => {
+                    if is_backfill {
+                        self.ensure_scope_manifests(workspace_id, project_id).await;
+                    }
+                    id
+                }
                 Ok(ConditionalUpsert::Mismatch { current }) => {
                     rollback_or_inconsistent(
                         &self.git,
@@ -4040,8 +4083,10 @@ impl Wiki {
         // tool reply still happens "indexes commit in the same
         // transaction" (basic-memory #763 lesson): no fire-and-forget
         // background embedding.
-        self.embed_page_version(page_id, &final_body, abstract_text.as_deref())
-            .await?;
+        if !is_backfill {
+            self.embed_page_version(page_id, &final_body, abstract_text.as_deref())
+                .await?;
+        }
 
         // Non-blocking webhooks fire-and-forget only after the page has landed
         // on disk and the DB/index write has succeeded. They observe the final
@@ -4744,6 +4789,114 @@ mod tests {
         StageAutoImproveRun, Store,
     };
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn summary_backfill_rolls_back_the_wiki_file_if_the_session_cas_loses() {
+        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, Sanitized};
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        let id = SessionId::new();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let old = now - 100;
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(old),
+                id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+        let observe = |kind| {
+            store.writer.insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(old),
+                    session_id: id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind,
+                    extension: None,
+                    source_event: None,
+                    title: "fixture".into(),
+                    body: "fixture work".into(),
+                    importance: 5,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+        };
+        observe(ObservationKind::UserPrompt).await.unwrap();
+        store.writer.close_abandoned_sessions(now).await.unwrap();
+        let path = PagePath::new(format!("sessions/{id}.md")).unwrap();
+        let candidate = || async {
+            store
+                .reader
+                .session_summary_backfill_candidates(now, 1, None, None)
+                .await
+                .unwrap()
+                .remove(0)
+        };
+        let stale = candidate().await;
+        observe(ObservationKind::Stop).await.unwrap();
+        let request = || WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter: serde_json::json!({"session_id": id.to_string()}),
+            body: "summary".into(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: vec![],
+            trust_class: None,
+        };
+        assert!(matches!(
+            wiki.write_backfilled_session_summary(request(), stale)
+                .await
+                .unwrap(),
+            ConditionalWrite::Mismatch { current: None }
+        ));
+        assert!(!wiki.abs_path(ws, proj, &path).exists());
+        assert!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let fresh = candidate().await;
+        assert!(matches!(
+            wiki.write_backfilled_session_summary(request(), fresh)
+                .await
+                .unwrap(),
+            ConditionalWrite::Written(_)
+        ));
+        assert!(wiki.abs_path(ws, proj, &path).is_file());
+    }
 
     struct StoreFailingEmbedder {
         db_path: PathBuf,

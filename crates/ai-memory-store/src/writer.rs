@@ -193,6 +193,12 @@ pub(crate) enum WriteCmd {
         precondition: ops::PagePrecondition,
         reply: oneshot::Sender<StoreResult<ops::ConditionalUpsert>>,
     },
+    /// Atomically write or attach a summary and stamp its ended session.
+    BackfillSessionSummary {
+        candidate: crate::SessionSummaryBackfillCandidate,
+        page: Option<Box<NewPage>>,
+        reply: oneshot::Sender<StoreResult<ops::ConditionalUpsert>>,
+    },
     UpsertPageBatch {
         pages: Vec<NewPage>,
         reply: oneshot::Sender<StoreResult<Vec<PageId>>>,
@@ -3412,6 +3418,26 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically write or attach the selected summary and stamp its ended
+    /// session. Returns a mismatch when the session or page moved.
+    ///
+    /// # Errors
+    /// Propagates store or writer errors.
+    pub async fn backfill_session_summary(
+        &self,
+        candidate: crate::SessionSummaryBackfillCandidate,
+        page: Option<NewPage>,
+    ) -> StoreResult<ops::ConditionalUpsert> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::BackfillSessionSummary {
+            candidate,
+            page: page.map(Box::new),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Delete every version of a page (by path) from the index. The wiki file
     /// removal is the caller's concern; this drops the derived rows so the
     /// page stops appearing in search/recent (the watcher does NOT reconcile
@@ -4692,6 +4718,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::upsert_page_if(&mut conn, &page, precondition);
                 send_or_warn(reply, result, "upsert_page_if");
+            }
+            WriteCmd::BackfillSessionSummary {
+                candidate,
+                page,
+                reply,
+            } => {
+                let result = ops::backfill_session_summary(&mut conn, &candidate, page.as_deref());
+                send_or_warn(reply, result, "backfill_session_summary");
             }
             WriteCmd::DeletePage {
                 workspace_id,

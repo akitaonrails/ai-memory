@@ -1570,6 +1570,29 @@ pub struct IdleOpenSession {
     pub seen_page_id: Option<PageId>,
 }
 
+/// An ended session and its observed generation at backfill selection.
+#[derive(Debug, Clone)]
+pub struct SessionSummaryBackfillCandidate {
+    /// Session id.
+    pub session_id: SessionId,
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Harness that opened the session.
+    pub agent_kind: AgentKind,
+    /// Stored operator identity, if any.
+    pub actor_user: Option<String>,
+    /// Original end timestamp, in Unix microseconds.
+    pub ended_at: i64,
+    /// Count across all scopes, matching the retention watermark.
+    pub observation_count: i64,
+    /// Whether the session contains more than lifecycle markers.
+    pub substantive: bool,
+    /// Latest version of the canonical summary path at selection.
+    pub seen_page_id: Option<PageId>,
+}
+
 /// A session's latest captured work in one scope, as listed by
 /// [`ReaderPool::recent_session_activity`]. Ordered by work, not by when the
 /// session started or ended: a harness that resumes an old session, or one
@@ -7342,6 +7365,82 @@ impl ReaderPool {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Read a bounded, oldest-first batch of ended sessions missing a summary.
+    ///
+    /// The page precondition and observation count are from the same read
+    /// snapshot as selection. `after` resumes strictly beyond the given end
+    /// timestamp and session id. This method has no write effects.
+    pub async fn session_summary_backfill_candidates(
+        &self,
+        cutoff_us: i64,
+        limit: u32,
+        scope: Option<(WorkspaceId, ProjectId)>,
+        after: Option<(i64, SessionId)>,
+    ) -> StoreResult<Vec<SessionSummaryBackfillCandidate>> {
+        self.with_conn(move |conn| {
+            let (after_ended_at, after_session_id) = after.unzip();
+            let after_session_id = after_session_id.as_ref().map(|id| &id.as_bytes()[..]);
+            let scope_filter = if scope.is_some() {
+                "AND s.workspace_id = ?5 AND s.project_id = ?6"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "WITH selected AS MATERIALIZED (
+                    SELECT s.*, lower(hex(s.id)) AS hex_id FROM sessions s
+                    WHERE s.ended_at < ?1 AND s.summary_page_id IS NULL
+                      AND EXISTS (SELECT 1 FROM observations WHERE session_id = s.id)
+                      AND NOT EXISTS (SELECT 1 FROM purged_sessions WHERE session_id = s.id)
+                      AND {BACKFILL_SCOPE_AND_JOB_AVAILABLE}
+                      AND (?3 IS NULL OR (s.ended_at, s.id) > (?3, ?4))
+                      {scope_filter}
+                    ORDER BY s.ended_at, s.id LIMIT ?2
+                )
+                SELECT s.id, s.workspace_id, s.project_id, s.agent_kind, s.actor_user, s.ended_at,
+                       (SELECT COUNT(*) FROM observations WHERE session_id = s.id),
+                       EXISTS(SELECT 1 FROM observations WHERE session_id = s.id
+                              AND {SUBSTANTIVE_OBSERVATION_KIND_SQL}),
+                       (SELECT p.id FROM pages p
+                        WHERE p.workspace_id = s.workspace_id AND p.project_id = s.project_id
+                          AND p.is_latest = 1
+                          AND p.path = 'sessions/' || substr(s.hex_id, 1, 8) || '-' ||
+                              substr(s.hex_id, 9, 4) || '-' || substr(s.hex_id, 13, 4) || '-' ||
+                              substr(s.hex_id, 17, 4) || '-' || substr(s.hex_id, 21, 12) || '.md')
+                FROM selected s ORDER BY s.ended_at, s.id",
+                BACKFILL_SCOPE_AND_JOB_AVAILABLE = crate::ops::BACKFILL_SCOPE_AND_JOB_AVAILABLE,
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = match scope.as_ref() {
+                Some((ws, proj)) => stmt.query(params![
+                    cutoff_us,
+                    limit,
+                    after_ended_at,
+                    after_session_id,
+                    ws.as_bytes(),
+                    proj.as_bytes()
+                ])?,
+                None => stmt.query(params![cutoff_us, limit, after_ended_at, after_session_id])?,
+            };
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                let page: Option<Vec<u8>> = row.get(8)?;
+                result.push(SessionSummaryBackfillCandidate {
+                    session_id: SessionId::from_slice(&row.get::<_, Vec<u8>>(0)?)?,
+                    workspace_id: WorkspaceId::from_slice(&row.get::<_, Vec<u8>>(1)?)?,
+                    project_id: ProjectId::from_slice(&row.get::<_, Vec<u8>>(2)?)?,
+                    agent_kind: AgentKind::from_wire(&row.get::<_, String>(3)?),
+                    actor_user: row.get(4)?,
+                    ended_at: row.get(5)?,
+                    observation_count: row.get(6)?,
+                    substantive: row.get(7)?,
+                    seen_page_id: page.as_deref().map(PageId::from_slice).transpose()?,
+                });
+            }
+            Ok(result)
         })
         .await
     }
