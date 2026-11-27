@@ -11,6 +11,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved query signals when a project purge received a mismatched workspace and project ID.
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
