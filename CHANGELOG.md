@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Hardened the user-mode systemd unit with the filesystem, kernel and
+  privilege protections the system unit already had (`ProtectSystem=full`,
+  `UMask=0077`, kernel/control-group restrictions). The unit still runs as the
+  invoking user with a writable data directory.
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed

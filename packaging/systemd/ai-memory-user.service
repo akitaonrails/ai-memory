@@ -10,6 +10,16 @@ Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
 PrivateTmp=true
+UMask=0077
+# `full` (not `strict`): the data directory lives under the user's home, so
+# keep home writable while making /usr, /boot and /etc read-only.
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=default.target
