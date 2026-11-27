@@ -54,6 +54,14 @@ version in [`docs/changelog/`](docs/changelog/):
   session selectors, preventing linked-session overrides and preserving exact
   `finalize-session` targeting on exit. (#2522)
 
+### Fixed
+
+- Updated `install-hooks --agent antigravity-cli` finalization guidance and the
+  Antigravity / Command Code documentation in `docs/support-matrix.md` and
+  `docs/managed-workstreams.md` to cover `ai-memory run` automatic
+  finalization (interactive and headless), `[sessions] idle_end_after_hours`,
+  and headless `agy -p --output-format json` `conversation_id` finalization.
+
 ## [3.6.3] - 2026-11-26
 
 ### Fixed
