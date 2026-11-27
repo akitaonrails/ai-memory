@@ -13,6 +13,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added `ai-memory delete-page --dry-run`, which resolves the target and prints the workspace, project and exact path it would delete without sending a request. The default stays a delete, so existing scripts keep working. ([#2538](https://github.com/akitaonrails/ai-memory/pull/2538))
+
 - Added `ai-memory backfill-session-summaries` and its admin endpoint to
   preview and repair ended sessions missing a summary, so observation
   retention can prune their old capture after the rule-based page is saved.
@@ -187,6 +189,7 @@ version in [`docs/changelog/`](docs/changelog/):
   stopped `session.compaction.started` from clearing an already-armed
   anchor, so step 1 carries the anchor and `system` stays identical across
   steps to preserve the prompt cache. (#2551)
+
 
 ## [3.6.4] - 2026-11-27
 

@@ -189,6 +189,7 @@ cli-help-root-delete-page-about = { "Excluir uma página da wiki. O servidor res
 cli-help-root-delete-page-path-help = { "Caminho exato da página a excluir (ex.: `notes/foo.md`)" }
 cli-help-root-delete-page-workspace-help = { "Nome do espaço de trabalho. Por padrão, usa `workspace` do marcador `.ai-memory.toml` mais próximo ou `default`. A resolução é informada em stderr para que colisões de nomes entre espaços de trabalho não direcionem a exclusão silenciosamente ao destino errado" }
 cli-help-root-delete-page-project-help = { "Nome do projeto. Se omitido, derivado do projeto atual (mesma heurística de write-page/read-page)" }
+cli-help-root-delete-page-dry-run-help = { "Exibe o destino e sai sem excluir" }
 cli-help-root-serve-about = { "Executar o servidor MCP (com monitor de arquivos) por stdio ou HTTP" }
 cli-help-root-serve-enable-management-ui-help = { "Habilitar o console de gerenciamento renderizado no servidor em /manage (exige a feature de build management-ui)" }
 cli-help-root-serve-enable-session-management-help = { "Servir rotas `/management/v1` de inspeção e exclusão de sessões próprias a usuários autenticados no navegador. Desabilitado por padrão; exige `--transport http`" }

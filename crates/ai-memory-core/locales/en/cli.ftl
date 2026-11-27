@@ -52,6 +52,7 @@ cli-continue-session-checkout-now-resolves-to = checkout now resolves to { $valu
 cli-curator-choose-either-dry-run-or-stage-not-both = choose either --dry-run or --stage, not both
 cli-delete-page-path-was-passed-empty-specify-the-wiki-page-path-to-delete = --path was passed empty; specify the wiki page path to delete
 cli-delete-page-under = { $value0 } { $value1 } under { $value2 }/{ $value3 }
+cli-delete-page-dry-run-would-delete = delete-page --dry-run: would delete { $value0 } under { $value1 }/{ $value2 }
 cli-doctor-resolving-the-current-working-directory = resolving the current working directory
 cli-doctor-invalid-home-route-map-doctor-did-not-query-a-fallback-server-scope = invalid home route map; doctor did not query a fallback server scope
 cli-embed-dry-run-would-embed-would-page-s-skipped-already-up-to-date = dry-run: would embed { $value0 } page(s), { $value1 } already up-to-date
