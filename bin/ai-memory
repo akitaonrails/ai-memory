@@ -896,10 +896,10 @@ case "${WRAPPER_SUBCOMMAND}" in
       WRITES_HOST_FILES=1
       ;;
     # uninstall edits the same host agent-config files the install-*
-    # commands write; backup writes its tarball to a host path. Both go
-    # through the same $HOME/$PWD bind mounts, so they need the same
+    # commands write. Backups and agent-asset restores also write to host
+    # paths through the same $HOME/$PWD bind mounts, so they need the same
     # rootless-Docker UID treatment.
-    install-instructions | install-skills | uninstall | backup)
+    install-instructions | install-skills | uninstall | backup | backup-agents | restore-agents)
       WRITES_HOST_FILES=1
       ;;
 esac

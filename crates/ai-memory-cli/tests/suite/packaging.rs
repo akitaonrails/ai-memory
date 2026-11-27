@@ -3378,6 +3378,8 @@ mod slow {
             "uninstall",
             "backup",
             "restore",
+            "backup-agents",
+            "restore-agents",
         ] {
             let args = run_wrapper_with_fake_docker(&[subcommand], rootless_info);
             assert!(
@@ -3454,6 +3456,8 @@ mod slow {
             "uninstall",
             "backup",
             "restore",
+            "backup-agents",
+            "restore-agents",
         ] {
             let args = run_wrapper_with_fake_selinux(&[subcommand], selinux_info, "Enforcing");
             assert!(
@@ -3931,6 +3935,8 @@ mod slow {
             "uninstall",
             "backup",
             "restore",
+            "backup-agents",
+            "restore-agents",
         ] {
             let args = run_wrapper_with_fake_podman(&[subcommand], true, true, "Enforcing");
             assert!(

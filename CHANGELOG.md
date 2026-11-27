@@ -41,6 +41,14 @@ version in [`docs/changelog/`](docs/changelog/):
   ended-session consolidation jobs key their generation on
   `ended_observation_count`. (#2504)
 
+### Fixed
+
+- Applied host-file permissions to `backup-agents` and `restore-agents` in
+  the POSIX container wrapper. Rootless Docker and Podman can now read and
+  write agent assets and archives under the invoking user's bind mounts.
+  These commands also use the existing host-file treatment on
+  SELinux-enforcing hosts.
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
