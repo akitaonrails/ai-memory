@@ -406,7 +406,7 @@ mod quota {
             .expect_err("nothing answers");
         let rendered = err.to_string();
         assert!(
-            matches!(err, LlmError::AllCandidatesFailed { attempted: 3, .. }),
+            matches!(err, LlmError::FallbackQuotaExhausted { attempted: 3, .. }),
             "{rendered}"
         );
         assert!(
