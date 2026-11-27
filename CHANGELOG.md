@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Named the workspace and project when pending writes were empty.
+- Included the source page in skipped relation warnings.
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed

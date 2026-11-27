@@ -544,7 +544,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `memory_auto_improve` | Manually review the newest completed session with no persisted auto-improvement run, or explicitly rerun a named session, and apply or stage validated proposals through the same path. An empty run records a preflight skip so the next implicit call advances. |
 | `ai-memory curator` | Rule-based, report-only maintenance review. |
 | `ai-memory curator --stage` | Stage exactly one curator report page for pending-writes approval. |
-| `ai-memory pending-writes list` | Show staged wiki changes. |
+| `ai-memory pending-writes list` | Show staged wiki changes in one workspace and project; an empty answer names the scope it read. |
 | `ai-memory pending-writes diff <id>` | Show markdown diff. |
 | `ai-memory pending-writes approve <id>` | Apply through the normal wiki mutation path. |
 | `ai-memory pending-writes reject <id>` | Discard proposal with audit trail. |
