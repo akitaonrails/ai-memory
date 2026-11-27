@@ -5,6 +5,7 @@
 mod abstract_backfill;
 mod access_breadth_sweep;
 mod aging_lifecycle;
+mod auto_improve_compaction;
 mod bounded_session_load;
 mod cold_cluster_sweep;
 mod compaction_sweep;

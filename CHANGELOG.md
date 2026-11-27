@@ -24,6 +24,18 @@ version in [`docs/changelog/`](docs/changelog/):
   token calls older than the cutoff, in bounded batches per scope. Token calls
   and `session_usage` totals are kept. (#2514)
 
+- Auto-improve review prompt compaction: before sampling observations for a
+  per-session review, positively identified machine-generated `## Raw
+  observations` index blocks on the session page are compacted to a count/range
+  note (preserving human-authored Markdown under the same heading), known empty
+  hook envelopes (`PreToolUse`, empty `SessionStart`, empty `Stop`, and
+  non-error empty/`(no output captured)` `PostToolUse`) are collapsed before
+  sampling, and recovered prompt budget is reallocated to render substantive
+  observation bodies unclipped up to 8,000 chars before falling back to
+  1,500-char clipping. Stored session pages, SQLite observations,
+  consolidation, streaming memory bounds, and tool-result-only provenance
+  gating are unchanged. (#2532)
+
 - Pi tool description and parameter overrides (`pi_tool_overrides` /
   `AI_MEMORY_PI_TOOL_OVERRIDES`): operators can point to a JSON file relative
   to the config directory (confined to that directory, max 64 KiB) to shorten
