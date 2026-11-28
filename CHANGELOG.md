@@ -51,6 +51,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Preserved query signals when a project purge received a mismatched workspace and project ID (#2541).
 
+### Fixed
+
+- Named the workspace and project when pending writes were empty (#2542).
+- Included the source page in skipped relation warnings (#2542).
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed

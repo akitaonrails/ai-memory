@@ -2012,6 +2012,56 @@ mod tests {
         );
     }
 
+    /// The #1975 skip is what stops a page with an invalid `relations:` target
+    /// from logging on every tick, and only the pass that indexes the file
+    /// logs: once per process for a stable file, and again after an edit.
+    #[tokio::test]
+    async fn reconcile_warns_about_an_invalid_relation_only_when_it_indexes_the_page() {
+        let (log, _guard, _companion) = crate::markdown::log_capture::capture_warns();
+        let (tmp, _store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("carrier.md");
+        std::fs::write(
+            &page,
+            "---\ntitle: Carrier\nrelations:\n  fixes: [\"notes/draft.txt\"]\n---\n\nfirst\n",
+        )
+        .unwrap();
+        let warnings = || {
+            log.text()
+                .lines()
+                .filter(|line| {
+                    line.contains("relation target is not a page") && line.contains("carrier.md")
+                })
+                .count()
+        };
+
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+            .await
+            .unwrap();
+        assert_eq!(warnings(), 1, "the indexing pass names the page once");
+
+        for _ in 0..3 {
+            reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+                .await
+                .unwrap();
+        }
+        assert_eq!(warnings(), 1, "idle passes must stay silent");
+
+        std::fs::write(
+            &page,
+            "---\ntitle: Carrier\nrelations:\n  fixes: [\"notes/draft.txt\"]\n---\n\nsecond, longer\n",
+        )
+        .unwrap();
+        reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
+            .await
+            .unwrap();
+        assert_eq!(warnings(), 2, "an edited page is reported again");
+    }
+
     /// Git's racily-clean rule for the #1975 skip: a fingerprint whose mtime
     /// is not yet older than [`RACY_FINGERPRINT_WINDOW`] at the start of the
     /// pass cannot prove the file unchanged, because a same-length edit
