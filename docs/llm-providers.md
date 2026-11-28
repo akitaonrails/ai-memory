@@ -59,7 +59,7 @@ Recommended defaults:
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
 | `vertex` | `gemini-3.5-flash` | The same Gemini models through Vertex AI, billed to a Google Cloud project (Cloud credits apply). Uses `gcloud` Application Default Credentials; no API key. |
 | `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
-| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Standard Compute, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Standard Compute, LLMTR, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 | `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
@@ -722,7 +722,7 @@ non-English wikis; both 384-dim), with the model fetched once into
 [`docs/local-embeddings.md`](local-embeddings.md).
 
 See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
-for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra/Standard Compute
+for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra/Standard Compute/LLMTR
 examples, and
 [`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.

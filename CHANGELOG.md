@@ -56,6 +56,10 @@ version in [`docs/changelog/`](docs/changelog/):
 - Named the workspace and project when pending writes were empty (#2542).
 - Included the source page in skipped relation warnings (#2542).
 
+### Changed
+
+- Documented LLMTR as an endpoint for the existing `openai-compat` provider.
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
