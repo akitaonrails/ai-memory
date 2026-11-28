@@ -86,7 +86,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Added a background mode to `POST /admin/compact` (`"background": true`,
   answered `202`) and a `GET /admin/compact` status route, so a compaction that
   outlasts a proxy timeout is followed instead of cut off with `524`. Both forms
-  share one single-flight slot and answer `409` while a compaction runs.
+  share one single-flight slot and answer `409` while a compaction runs (#2547).
 
 ### Fixed
 
