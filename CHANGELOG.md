@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Validated the scope of a `/api/v1/search` request before answering a blank
+  `q`. A blank query with only `workspace` or only `project`, with more than
+  25 `scopes`, or with an unknown project answered `200 []`; it now gets the
+  same `400` or `404` as a request with a search term. A blank query with a
+  valid scope, or none, still answers `200 []`. (#2563)
+
 ## [3.6.5] - 2026-11-28
 
 ### Security
