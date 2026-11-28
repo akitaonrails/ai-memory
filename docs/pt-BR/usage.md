@@ -208,7 +208,7 @@ instruções instaladas, como os harnesses na última linha abaixo.
 | Codex | Automático (hook nativo): `SessionStart` com origem `compact`, como contexto de desenvolvedor antes da próxima solicitação ao modelo |
 | Factory Droid | Automático (hook nativo): `SessionStart` com origem `compact`, anexado ao novo contexto de sessão |
 | OpenCode V1 | Automático: o hook `experimental.session.compacting` adiciona uma linha a `output.context` solicitando ao resumo que mantenha o id da sessão e aponte para o ai-memory, e `session.compacted` arma a âncora para a transformação de sistema até a próxima compactação |
-| OpenCode V2 | Automático: o hook `compaction` adiciona a mesma linha como uma parte `system`, e `session.compaction.ended` arma a âncora para o hook `context` até a próxima compactação |
+| OpenCode V2 | Automático: o hook `compaction` adiciona a mesma linha como uma parte `system`, e o hook `context` arma a âncora pela mensagem `<conversation-checkpoint>` que abre o histórico, de modo que ela vai em toda chamada ao modelo desde a primeira até a próxima compactação |
 | Gemini CLI, Cursor, GitHub Copilot CLI, Kimi Code, Grok Build, Kiro CLI, Cline, Muse Code e os demais | Apenas instruções: esses harnesses não possuem hook que possa adicionar contexto após uma compactação (o Muse relata uma origem `compact`, mas seu contrato de saída não foi publicado, de modo que seu início por compactação apenas ignora a reivindicação de handoff), portanto o agente segue as instruções instaladas e lê os prompts de sua própria sessão |
 
 Quando nenhuma âncora chega, o agente chama `memory_read_session_observations`
