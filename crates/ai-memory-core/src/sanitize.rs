@@ -1430,6 +1430,73 @@ mod tests {
         }
     }
 
+    /// GitLab, npm and PyPI tokens were redacted only beside a name another
+    /// rule knows (`GITLAB_TOKEN=`, `Private-Token:`, `_authToken=`,
+    /// `password =`). On a command line, in a prompt or after a short
+    /// `token:` key they reached storage verbatim: the key/value rules need an
+    /// auth word followed by `=` or `:`, and the bare `token` rule needs 32
+    /// characters.
+    #[test]
+    fn scrubs_gitlab_npm_and_pypi_tokens() {
+        let s = s();
+        // Every GitLab prefix the rule names, behind a flag that no other
+        // rule reads as a credential. Each token is put together at run time:
+        // GitHub's push protection blocks several of these shapes as literals.
+        for prefix in [
+            "glpat", "gldt", "glrt", "glrtr", "glcbt", "glptt", "glft", "glwt", "gloas", "glsoat",
+            "glagent", "glffct",
+        ] {
+            let raw = format!("--token {prefix}-FAKEfake0123456789ab");
+            assert_eq!(s.scrub(&raw), "--token [REDACTED:gitlab_token]", "{raw}");
+        }
+        for (raw, redacted) in [
+            (
+                "glab auth login --hostname gitlab.example.org --token glpat-FAKEfake0123456789ab",
+                "glab auth login --hostname gitlab.example.org --token [REDACTED:gitlab_token]",
+            ),
+            // 26 characters, under the bare `token` rule's 32-character floor.
+            (
+                "token: glpat-FAKEfake0123456789ab",
+                "token: [REDACTED:gitlab_token]",
+            ),
+            (
+                "npm token revoke npm_FAKEfake0123456789abcdefghijklmnopqr",
+                "npm token revoke [REDACTED:npm_token]",
+            ),
+            (
+                "uv publish --token pypi-AgEIcHlwaS5vcmcFAKEfake0123456789FAKEfake0123456789abcdefghij",
+                "uv publish --token [REDACTED:pypi_token]",
+            ),
+            // TestPyPI: the macaroon's location field holds test.pypi.org.
+            (
+                "poetry config pypi-token.testpypi pypi-AgENdGVzdC5weXBpLm9yZwFAKEfake0123456789FAKEfake0123456789",
+                "poetry config pypi-token.testpypi [REDACTED:pypi_token]",
+            ),
+        ] {
+            assert_eq!(s.scrub(raw), redacted, "{raw}");
+        }
+    }
+
+    /// The control for the test above: text that shares a prefix with a
+    /// GitLab, npm or PyPI token without being one survives byte for byte.
+    #[test]
+    fn leaves_gitlab_npm_and_pypi_lookalikes_alone() {
+        let s = s();
+        for text in [
+            // A placeholder too short to be a token.
+            "replace glpat-xxxx with your token",
+            // `glimt` is a word, not one of the prefixes.
+            "https://example.com/sport/bodo-glimt-wins-the-champions-league-final",
+            // npm's own environment variables.
+            "npm_config_cache=/home/user/.npm npm_lifecycle_event=build",
+            // Hyphenated PyPI names, with no macaroon behind the prefix.
+            "uses: pypa/gh-action-pypi-publish@release/v1",
+            "docs/pypi-trusted-publishing-with-github-actions-and-oidc-tokens.md",
+        ] {
+            assert_eq!(s.scrub(text), text, "{text}");
+        }
+    }
+
     /// The strip runs before storage and cannot be undone, so a pattern that
     /// over-matches destroys captured content silently. Every other test here
     /// asserts that a secret IS redacted; these assert that ordinary text is
