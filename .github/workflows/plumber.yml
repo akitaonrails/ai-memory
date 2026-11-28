@@ -1,0 +1,43 @@
+name: plumber
+
+# Scans the workflows in this directory with the Plumber CLI and fails when
+# they drift: a checkout that keeps the job token, an installer piped into a
+# shell, a job without a token scope, an action that is not pinned by commit.
+# What is specific to this repository sits in .plumber.yaml at the root.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Same rule as ci.yml: a newer push to a pull request cancels its in-flight
+# run, a push to main runs to completion.
+concurrency:
+  group: plumber-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scan:
+    name: workflow scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Plumber reads the workflow states and one run log to work out what the
+      # job tokens can really do.
+      actions: read
+      # The findings go to code scanning.
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: getplumber/plumber@ec8cb3a7edd6a324b33e85109b627b2df6023d94 # v0.7.23
+        with:
+          # Out of 100. The action's default fails on any single finding.
+          min-points: 85
+          # A pull request from a fork gets a read-only token, so it skips the
+          # code scanning upload and keeps the rest of the scan.
+          upload-sarif: ${{ github.event.pull_request.head.repo.fork != true }}

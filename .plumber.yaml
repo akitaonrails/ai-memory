@@ -1,0 +1,18 @@
+# Plumber configuration: the built-in defaults plus what this repository needs.
+extends: plumber:default
+version: "2.0"
+
+github:
+  controls:
+    githubActionMustComeFromAuthorizedSources:
+      includePlumberDefaults: true
+      # Third-party actions the workflows use, on top of the default trust list.
+      trustedGithubActions:
+        - Swatinem/rust-cache
+        - dorny/paths-filter
+        - taiki-e/install-action
+    # Off because main and the release/* branches have no protection rule
+    # today, a repository setting no pull request can change. Remove this
+    # block once a rule covers them.
+    branchMustBeProtected:
+      enabled: false
