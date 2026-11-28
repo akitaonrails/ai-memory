@@ -40,6 +40,13 @@ version in [`docs/changelog/`](docs/changelog/):
   viewer who cannot read that project. Also ordered the path lookup by
   workspace and project name so the result is deterministic ([#2536](https://github.com/akitaonrails/ai-memory/pull/2536))
 
+### Fixed
+
+- Hardened the user-mode systemd unit with the filesystem, kernel and
+  privilege protections the system unit already had (`ProtectSystem=full`,
+  `UMask=0077`, kernel/control-group restrictions). The unit still runs as the
+  invoking user with a writable data directory ([#2537](https://github.com/akitaonrails/ai-memory/pull/2537))
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
