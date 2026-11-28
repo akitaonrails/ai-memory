@@ -1567,9 +1567,15 @@ the packing target for stages, not a per-call ceiling. Map stages split bodies
 into ordered parts of at most 12,000 characters, still naming every
 observation id, and pack those parts into blocks toward that target; a single
 larger part opens its own block. Every call is hard-capped by
-`max_input_tokens`. Every id in a block must be cited by a grounded extraction or listed as
-having no durable fact; otherwise the job fails terminally on its first
-attempt. Reduce stages merge extractions until the final page prompt fits
+`max_input_tokens`. Grounding stays strict: an id cited outside its stage's
+input, or an empty, ceiling-breaking or out-of-range extraction, fails the job
+terminally. A coverage hole does not: a map block whose fresh reply leaves
+input ids unaccounted is re-run as its two halves, in order, recursively, and
+at the limit — a one-part block, or any reduce group — the unaccounted ids join
+`no_durable_fact_ids` (an id both cited and listed leaves the list, one listed
+twice or outside the stage input drops out), so the session keeps its page.
+The repair is logged at warn level with counts only, never observation text.
+Reduce stages merge extractions until the final page prompt fits
 `max_input_tokens` (at most eight levels). The published page carries a
 `consolidation_marker` in its frontmatter: a crash between publication and
 checkpoint cleanup reconciles without another LLM call, while a page written by
@@ -1577,8 +1583,12 @@ the agent is never reconciled or overwritten.
 
 Completed stages live in `consolidation_chunk_progress`, keyed by
 `(workspace_id, project_id, session_id, chunk_fingerprint)`. Fingerprints come
-from content (prompt versions, model, observation text and ids, stage position),
-never from a timestamp; rows are pruned after publication. A checkpoint from
+from content (prompt versions, model, observation text and ids, stage position,
+and for a re-mapped half the split marker), never from a timestamp; rows are
+pruned after publication. A re-mapped half checkpoints under its own
+fingerprint, which never aliases a plain block's, and the block that failed
+coverage records none — so a resume reuses finished sub-blocks without another
+LLM call. A checkpoint from
 another scope is invisible to a resume. The key must not exceed
 `max_input_tokens`, and a positive value must leave room for one minimal map
 part plus the fixed stage prompts at the configured safety margin.
