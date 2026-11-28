@@ -23,7 +23,12 @@ What that means for you:
 - **Shared / team server**: set `[auto_improve] require_approval =
   true`. On a server several people trust, an LLM should not
   auto-apply edits nobody reviewed. Proposals then wait in
-  `_pending/` until a human approves each one.
+  `_pending/` until a human approves each one. If only part of the wiki
+  needs that protection, `require_approval_prefixes` (for example
+  `["_rules/"]`) holds just the proposals under the configured prefixes
+  while the rest of each run is auto-approved. Both keys cover
+  auto-improve proposals only: ordinary consolidation writes a page of kind
+  `rule` to `_rules/` through its own path, without review.
 - **Cost**: one bounded LLM call per completed session that passes the
   preflight filters (minimum observations/duration); prompt and output
   sizes are capped in `[auto_improve]`.
@@ -58,7 +63,8 @@ implementation notes, kept for depth.
 > targeted runs and catch-up. Both paths record validated proposals in the
 > pending-writes audit trail and auto-approve them through the normal wiki write
 > path by default. Admins can set `[auto_improve] require_approval = true` for
-> manual review.
+> manual review, or `require_approval_prefixes` to hold only the proposals
+> under a set of path prefixes.
 
 ## Executive Summary
 
@@ -236,7 +242,13 @@ The shipped feature is an audit-first learning reviewer:
 Auto-approval is the default, but it still records staged proposals and applies
 them through the same approval path. Admins who want a human queue set
 `[auto_improve] require_approval = true`; admins who want no automatic review set
-`[auto_improve.scheduler] enabled = false`.
+`[auto_improve.scheduler] enabled = false`. Admins who want to protect only a
+subset of the wiki set `require_approval_prefixes` (for example
+`["_rules/"]`): proposals whose stored target path starts with a configured
+prefix stay pending while the rest of the same run is auto-approved. `require_approval = true`
+still holds every proposal; the decision reads the stored target path, never
+the path the model claimed, and an unreadable stored detail is held, not
+approved.
 
 High-impact targets can also be guarded by an operator-supplied executable eval
 gate. `[auto_improve.eval]` defaults to disabled; when enabled, proposals whose
@@ -402,6 +414,7 @@ The exact names can change, but the shape should be explicit and conservative:
 ```toml
 [auto_improve]
 require_approval = false      # true leaves proposals pending for manual review
+# require_approval_prefixes = ["_rules/"]  # holds only the matching proposals
 min_observations = 8
 min_session_duration_secs = 120
 min_confidence = 0.75
@@ -484,7 +497,9 @@ reviewer and the cross-session experience pass both follow it.
 
 `[auto_improve.scheduler]` controls whether and how often the server launches
 background review. `[auto_improve] require_approval` controls whether validated
-proposals are applied automatically or left pending. They intentionally do not
+proposals are applied automatically or left pending. `require_approval_prefixes`
+refines that policy: when the global switch is off, only proposals whose stored
+target path starts with one of the prefixes are held. They intentionally do not
 imply each other.
 
 `max_rejection_context` and `rejection_context_days` bound the persistent

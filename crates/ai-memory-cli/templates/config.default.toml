@@ -609,6 +609,13 @@ max_output_tokens = 32000
 # is ignored by current ai-memory and can be removed when convenient.
 [auto_improve]
 require_approval = false
+# Path prefixes whose proposals wait for manual review while the rest are
+# still approved automatically (empty = every proposal follows
+# require_approval). Entries must end with `/` and must not start with `/`
+# (matching is a plain `starts_with`), so `_rules/` holds `_rules/x.md` but
+# not `_rulesx/z.md`. Blank entries are ignored. require_approval = true
+# still holds every proposal.
+# require_approval_prefixes = ["_rules/"]
 min_observations = 8
 min_session_duration_secs = 120
 min_confidence = 0.75

@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
+use ai_memory_core::{
+    ActorContext, AutoImproveProposalId, PagePath, ProjectId, SessionId, WorkspaceId,
+};
 use ai_memory_llm::{LlmProvider, LlmProviders, LlmWorkload};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
@@ -45,6 +47,12 @@ pub struct ScheduledAutoImproveSettings {
     /// When true, validated proposals stay pending for manual review
     /// instead of being auto-approved (`[auto_improve] require_approval`).
     pub require_approval: bool,
+    /// Path prefixes whose proposals stay pending even with
+    /// `require_approval` false; the rest are auto-approved
+    /// (`[auto_improve] require_approval_prefixes`). Blank entries are
+    /// ignored. The decision reads the stored target path, never the model's
+    /// claim, and fails closed when the detail cannot be read.
+    pub require_approval_prefixes: Vec<String>,
     /// Minimum session age before a completed session becomes a
     /// candidate (`[auto_improve.scheduler] min_session_age_secs`).
     pub min_session_age_secs: u64,
@@ -466,6 +474,45 @@ fn redacted_scheduler_error_summary(error: &anyhow::Error) -> String {
     "auto-improve failed: class=unrecognized status=none".to_string()
 }
 
+/// Decide whether one staged proposal is held by the configured prefixes,
+/// reading the STORED target path (the row an operator can audit) rather
+/// than the path the model claimed. Fails closed: a read error or a missing
+/// row holds the proposal pending, and the warning carries the id and any store
+/// error, never proposal content.
+async fn held_by_require_approval_prefixes(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    proposal_id: AutoImproveProposalId,
+    prefixes: &[String],
+) -> bool {
+    match reader
+        .auto_improve_proposal_detail(workspace_id, project_id, proposal_id)
+        .await
+    {
+        Ok(Some(detail)) => ai_memory_core::auto_improve_requires_approval(
+            false,
+            prefixes,
+            detail.summary.target_path.as_str(),
+        ),
+        Ok(None) => {
+            tracing::warn!(
+                %proposal_id,
+                "auto-improve approval check found no stored proposal; holding it pending"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                %proposal_id,
+                error = %e,
+                "auto-improve approval check could not read the stored proposal; holding it pending"
+            );
+            true
+        }
+    }
+}
+
 async fn run_scheduled_auto_improve(
     ctx: &ScheduledAutoImproveContext<'_>,
     session_id: SessionId,
@@ -560,6 +607,7 @@ async fn stage_and_apply(
                     "eval": cfg.eval,
                     "eval_results": report.eval_results(),
                     "require_approval": ctx.settings.require_approval,
+                    "require_approval_prefixes": ctx.settings.require_approval_prefixes,
                 }),
                 proposal_actor: ActorContext {
                     agent: Some(cfg.proposal_actor.clone()),
@@ -579,8 +627,25 @@ async fn stage_and_apply(
     let mut approved = 0usize;
     let mut pending = 0usize;
     let mut conflicts = 0usize;
+    // The prefixes only matter when the global switch is off; when it is on,
+    // every proposal is held without a store read (unchanged behaviour).
+    let prefix_hold = !ctx.settings.require_approval
+        && ai_memory_core::auto_improve_prefixes_active(&ctx.settings.require_approval_prefixes);
     for proposal_id in &staged.proposal_ids {
         if ctx.settings.require_approval {
+            pending += 1;
+            continue;
+        }
+        if prefix_hold
+            && held_by_require_approval_prefixes(
+                ctx.reader,
+                ctx.workspace_id,
+                ctx.project_id,
+                *proposal_id,
+                &ctx.settings.require_approval_prefixes,
+            )
+            .await
+        {
             pending += 1;
             continue;
         }
@@ -752,6 +817,7 @@ mod tests {
                 ..AutoImproveReviewConfig::default()
             },
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: None,
@@ -955,6 +1021,7 @@ mod tests {
                 ..AutoImproveReviewConfig::default()
             },
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: None,
@@ -1128,6 +1195,7 @@ mod tests {
         let settings = ScheduledAutoImproveSettings {
             review: AutoImproveReviewConfig::default(),
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 0,
             experience: Some(crate::ExperienceConfig {
@@ -1311,6 +1379,7 @@ mod tests {
                 ..AutoImproveReviewConfig::default()
             },
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: None,
@@ -1429,6 +1498,7 @@ mod tests {
                 ..AutoImproveReviewConfig::default()
             },
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: None,
@@ -1545,6 +1615,7 @@ mod tests {
         let settings = ScheduledAutoImproveSettings {
             review: AutoImproveReviewConfig::default(),
             require_approval: false,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: None,
@@ -1703,6 +1774,7 @@ mod tests {
         let settings = ScheduledAutoImproveSettings {
             review: AutoImproveReviewConfig::default(),
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             // Only the experience provider is configured.
             max_sessions_per_tick: 10,
@@ -1865,6 +1937,7 @@ mod tests {
         let settings = ScheduledAutoImproveSettings {
             review: AutoImproveReviewConfig::default(),
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: Some(crate::ExperienceConfig {
@@ -1936,6 +2009,90 @@ mod tests {
                         "evidence": [{"page": "sessions/test.md", "quote": "run the full gate before release"}],
                         "body_markdown": "# Release Procedure\n\nRun the full gate before release."
                     }],
+                    "rejected_candidates": []
+                }))
+            })
+        }
+    }
+
+    /// Proposes one `_rules/` page and one `gotchas/` page in the same run,
+    /// so the approval-prefix decision is exercised on both sides of the
+    /// match in a single execution.
+    struct PrefixProposalsLlm;
+
+    impl LlmProvider for PrefixProposalsLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "fake-model".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "summary": "one rule and one gotcha",
+                    "proposals": [
+                        {
+                            "operation": "create_or_update",
+                            "path": "_rules/existing.md",
+                            "title": "Existing rule",
+                            "kind": "rule",
+                            "confidence": 0.93,
+                            "rationale": "The scope should be extended.",
+                            "evidence": [{"page": "session", "quote": "durable lesson"}],
+                            "edit_mode": "patch",
+                            "edits": [
+                                {"op": "append", "anchor": "## Scope", "content": "Added by the review."}
+                            ]
+                        },
+                        {
+                            "operation": "create_or_update",
+                            "path": "_rules/x.md",
+                            "title": "Durable Rule",
+                            "kind": "rule",
+                            "confidence": 0.92,
+                            "rationale": "The session established an explicit rule.",
+                            "evidence": [{"page": "sessions/test.md", "quote": "always run the gate"}],
+                            "body_markdown": "# Durable Rule\n\nAlways run the gate before release."
+                        },
+                        {
+                            "operation": "create_or_update",
+                            "path": "gotchas/y.md",
+                            "title": "Release Gotcha",
+                            "kind": "gotcha",
+                            "confidence": 0.9,
+                            "rationale": "A reproducible pitfall surfaced in the session.",
+                            "evidence": [{"page": "sessions/test.md", "quote": "the deploy failed"}],
+                            "body_markdown": "# Release Gotcha\n\nDeploy fails without the gate."
+                        }
+                    ],
                     "rejected_candidates": []
                 }))
             })
@@ -2126,6 +2283,7 @@ mod tests {
                 ..AutoImproveReviewConfig::default()
             },
             require_approval: true,
+            require_approval_prefixes: Vec::new(),
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: None,
@@ -2173,5 +2331,189 @@ mod tests {
             "the tick must carry the dropped proposal, not just the count"
         );
         assert_eq!(tick.skipped_proposals[0].target_path, COLLIDING_PATH);
+    }
+
+    /// One execution, two proposals under `_rules/` and one `gotchas/`:
+    /// require_approval is off, so only the prefix-matching ones stay pending
+    /// and their pages are never written. The prefixes are recorded in the
+    /// run metadata next to `require_approval`.
+    #[tokio::test]
+    async fn auto_improve_scheduler_holds_prefix_matching_proposal_and_applies_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        wiki.write_page(ai_memory_wiki::WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_rules/existing.md").unwrap(),
+            frontmatter: serde_json::json!({"kind": "rule"}),
+            body: "# Existing rule\n\nBase text.\n\n## Scope\n\nApplies here.\n".into(),
+            tier: ai_memory_core::Tier::Working,
+            pinned: false,
+            title: Some("Existing rule".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+            trust_class: None,
+        })
+        .await
+        .unwrap();
+        let base_body = store
+            .reader
+            .page_body_by_ids(ws, proj, "_rules/existing.md")
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = seed_reviewable_session(&store, ws, proj).await;
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: false,
+            require_approval_prefixes: vec!["_rules/".to_string()],
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(PrefixProposalsLlm);
+        let ctx = ScheduledAutoImproveContext {
+            reader: &store.reader,
+            writer: &store.writer,
+            wiki: &wiki,
+            llm: &llm,
+            workspace_id: ws,
+            project_id: proj,
+            settings: &settings,
+        };
+
+        let run = run_scheduled_auto_improve(&ctx, session_id).await.unwrap();
+        assert_eq!(run.proposals, 3, "every proposal must stage");
+        assert_eq!(run.approved, 1, "only the non-matching proposal is applied");
+        assert_eq!(run.pending, 2, "both prefix-matching proposals are held");
+
+        let proposals = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap();
+        let by_path: std::collections::HashMap<&str, ai_memory_store::AutoImproveProposalStatus> =
+            proposals
+                .iter()
+                .map(|p| (p.target_path.as_str(), p.status))
+                .collect();
+        assert_eq!(
+            by_path.get("_rules/x.md"),
+            Some(&ai_memory_store::AutoImproveProposalStatus::Pending),
+            "the prefix-matching proposal must stay pending"
+        );
+        assert_eq!(
+            by_path.get("_rules/existing.md"),
+            Some(&ai_memory_store::AutoImproveProposalStatus::Pending),
+            "a patch to a prefix-matching page stays pending too"
+        );
+        assert_eq!(
+            by_path.get("gotchas/y.md"),
+            Some(&ai_memory_store::AutoImproveProposalStatus::Approved)
+        );
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "_rules/existing.md")
+                .await
+                .unwrap()
+                .map(|page| page.body),
+            Some(base_body.body),
+            "a held patch must not write its target page"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "_rules/x.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "a held proposal must not write its target page"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "gotchas/y.md")
+                .await
+                .unwrap()
+                .is_some(),
+            "the sibling proposal must be applied"
+        );
+
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let config_json: String = db
+            .query_row(
+                "SELECT config_json FROM auto_improve_runs WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+                rusqlite::params![run.run_id.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+        assert_eq!(json["require_approval"], false);
+        assert_eq!(
+            json["require_approval_prefixes"],
+            serde_json::json!(["_rules/"])
+        );
+    }
+
+    /// Fail closed at the scheduler decision point: a missing row or an
+    /// unreadable table holds the proposal pending, never approves it.
+    #[tokio::test]
+    async fn auto_improve_scheduler_holds_a_proposal_whose_detail_is_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let prefixes = vec!["_rules/".to_string()];
+
+        let missing = AutoImproveProposalId::new();
+        assert!(
+            held_by_require_approval_prefixes(&store.reader, ws, proj, missing, &prefixes).await,
+            "an unreadable detail must hold the proposal"
+        );
+
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE auto_improve_proposals RENAME TO auto_improve_proposals_broken",
+        )
+        .unwrap();
+        let broken =
+            held_by_require_approval_prefixes(&store.reader, ws, proj, missing, &prefixes).await;
+        conn.execute_batch(
+            "ALTER TABLE auto_improve_proposals_broken RENAME TO auto_improve_proposals",
+        )
+        .unwrap();
+        assert!(
+            broken,
+            "a read error must hold the proposal, not approve it"
+        );
     }
 }

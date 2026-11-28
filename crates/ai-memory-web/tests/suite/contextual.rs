@@ -174,6 +174,73 @@ async fn contextual_states_report_effective_configuration_and_mask_admin_setting
     );
 }
 
+fn review_feature_state(json: &serde_json::Value) -> &str {
+    json["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "review")
+        .unwrap()["state"]
+        .as_str()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn contextual_review_feature_reports_prefix_only_approval_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+    // Default: no global switch, no active prefixes -> automatic approval.
+    let app = mounted(&store, wiki.clone(), Some(RuntimeFeatures::default()));
+    let (status, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(review_feature_state(&json), "Automatic approval configured");
+
+    // Prefix-only retention names the configured prefixes.
+    let app = mounted(
+        &store,
+        wiki.clone(),
+        Some(RuntimeFeatures {
+            review_approval_prefixes: vec!["_rules/".to_string(), "procedures/".to_string()],
+            ..RuntimeFeatures::default()
+        }),
+    );
+    let (_, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        review_feature_state(&json),
+        "Manual approval for: _rules/, procedures/"
+    );
+
+    // A blank-only list changes nothing; the global switch still wins.
+    for (prefixes, manual) in [
+        (vec!["".to_string(), "  ".to_string()], false),
+        (vec!["_rules/".to_string()], true),
+    ] {
+        let app = mounted(
+            &store,
+            wiki.clone(),
+            Some(RuntimeFeatures {
+                review_requires_approval: manual,
+                review_approval_prefixes: prefixes,
+                ..RuntimeFeatures::default()
+            }),
+        );
+        let (_, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            review_feature_state(&json),
+            if manual {
+                "Manual approval required"
+            } else {
+                "Automatic approval configured"
+            }
+        );
+    }
+}
+
 #[tokio::test]
 async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_private_evidence() {
     let tmp = tempfile::tempdir().unwrap();

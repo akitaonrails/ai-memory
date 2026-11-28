@@ -1956,6 +1956,14 @@ pub struct AutoImproveSettings {
     /// proposals are staged for audit and immediately approved through the
     /// normal wiki write path.
     pub require_approval: bool,
+    /// Path prefixes whose proposals wait for manual review even when
+    /// `require_approval` is false; everything else is auto-approved. Each
+    /// entry must end with `/` and not start with `/` (validated at load,
+    /// because matching is a plain `starts_with`); blank entries are ignored
+    /// at match time, so an empty or blank-only list changes nothing.
+    /// `require_approval = true` still holds every proposal.
+    #[serde(default)]
+    pub require_approval_prefixes: Vec<String>,
     /// Accepted so existing configs keep loading; it has no effect. Session-end
     /// triggering stays off (`docs/auto-improvement-loop.md`, upgrade contract):
     /// `[auto_improve.scheduler]` reviews completed sessions outside hook latency.
@@ -2088,6 +2096,7 @@ impl Default for AutoImproveSettings {
             scheduler: AutoImproveSchedulerSettings::default(),
             eval: AutoImproveEvalSettings::default(),
             require_approval: false,
+            require_approval_prefixes: Vec::new(),
             on_session_end: false,
             min_observations: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS,
             min_session_duration_secs:
@@ -3041,6 +3050,25 @@ impl Config {
                 "auto_improve.eval.builtin `{builtin}` is not a known scorer; the only one is \
                  `structure`"
             );
+        }
+        // Prefixes are matched with a plain `starts_with`, so an entry without
+        // its trailing `/` would also hold `_rulesx/...` (`_rules` matches
+        // `_rulesx/`), and one with a leading `/` could never match and would
+        // disable the retention silently: both refuse the boot instead of the
+        // first unattended tick deciding the operator's intent. Blank entries
+        // are ignored at match time, so only the non-blank ones are checked.
+        for prefix in &config.auto_improve.require_approval_prefixes {
+            let prefix = prefix.trim();
+            if prefix.is_empty() {
+                continue;
+            }
+            if !prefix.ends_with('/') || prefix.starts_with('/') {
+                anyhow::bail!(
+                    "auto_improve.require_approval_prefixes entry {prefix:?} must be a \
+                     path prefix that ends with `/` and does not start with `/` \
+                     (blank entries are ignored)"
+                );
+            }
         }
 
         // A4 entropy filter thresholds: reject an unusable threshold at startup
@@ -6908,6 +6936,154 @@ input_token_safety_margin = {margin}
             "child stdout: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    /// `[auto_improve] require_approval_prefixes` is matched with
+    /// `starts_with`, so an entry without its trailing `/` would also hold
+    /// `_rulesx/...` (`_rules` matches `_rulesx/`), and one with a leading
+    /// `/` could never match and would disable the retention silently:
+    /// both refuse the boot naming the key and the entry. Blank entries are
+    /// ignored at match time, so they may coexist with valid ones.
+    #[test]
+    fn load_rejects_malformed_require_approval_prefixes() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            "[auto_improve]\nrequire_approval_prefixes = [\"_rules\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("auto_improve.require_approval_prefixes")
+                && format!("{error:#}").contains("_rules"),
+            "{error:#}"
+        );
+
+        std::fs::write(
+            &config_path,
+            "[auto_improve]\nrequire_approval_prefixes = [\"/_rules/\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("auto_improve.require_approval_prefixes")
+                && format!("{error:#}").contains("/_rules/"),
+            "{error:#}"
+        );
+
+        // Matching trims each entry, so validation must see what matching sees:
+        // this one could never match and would disable the retention silently.
+        std::fs::write(
+            &config_path,
+            "[auto_improve]\nrequire_approval_prefixes = [\" /_rules/\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("auto_improve.require_approval_prefixes"),
+            "{error:#}"
+        );
+
+        std::fs::write(
+            &config_path,
+            "[auto_improve]\nrequire_approval_prefixes = [\"\", \"_rules/\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.auto_improve.require_approval_prefixes,
+            vec!["".to_string(), "_rules/".to_string()]
+        );
+
+        // Default: empty, so a config without the key behaves exactly as
+        // before the key existed.
+        assert_eq!(
+            Config::default().auto_improve.require_approval_prefixes,
+            Vec::<String>::new()
+        );
+    }
+
+    /// Env forms of `[auto_improve] require_approval_prefixes` through the
+    /// real `Config::load` figment path. The accepted form is a JSON array of
+    /// path prefixes; a bare or comma-CSV spelling must refuse the boot
+    /// rather than silently drop the retention. Uses the child-process
+    /// marker pattern because `std::env::set_var` is unsafe and forbidden in
+    /// this crate's multi-threaded test binary.
+    #[test]
+    fn require_approval_prefixes_env_forms_load_or_refuse() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_AIPREFIX_CHILD";
+        const FORM: &str = "AI_MEMORY_TEST_AIPREFIX_FORM";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let form = std::env::var(FORM).unwrap();
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[auto_improve]\n").unwrap();
+            match Config::load(Some(&config_path), Some(tmp.path().to_path_buf())) {
+                Ok(cfg) => {
+                    let expected: Vec<String> = if form == r#"["_rules/"]"# {
+                        vec!["_rules/".to_string()]
+                    } else if form == r#"["_rules/", "procedures/"]"# {
+                        vec!["_rules/".to_string(), "procedures/".to_string()]
+                    } else {
+                        panic!("unexpected accepted form {form:?}")
+                    };
+                    assert_eq!(
+                        cfg.auto_improve.require_approval_prefixes, expected,
+                        "form {form:?} must load as the expected list"
+                    );
+                    println!("aiprefix-env-ok");
+                }
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    // Figment names an env-provided key with its env spelling
+                    // (`AUTO_IMPROVE.REQUIRE_APPROVAL_PREFIXES`), so compare
+                    // case-insensitively; a TOML refusal uses the dotted key.
+                    assert!(
+                        message
+                            .to_ascii_lowercase()
+                            .contains("auto_improve.require_approval_prefixes"),
+                        "the refusal must name the key: {message}"
+                    );
+                    println!("aiprefix-env-refused");
+                }
+            }
+            return;
+        }
+
+        for (form, accepted) in [
+            (r#"["_rules/"]"#, true),
+            (r#"["_rules/", "procedures/"]"#, true),
+            ("_rules/", false),
+            ("_rules/,procedures/", false),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("config::tests::require_approval_prefixes_env_forms_load_or_refuse")
+                .arg("--test-threads=1")
+                .arg("--nocapture")
+                .env(CHILD_MARKER, "1")
+                .env(FORM, form)
+                .env("AI_MEMORY_AUTO_IMPROVE__REQUIRE_APPROVAL_PREFIXES", form)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed for form {form:?}:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains(if accepted {
+                    "aiprefix-env-ok"
+                } else {
+                    "aiprefix-env-refused"
+                }),
+                "form {form:?} must {accepted}; stdout: {stdout}"
+            );
+        }
     }
 
     #[test]

@@ -123,6 +123,7 @@ async fn harness_with(index_file_paths: bool) -> Harness {
             overrides: Default::default(),
         },
         auto_improve_require_approval: false,
+        auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
         embedder: None,
         provider_health: ProviderHealth::default(),

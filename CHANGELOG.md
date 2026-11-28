@@ -26,6 +26,10 @@ version in [`docs/changelog/`](docs/changelog/):
   other migration would run without a backup. Fresh installs, up-to-date
   stores and an unreadable schema never warn or block startup (#2545).
 
+- Added `[auto_improve] require_approval_prefixes`, which holds auto-improve
+  proposals for matching page paths for review while the rest are still approved
+  automatically. `require_approval = true` still holds everything (#2548).
+
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
   Providers that return only JSON continue to contribute estimates.
