@@ -150,14 +150,19 @@ renamed surface, no changed defaults), but it still has costs:
   approximation when no retirement timestamp survived),
   create the `(valid_from, valid_to)` index. Idempotent re-run migrates
   zero rows.
-- **Backup gate.** The migration refuses to run without a verified
-  pre-migration safety archive, per the current store-migration policy
-  (the #633 ordering fix: archive *before* the schema migration, abort
-  when the archive cannot be written or verified). The issue understates
-  this step; it is listed here so the implementation PR is sized
-  correctly.
-- **Rollback.** Restore the verified pre-migration snapshot from #633
-  before starting the older binary. Refinery rejects newer applied
+- **Backup gate.** No refinery migration is itself backup-gated: the only
+  automatic pre-migration archive is the boot-time snapshot taken on the
+  1.x→2.0 OKF path (#633: archive *before* the schema migration, abort when
+  the archive cannot be written or verified). An upgrade that reaches this
+  migration through an ordinary schema change migrates the store without any
+  boot backup — the boot warning now names the schema versions when that
+  happens. Size the PR accordingly: before the upgrade ships, operators take
+  `ai-memory backup` with the binary that is live, and that archive is what
+  the rollback below restores.
+- **Rollback.** Restore the backup taken before the upgrade before starting
+  the older binary (the #633 snapshot only exists on the 1.x→2.0 path). The
+  newer binary's `restore` migrates the backup forward to its own schema and
+  cannot be used to roll back. Refinery rejects newer applied
   schema versions; an older binary cannot read the migrated store.
   Forward re-runs are no-ops.
 

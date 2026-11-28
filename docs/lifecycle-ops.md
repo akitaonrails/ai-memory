@@ -28,7 +28,7 @@ on a homelab box where mistakes are harder to undo.
 | `restore-page --path (--from REV \| --page-id UUID)` | ✅ yes | overwrites one markdown page version | yes (restore another retained version) | Restores one page from wiki git history or a retained SQLite page version, reindexes it, and writes a post-restore checkpoint. `--page-id` reaches source history preserved by `merge-project`; it does not restore other DB state. |
 | MCP `memory_restore_page` | ✅ yes | no (writes a new current version; the replaced one stays reachable) | yes (restore another checkpoint) | Lists a page's checkpoints, or writes one back through the `memory_write_page` path. Admin only, like `restore-page`. See [below](#mcp-memory_restore_page). |
 | `backup-agents --to` / `restore-agents --from <tarball>` | ✅ yes (client-side; never touches the server or its data dir) | no | yes (`restore-agents --apply` keeps timestamped copies of overwritten files) | Agent-config assets, not wiki/db: MCP configs (redacted unless `--include-secrets`), hook configs, instructions, skills, plugins. `restore-agents` is a dry run by default; `--apply` writes to disk and `--force` overwrites existing or differing targets. Non-MCP assets are restored verbatim and may contain secrets, so only `--apply` an archive whose source you trust. |
-| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. Keeps an existing `config.toml` and saves the backup's as `config.toml.from-backup` unless `--with-config` is passed. From the wiki's `.git` it restores only git's data (objects, refs, logs, HEAD, the index) and writes a fresh git config; hooks, the archived config and anything else git would run or follow are left out and listed. |
+| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. Keeps an existing `config.toml` and saves the backup's as `config.toml.from-backup` unless `--with-config` is passed. From the wiki's `.git` it restores only git's data (objects, refs, logs, HEAD, the index) and writes a fresh git config; hooks, the archived config and anything else git would run or follow are left out and listed. The staged snapshot is opened with the **current** binary, so its pending migrations run before the swap: this is not a version rollback, and the boot does not guarantee a backup before migrating — before any upgrade, run `ai-memory backup` with the binary that is live, and to roll back use the older binary's (or image's) `restore`. |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
 
@@ -1396,6 +1396,18 @@ ai-memory restore --from <tarball> --data-dir <path> --force [--with-config]
 
 Direct-disk operation. Refuses if any other `ai-memory` process is
 alive (uses `sysinfo` to scan the process table).
+
+Not a version rollback. The staged snapshot is opened with the **current**
+binary (step 3), so its pending migrations run before the swap: restoring a
+backup through a newer binary migrates that backup forward to the newer
+binary's schema, and the restored store can no longer be opened by the older
+one. To come back to an older version, run the older binary's (or the older
+image's) `restore` against the backup you took before the upgrade, with the
+older binary still at hand. And the boot does not guarantee a backup before
+migrating: the only automatic pre-migration package is the 1.x→2.0 snapshot
+(its boot warning names the schema versions whenever a schema migration
+would otherwise run without a package). Before any upgrade, run
+`ai-memory backup` with the binary that is live.
 
 Order of operations:
 

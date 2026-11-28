@@ -527,11 +527,14 @@ in a boot migration.
 
 ### 3. Recovery & proof
 
-`serve` startup already writes a **pre-migration safety archive** of the whole
-data directory before applying migrations (#633; `ai-memory-wiki/src/backup.rs`,
+`serve` startup writes a **pre-migration safety archive** of the whole
+data directory before applying migrations **on the 1.x→2.0 OKF path only**
+(#633; `ai-memory-wiki/src/backup.rs`,
 `create_pre_migration_backup` at `:125`, receipt
 `pre-migration-backup.json`, `:21`), and the wiki error path points a stuck user
-at restoring it (`ai-memory-wiki/src/error.rs:51`). Beyond that, every
+at restoring it (`ai-memory-wiki/src/error.rs:51`); any other schema migration
+at boot runs without a package, and the boot warning names the schema
+versions whenever that is about to happen. Beyond that, every
 state-touching step keeps its source **diffable in git and reachable via
 supersession** until the existing 180-day tombstone grace + hard-delete
 (`DecayParams::hard_delete_after_days`, `decay.rs:43`).

@@ -74,6 +74,7 @@ pub use grants::{
     WorkspaceGrantListing,
 };
 pub use maintenance::MaintenanceJob;
+pub use migrations::{SchemaStatus, schema_status};
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
     ConditionalBatchUpsert, ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary,

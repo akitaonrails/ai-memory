@@ -133,6 +133,17 @@ tar -xzf ~/ai-memory-backup-okf-v0.2-<date>.tar.gz -C <data_dir>
 # 4. start the OLD (1.x) binary against it
 ```
 
+Run step 3 as the service user, not as `root`: a `tar` run as `root`
+leaves `db/` and `wiki/` owned by `root`, and the server then refuses to
+start (libgit2's ownership check answers `Permission denied`). If you
+already unpacked as `root`, repair it before starting the binary:
+`chown -R <service-user> <data_dir>`. In the Docker image the service
+user is `ai-memory` at UID 1000 (`docker/Dockerfile`: `useradd --system
+--uid 1000 --user-group --home-dir /data ... ai-memory`, the runtime
+stages end in `USER ai-memory` and `/data` is `chown -R
+ai-memory:ai-memory`), so unpack as that user or
+`chown -R ai-memory:ai-memory /data` afterwards.
+
 Surgical alternative (keeps post-migration work, reverts only the wiki
 files): the `pre-okf-migration checkpoint` commit in the wiki's git
 history, followed by `ai-memory reindex`.
