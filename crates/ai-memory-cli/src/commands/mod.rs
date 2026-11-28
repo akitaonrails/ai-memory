@@ -36,6 +36,7 @@ pub mod auth_enable;
 pub mod auto_improve;
 pub mod auto_improve_report;
 pub mod backfill;
+pub mod backfill_session_summaries;
 pub mod backup;
 pub mod backup_agents;
 pub mod bootstrap;

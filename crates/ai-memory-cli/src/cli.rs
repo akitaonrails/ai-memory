@@ -377,6 +377,8 @@ pub enum Command {
     /// only *accepted* are left alone: their text belongs to the session that
     /// wrote them.
     PurgeSession(PurgeSessionArgs),
+    /// Preview or backfill deterministic summary pages for ended sessions.
+    BackfillSessionSummaries(BackfillSessionSummariesArgs),
     /// Rename a project within its workspace. No files move on disk —
     /// the wiki is flat and pages are differentiated by project_id only.
     /// Useful after renaming the project's directory on disk so the hook
@@ -1683,6 +1685,29 @@ pub struct PurgeProjectArgs {
     /// backup taken before the purge still contain it.
     #[arg(long)]
     pub compact: bool,
+}
+
+/// Arguments for `backfill-session-summaries`.
+#[derive(Debug, Args)]
+pub struct BackfillSessionSummariesArgs {
+    /// Select sessions ended strictly more than this many days ago.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub ended_before_days: u64,
+    /// Maximum number of sessions selected in one request.
+    #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..=2000))]
+    pub limit: u32,
+    /// Resume with the next_cursor returned by the previous batch.
+    #[arg(long)]
+    pub after: Option<String>,
+    /// Workspace name. Omit with --project to select across all scopes.
+    #[arg(long, requires = "project")]
+    pub workspace: Option<String>,
+    /// Project name. Must be paired with --workspace.
+    #[arg(long, requires = "workspace")]
+    pub project: Option<String>,
+    /// Apply the backfill. Without this flag, report a read-only preview.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 /// Arguments for `purge-session`.
@@ -4434,6 +4459,55 @@ mod tests {
             Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "hermez"]).is_err(),
             "an unknown agent must be rejected, not silently accepted as Other"
         );
+    }
+
+    #[test]
+    fn summary_backfill_cli_enforces_flag_bounds_and_scope_pairing() {
+        let base = ["ai-memory", "backfill-session-summaries"];
+        for flags in [
+            vec![],
+            vec!["--ended-before-days", "1", "--after"],
+            vec!["--ended-before-days", "0"],
+            vec!["--ended-before-days", "-1"],
+            vec!["--ended-before-days", "1", "--limit", "0"],
+            vec!["--ended-before-days", "1", "--limit", "2001"],
+            vec!["--ended-before-days", "1", "--workspace", "default"],
+            vec!["--ended-before-days", "1", "--project", "demo"],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(flags)).is_err());
+        }
+        let default =
+            Cli::try_parse_from(base.into_iter().chain(["--ended-before-days", "1"])).unwrap();
+        let Command::BackfillSessionSummaries(default) = default.command else {
+            panic!("expected backfill")
+        };
+        assert_eq!(default.limit, 200);
+        assert!(!default.confirm);
+        assert!(default.after.is_none());
+        assert!(default.workspace.is_none() && default.project.is_none());
+
+        let confirmed = Cli::try_parse_from(base.into_iter().chain([
+            "--ended-before-days",
+            "30",
+            "--limit",
+            "2000",
+            "--workspace",
+            "default",
+            "--project",
+            "demo with spaces",
+            "--confirm",
+            "--after",
+            "WzEsImN1cnNvciJd",
+        ]))
+        .unwrap();
+        let Command::BackfillSessionSummaries(confirmed) = confirmed.command else {
+            panic!("expected backfill")
+        };
+        assert_eq!(confirmed.ended_before_days, 30);
+        assert_eq!(confirmed.project.as_deref(), Some("demo with spaces"));
+        assert_eq!(confirmed.limit, 2000);
+        assert!(confirmed.confirm);
+        assert_eq!(confirmed.after.as_deref(), Some("WzEsImN1cnNvciJd"));
     }
 
     #[test]

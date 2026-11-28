@@ -324,6 +324,109 @@ pub fn upsert_page_if(
     Ok(ConditionalUpsert::Upserted(id))
 }
 
+/// Common selection and stamp predicates for a backfill candidate (`s`).
+pub(crate) const BACKFILL_SCOPE_AND_JOB_AVAILABLE: &str = "
+    NOT EXISTS (
+        SELECT 1 FROM purged_scopes t WHERE t.workspace_id = s.workspace_id
+          AND (t.project_id = s.project_id OR t.project_id = zeroblob(16))
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM session_consolidation_jobs j WHERE j.session_id = s.id
+          AND j.state IN ('pending', 'running')
+    )";
+
+/// Conditionally materialize the page, then stamp its session in one
+/// transaction. If the session CAS loses, the page and index changes roll
+/// back with it. Without a new page, only the selected live agent page can
+/// be attached.
+pub(crate) fn backfill_session_summary(
+    conn: &mut Connection,
+    candidate: &crate::SessionSummaryBackfillCandidate,
+    page: Option<&NewPage>,
+) -> StoreResult<ConditionalUpsert> {
+    let workspace = candidate.workspace_id.as_bytes();
+    let project = candidate.project_id.as_bytes();
+    let session = candidate.session_id.as_bytes();
+    let session_text = candidate.session_id.to_string();
+    let path = format!("sessions/{session_text}.md");
+    let tx = conn.transaction()?;
+    let scope_exists = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_id = ?1 AND id = ?2)",
+        params![workspace, project],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !scope_exists {
+        return Ok(ConditionalUpsert::Mismatch { current: None });
+    }
+    let current: Option<(Vec<u8>, Option<String>, bool)> = tx
+        .query_row(
+            "SELECT id, CAST(json_extract(frontmatter_json, '$.session_id') AS TEXT),
+                    COALESCE(json_extract(frontmatter_json, '$.consolidated_by') = 'agent', 0)
+             FROM pages
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![workspace, project, path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let current_id = current
+        .as_ref()
+        .map(|(id, _, _)| PageId::from_slice(id))
+        .transpose()?;
+    let mismatch = ConditionalUpsert::Mismatch {
+        current: current_id,
+    };
+    if !candidate.substantive
+        || current_id != candidate.seen_page_id
+        || current
+            .as_ref()
+            .and_then(|(_, owner, _)| owner.as_deref())
+            .is_some_and(|owner| owner != session_text)
+    {
+        return Ok(mismatch);
+    }
+    let page_id = match page {
+        Some(page)
+            if page.workspace_id == candidate.workspace_id
+                && page.project_id == candidate.project_id
+                && page.path.as_str() == path
+                && page.frontmatter_json["session_id"].as_str() == Some(session_text.as_str()) =>
+        {
+            upsert_page_in_tx(&tx, page, Timestamp::now().as_microsecond())?
+        }
+        None if let Some(id) = current_id
+            && current.as_ref().is_some_and(|(_, _, by_agent)| *by_agent) =>
+        {
+            id
+        }
+        _ => return Ok(mismatch),
+    };
+
+    let sql = format!(
+        "UPDATE sessions AS s SET summary_page_id = ?1, ended_observation_count = ?2
+         WHERE s.id = ?3 AND s.workspace_id = ?4 AND s.project_id = ?5
+           AND s.ended_at = ?6 AND s.summary_page_id IS NULL
+           AND (SELECT COUNT(*) FROM observations WHERE session_id = s.id) = ?2
+           AND NOT EXISTS (SELECT 1 FROM purged_sessions WHERE session_id = s.id)
+           AND {BACKFILL_SCOPE_AND_JOB_AVAILABLE}"
+    );
+    let changed = tx.execute(
+        &sql,
+        params![
+            page_id.as_bytes(),
+            candidate.observation_count,
+            session,
+            workspace,
+            project,
+            candidate.ended_at
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(mismatch);
+    }
+    tx.commit()?;
+    Ok(ConditionalUpsert::Upserted(page_id))
+}
+
 /// Upsert a batch only when every page precondition holds in the batch's
 /// transaction. A single mismatch writes nothing.
 pub fn upsert_pages_batch_if(

@@ -19,6 +19,7 @@ management-ui = []
 [dependencies]
 ai-memory-core.workspace = true
 ai-memory-consolidate.workspace = true
+ai-memory-hooks.workspace = true
 ai-memory-llm.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
@@ -52,7 +53,6 @@ sha2.workspace = true
 
 [dev-dependencies]
 ai-memory-core.workspace = true
-ai-memory-hooks.workspace = true
 ai-memory-store.workspace = true
 # The web search parity test drives `/web` and `/api/v1` next to
 # `memory_query`. Test-only: the server crate does not depend on the web UI.

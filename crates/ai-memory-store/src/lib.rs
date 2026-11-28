@@ -120,11 +120,12 @@ pub use reader::{
     RrfContributions, SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow,
     SearchExplain, SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary,
     SessionDependentRows, SessionEndDisposition, SessionKindSummary, SessionLine,
-    SessionObservationSnapshot, SessionPromptTitles, SessionSummary, SessionToolTitles,
-    SessionUsageView, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
-    StreamTimings, TokenCallOrder, TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery,
-    WikiFileFingerprintRow, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
-    highlighted_snippet_html, plain_snippet, project_name_fold_key,
+    SessionObservationSnapshot, SessionPromptTitles, SessionSummary,
+    SessionSummaryBackfillCandidate, SessionToolTitles, SessionUsageView, SettledPage,
+    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
+    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WikiFileFingerprintRow,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
+    project_name_fold_key,
 };
 pub use retrieval_criteria::{MAX_RESULT_LIMIT, RetrievalCriteria};
 pub use retrieval_history::{
@@ -5572,6 +5573,525 @@ mod tests {
             last_failed_at.is_some(),
             "a parked claim must carry its park time"
         );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_unlocks_retention_and_converges() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let day = 86_400_000_000;
+        let sid = aged_open_session(&store, ws, proj, now - 60 * day, 4).await;
+        assert_eq!(
+            store
+                .writer
+                .close_abandoned_sessions(now - 30 * day)
+                .await
+                .unwrap(),
+            1
+        );
+        // The current sweep already stamps a watermark. Model pre-existing rows
+        // by resetting only that field to the historic value.
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        db.execute(
+            "UPDATE sessions SET ended_observation_count = 0 WHERE id = ?1",
+            [sid.as_bytes()],
+        )
+        .unwrap();
+        let prune = || {
+            store
+                .writer
+                .prune_consolidated_observations(ws, proj, now - 30 * day, 100)
+        };
+        assert_eq!(prune().await.unwrap().deleted, 0);
+
+        let selected = store
+            .reader
+            .session_summary_backfill_candidates(now - 30 * day, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        let candidate = &selected[0];
+        assert_eq!(candidate.session_id, sid);
+        let page = backfill_test_page(ws, proj, sid);
+        let result = store
+            .writer
+            .backfill_session_summary(candidate.clone(), Some(page))
+            .await
+            .unwrap();
+        let ConditionalUpsert::Upserted(page_id) = result else {
+            panic!("expected summary page")
+        };
+        let (actual, watermark, ended): (Vec<u8>, i64, i64) = db.query_row(
+            "SELECT summary_page_id, ended_observation_count, ended_at FROM sessions WHERE id = ?1",
+            [sid.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(actual.as_slice(), page_id.as_bytes());
+        let deleted = prune().await.unwrap().deleted;
+        assert_eq!(deleted, 4, "retention needs the backfilled watermark");
+        assert_eq!(watermark, 4);
+        assert_eq!(ended, candidate.ended_at);
+        assert!(
+            store
+                .reader
+                .session_summary_backfill_candidates(now - 30 * day, 200, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_watermark_keeps_a_resumed_session_consolidatable() {
+        let (_tmp, store, ws, proj, cutoff, sessions) = backfill_fixture(1).await;
+        let sid = sessions[0];
+        let candidates = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, Some((ws, proj)), None)
+            .await
+            .unwrap();
+        let generation = candidates[0].observation_count;
+        assert!(apply_backfill_test_page(&store, &candidates[0]).await);
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(sid, ws, proj, AgentKind::OpenCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "the backfill must not reopen the session"
+        );
+
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(cutoff + 1_000),
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "Resumed prompt".into(),
+                    body: "New work after the backfill.".into(),
+                    importance: 5,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(sid, ws, proj, AgentKind::OpenCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork,
+            "the backfilled watermark must still tell a resumed generation apart"
+        );
+        store.writer.end_session(sid, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, sid)
+                .await
+                .unwrap(),
+            "resumed work must get its own consolidation job"
+        );
+        let db = Connection::open(store.db_path()).unwrap();
+        let jobs: Vec<i64> = db
+            .prepare("SELECT generation FROM session_consolidation_jobs WHERE session_id = ?1")
+            .unwrap()
+            .query_map([sid.as_bytes()], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(jobs, vec![generation + 1]);
+        assert!(
+            !store
+                .writer
+                .enqueue_session_consolidation(ws, proj, sid)
+                .await
+                .unwrap(),
+            "the same generation must not queue twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_cas_preserves_a_competing_summary_pointer() {
+        let (_tmp, store, ws, proj, cutoff, sessions) = backfill_fixture(2).await;
+        let candidates = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        let stale = &candidates[0];
+        let mut winner = backfill_test_page(ws, proj, stale.session_id);
+        winner.path = PagePath::new("sessions/concurrent-summary.md").unwrap();
+        let winner = store.writer.upsert_page(winner).await.unwrap();
+        // A competing end can stamp a pointer without changing the selected
+        // path, timestamp or generation. Isolate exactly that interleaving.
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        db.execute(
+            "UPDATE sessions SET summary_page_id = ?1 WHERE id = ?2",
+            rusqlite::params![winner.as_bytes(), stale.session_id.as_bytes()],
+        )
+        .unwrap();
+
+        assert_backfill_race_loses(&store, stale).await;
+        let pointer: Vec<u8> = db
+            .query_row(
+                "SELECT summary_page_id FROM sessions WHERE id = ?1",
+                [stale.session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointer.as_slice(), winner.as_bytes());
+        assert!(apply_backfill_test_page(&store, &candidates[1]).await);
+        assert_eq!(stale.session_id, sessions[0]);
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_cas_rejects_late_observations_across_scopes() {
+        let (_tmp, store, ws, proj, cutoff, sessions) = backfill_fixture(2).await;
+        let candidates = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        let stale = &candidates[0];
+        assert_eq!(stale.session_id, sessions[0]);
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(cutoff - 5),
+                    session_id: stale.session_id,
+                    workspace_id: ws,
+                    project_id: other,
+                    kind: ObservationKind::Stop,
+                    extension: None,
+                    source_event: None,
+                    title: "Late observation".into(),
+                    body: String::new(),
+                    importance: 5,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_backfill_race_loses(&store, stale).await;
+        assert!(apply_backfill_test_page(&store, &candidates[1]).await);
+
+        let fresh = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, Some((ws, proj)), None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].observation_count, stale.observation_count + 1);
+        assert!(apply_backfill_test_page(&store, &fresh[0]).await);
+        // The home summary covers only home observations.
+        assert_eq!(
+            store
+                .writer
+                .prune_consolidated_observations(ws, other, cutoff, 100)
+                .await
+                .unwrap()
+                .deleted,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_skips_a_late_job_and_a_purged_session() {
+        let (_tmp, store, ws, proj, cutoff, _) = backfill_fixture(3).await;
+        let candidates = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 3);
+        let (queued, purged) = (&candidates[0], &candidates[1]);
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, queued.session_id)
+                .await
+                .unwrap()
+        );
+        store
+            .writer
+            .purge_session(
+                ws,
+                proj,
+                purged.session_id,
+                None,
+                Compaction::Skip,
+                PurgeMode::Commit,
+            )
+            .await
+            .unwrap();
+        assert_backfill_race_loses(&store, queued).await;
+        assert_backfill_race_loses(&store, purged).await;
+        let retry = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].session_id, candidates[2].session_id);
+        assert!(apply_backfill_test_page(&store, &retry[0]).await);
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_selects_only_ended_nonempty_sessions_strictly_before_cutoff() {
+        let (_tmp, store, ws, proj, cutoff, sessions) = backfill_fixture(1).await;
+        aged_open_session(&store, ws, proj, cutoff - 2_000, 0).await;
+        let exactly_at_cutoff = aged_open_session(&store, ws, proj, cutoff, 1).await;
+        assert_eq!(
+            store
+                .writer
+                .close_abandoned_sessions(cutoff + 1)
+                .await
+                .unwrap(),
+            2
+        );
+        aged_open_session(&store, ws, proj, cutoff - 3_000, 2).await;
+        let selected = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, Some((ws, proj)), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.session_id)
+                .collect::<Vec<_>>(),
+            sessions
+        );
+
+        let later = store
+            .reader
+            .session_summary_backfill_candidates(cutoff + 1, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(later.len(), 2);
+        assert_eq!(later[1].session_id, exactly_at_cutoff);
+        assert!(!later[1].substantive);
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_excludes_tombstones_before_taking_the_limit() {
+        let (_tmp, store, ws, proj, cutoff, sessions) = backfill_fixture(2).await;
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        // Model a tombstone alongside a historical row, even though today's
+        // purge removes the row. The limit must apply after tombstone filtering.
+        db.execute("INSERT INTO purged_sessions (session_id, workspace_id, project_id, purged_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![sessions[0].as_bytes(), ws.as_bytes(), proj.as_bytes(), cutoff]).unwrap();
+        let candidates = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 1, Some((ws, proj)), None)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].session_id, sessions[1],
+            "the oldest row is tombstoned"
+        );
+        db.execute("INSERT INTO purged_scopes (workspace_id, project_id, purged_at) VALUES (?1, zeroblob(16), ?2)",
+            rusqlite::params![ws.as_bytes(), cutoff]).unwrap();
+        assert_backfill_race_loses(&store, &candidates[0]).await;
+        assert!(
+            store
+                .reader
+                .session_summary_backfill_candidates(cutoff, 1, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_backfill_preserves_a_new_page_and_rejects_foreign_pages() {
+        let (_tmp, store, ws, proj, cutoff, _) = backfill_fixture(3).await;
+        let candidates = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 3);
+        let stale = &candidates[0];
+        let page = backfill_test_page(ws, proj, stale.session_id);
+        let winner = store.writer.upsert_page(page.clone()).await.unwrap();
+        assert!(!apply_backfill_test_page(&store, stale).await);
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, page.path.to_string())
+                .await
+                .unwrap(),
+            Some(winner)
+        );
+
+        let foreign = &candidates[1];
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let wrong_page = backfill_test_page(ws, other, foreign.session_id);
+        store.writer.upsert_page(wrong_page.clone()).await.unwrap();
+        assert!(matches!(
+            store
+                .writer
+                .backfill_session_summary(foreign.clone(), Some(wrong_page))
+                .await
+                .unwrap(),
+            ConditionalUpsert::Mismatch { .. }
+        ));
+        assert!(matches!(
+            store
+                .writer
+                .backfill_session_summary(foreign.clone(), None)
+                .await
+                .unwrap(),
+            ConditionalUpsert::Mismatch { .. }
+        ));
+        assert!(apply_backfill_test_page(&store, foreign).await);
+
+        let conflict = &candidates[2];
+        let mut wrong_session = backfill_test_page(ws, proj, conflict.session_id);
+        wrong_session.frontmatter_json = serde_json::json!({"session_id": foreign.session_id.to_string(), "consolidated_by": "agent"});
+        let wrong_id = store.writer.upsert_page(wrong_session).await.unwrap();
+        let remaining = store
+            .reader
+            .session_summary_backfill_candidates(cutoff, 200, None, None)
+            .await
+            .unwrap();
+        assert_eq!(remaining[1].seen_page_id, Some(wrong_id));
+        assert!(!apply_backfill_test_page(&store, &remaining[1]).await);
+        assert!(matches!(
+            store
+                .writer
+                .backfill_session_summary(remaining[1].clone(), None)
+                .await
+                .unwrap(),
+            ConditionalUpsert::Mismatch { .. }
+        ));
+    }
+
+    async fn backfill_fixture(
+        count: usize,
+    ) -> (TempDir, Store, WorkspaceId, ProjectId, i64, Vec<SessionId>) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let cutoff = now - 30 * 86_400_000_000;
+        let mut sessions = Vec::new();
+        for index in 0..count {
+            sessions.push(
+                aged_open_session(&store, ws, proj, cutoff - 1_000 + 10 * index as i64, 3).await,
+            );
+        }
+        assert_eq!(
+            store.writer.close_abandoned_sessions(cutoff).await.unwrap() as usize,
+            count
+        );
+        (tmp, store, ws, proj, cutoff, sessions)
+    }
+
+    async fn apply_backfill_test_page(
+        store: &Store,
+        candidate: &SessionSummaryBackfillCandidate,
+    ) -> bool {
+        let page = backfill_test_page(
+            candidate.workspace_id,
+            candidate.project_id,
+            candidate.session_id,
+        );
+        matches!(
+            store
+                .writer
+                .backfill_session_summary(candidate.clone(), Some(page))
+                .await
+                .unwrap(),
+            ConditionalUpsert::Upserted(_)
+        )
+    }
+
+    async fn assert_backfill_race_loses(
+        store: &Store,
+        candidate: &SessionSummaryBackfillCandidate,
+    ) {
+        assert!(
+            !apply_backfill_test_page(store, candidate).await,
+            "a stale candidate must lose"
+        );
+        assert!(
+            store
+                .reader
+                .latest_page_id_by_ids(
+                    candidate.workspace_id,
+                    candidate.project_id,
+                    format!("sessions/{}.md", candidate.session_id)
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "the failed stamp must roll the page back"
+        );
+    }
+
+    fn backfill_test_page(ws: WorkspaceId, proj: ProjectId, sid: SessionId) -> NewPage {
+        NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(format!("sessions/{sid}.md")).unwrap(),
+            title: "Backfill fixture".into(),
+            body: "Fixture work distilled into a durable summary.".into(),
+            tier: ai_memory_core::Tier::Episodic,
+            frontmatter_json: serde_json::json!({"session_id": sid.to_string()}),
+            pinned: false,
+            links: vec![],
+            author_id: None,
+            expires_at: None,
+            entities: vec![],
+            evidence: vec![],
+            trust_class: Some(ai_memory_core::TrustClass::ModelGenerated),
+        }
     }
 
     /// A session closed by the sweep returns to the auto-improvement queue
