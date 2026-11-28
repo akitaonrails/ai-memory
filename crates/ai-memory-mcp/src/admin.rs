@@ -16231,7 +16231,6 @@ mod tests {
             })
         );
 
-        let started = std::time::Instant::now();
         let mut confirm = scoped.clone();
         confirm["confirm"] = true.into();
         let (status, report) = admin_call(
@@ -16242,7 +16241,6 @@ mod tests {
             Some(confirm.clone()),
         )
         .await;
-        let elapsed = started.elapsed();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(report, preview);
         assert_eq!(snapshot(), (22, 0, 0, 22));
@@ -16250,16 +16248,6 @@ mod tests {
             wiki.read_page(ws, proj, &path).unwrap().frontmatter["session_id"],
             ids[0].to_string()
         );
-        let bytes: u64 = ids[..22]
-            .iter()
-            .map(|id| {
-                let path = PagePath::new(format!("sessions/{id}.md")).unwrap();
-                std::fs::metadata(wiki.abs_path(ws, proj, &path))
-                    .unwrap()
-                    .len()
-            })
-            .sum();
-        eprintln!("backfill HTTP sample: 22 summaries in {elapsed:?}, {bytes} wiki bytes");
 
         let prune = store
             .writer

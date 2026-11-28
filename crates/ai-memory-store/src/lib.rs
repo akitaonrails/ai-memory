@@ -5615,7 +5615,6 @@ mod tests {
         };
         assert_eq!(prune().await.unwrap().deleted, 0);
 
-        let started = std::time::Instant::now();
         let selected = store
             .reader
             .session_summary_backfill_candidates(now - 30 * day, 200, None, None)
@@ -5625,7 +5624,6 @@ mod tests {
         let candidate = &selected[0];
         assert_eq!(candidate.session_id, sid);
         let page = backfill_test_page(ws, proj, sid);
-        let bytes = page.body.len();
         let result = store
             .writer
             .backfill_session_summary(candidate.clone(), Some(page))
@@ -5634,10 +5632,6 @@ mod tests {
         let ConditionalUpsert::Upserted(page_id) = result else {
             panic!("expected summary page")
         };
-        eprintln!(
-            "backfill store sample: {:?}, {bytes} body bytes",
-            started.elapsed()
-        );
         let (actual, watermark, ended): (Vec<u8>, i64, i64) = db.query_row(
             "SELECT summary_page_id, ended_observation_count, ended_at FROM sessions WHERE id = ?1",
             [sid.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
