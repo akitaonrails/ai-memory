@@ -132,6 +132,11 @@ version in [`docs/changelog/`](docs/changelog/):
   outlasts a proxy timeout is followed instead of cut off with `524`. Both forms
   share one single-flight slot and answer `409` while a compaction runs (#2547).
 
+- Added `AI_MEMORY_WORKER_THREADS` and `AI_MEMORY_MAX_BLOCKING_THREADS` as
+  process-level controls for the multi-thread Tokio runtime. Unset, malformed,
+  or over-limit values independently preserve Tokio's native worker resolution
+  and default blocking cap. (#2555)
+
 ### Fixed
 
 - Completed the English and Brazilian Portuguese help and installer

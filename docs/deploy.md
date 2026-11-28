@@ -343,6 +343,35 @@ storage. They also measure the store, not the HTTP front door; an install that
 saturates this is far more likely to be limited by the agent side than by
 SQLite.
 
+### Bounding Tokio runtime threads
+
+`AI_MEMORY_WORKER_THREADS` and `AI_MEMORY_MAX_BLOCKING_THREADS` are process-level
+environment controls for commands that use the multi-thread Tokio runtime,
+including `serve`. They are read once before configuration loading. Current-thread
+commands such as `hook` and `hook-drain` do not use them, and neither variable is
+a `config.toml` key.
+
+For workers, a valid `AI_MEMORY_WORKER_THREADS` overrides Tokio's native
+`TOKIO_WORKER_THREADS`; without that ai-memory override, Tokio uses its native
+variable and then `available_parallelism()`. The worker value sets an exact
+count from 1 through 256. `AI_MEMORY_MAX_BLOCKING_THREADS` sets an additional
+blocking-pool cap from 1 through 512; when unset, that cap remains Tokio's
+default of 512.
+
+Zero, malformed, non-Unicode, parse-overflowing, and over-limit ai-memory values
+are ignored independently and silently. In particular, a rejected worker value
+does not clamp the pool to 256: it leaves Tokio's native resolution untouched,
+and the result can exceed the accepted range. This early scheduler setup runs
+before localization and logging, so it does not emit a separate startup warning.
+
+When both ai-memory values are valid, their combined maximum is 256 worker plus
+512 additional blocking threads (768). That is not a hard process-thread limit:
+Tokio or other libraries can create other threads, and a native worker fallback
+can make the total larger. The blocking pool also serves stdio transport,
+DNS, and `spawn_blocking`. With stdio, a cap that is too low can leave work
+queued behind the stdin read; in particular, do not treat `1` as a recommended
+production setting without a workload-specific saturation test.
+
 ## Reclaiming disk space
 
 SQLite does not return deleted space to the filesystem. Deleted rows leave

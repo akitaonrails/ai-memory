@@ -350,6 +350,37 @@ local. Eles também medem a camada de persistência, e não a porta de entrada H
 sature isso terá muito mais probabilidade de ser limitada pelo lado do agente do que pelo
 SQLite.
 
+### Limitando as threads do runtime Tokio
+
+`AI_MEMORY_WORKER_THREADS` e `AI_MEMORY_MAX_BLOCKING_THREADS` são controles de
+ambiente no nível do processo para comandos que usam o runtime Tokio
+multithread, incluindo `serve`. Eles são lidos uma vez antes do carregamento da
+configuração. Comandos de thread única, como `hook` e `hook-drain`, não os usam,
+e nenhuma das variáveis é uma chave de `config.toml`.
+
+Para workers, um `AI_MEMORY_WORKER_THREADS` válido substitui o
+`TOKIO_WORKER_THREADS` nativo do Tokio; sem esse override do ai-memory, o Tokio
+usa sua variável nativa e depois `available_parallelism()`. O valor de workers
+define uma contagem exata de 1 a 256. `AI_MEMORY_MAX_BLOCKING_THREADS` define um
+teto de 1 a 512 para o pool adicional de bloqueio; quando ausente, esse teto
+permanece no padrão 512 do Tokio.
+
+Valores zero, malformados, não Unicode, com overflow de parsing ou acima do
+limite nas variáveis do ai-memory são ignorados independentemente e sem aviso.
+Em particular, um valor de worker rejeitado não limita o pool a 256: ele mantém
+intacta a resolução nativa do Tokio, cujo resultado pode exceder o intervalo
+aceito. Essa configuração inicial do scheduler ocorre antes da localização e do
+logging, portanto não emite um aviso separado na inicialização.
+
+Quando ambos os valores do ai-memory são válidos, o máximo combinado é 256
+workers mais 512 threads adicionais de bloqueio (768). Isso não é um limite
+rígido de threads do processo: o Tokio ou outras bibliotecas podem criar outras
+threads, e um fallback de worker nativo pode aumentar o total. O pool de
+bloqueio também atende transporte stdio, DNS e `spawn_blocking`. Com stdio, um
+teto baixo demais pode deixar trabalho enfileirado atrás da leitura de stdin; em
+particular, não trate `1` como configuração de produção recomendada sem um teste
+de saturação específico para a carga de trabalho.
+
 ## Recuperando espaço em disco
 
 O SQLite não devolve espaço excluído ao sistema de arquivos. Linhas excluídas deixam
