@@ -1829,6 +1829,15 @@ pub struct ConsolidationSettings {
     /// Maximum tokens the provider may generate for a consolidation response.
     /// Small-context models must lower this together with `max_input_tokens`.
     pub max_output_tokens: u32,
+    /// Opt-in map-reduce stage budget, in the same approximate token unit as
+    /// `max_input_tokens` (`0` = off). When the normal projection would omit
+    /// or truncate evidence, this is the packing target for stages:
+    /// `effective_input_chars(chunk_input_tokens, input_token_safety_margin)`
+    /// characters of content. A single part larger than the target still
+    /// opens its own stage; every call is hard-capped by `max_input_tokens`.
+    /// Sessions that fit keep the single-request pipeline byte for byte. Env:
+    /// `AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`.
+    pub chunk_input_tokens: usize,
     /// Safety margin applied to the `max_input_tokens` budget (`0 < m <= 1`).
     ///
     /// `max_input_tokens` is an approximate char-count heuristic (a flat
@@ -1856,6 +1865,7 @@ impl Default for ConsolidationSettings {
             verbatim_residue: false,
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            chunk_input_tokens: 0,
             input_token_safety_margin:
                 ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
             output_language: None,
@@ -3127,6 +3137,32 @@ impl Config {
                  max_input_tokens, or raise input_token_safety_margin towards 1.0",
                 config.consolidation.max_input_tokens
             );
+        }
+        // The opt-in map-reduce stage budget uses the same char heuristic
+        // and margin as the main prompt. Refuse a positive value that cannot
+        // carry one minimal observation part plus the fixed stage prompts,
+        // and one above the main budget (a stage must not exceed the final
+        // prompt it feeds). Zero keeps the old path untouched.
+        let chunk_input_tokens = config.consolidation.chunk_input_tokens;
+        if chunk_input_tokens > 0 {
+            if chunk_input_tokens > config.consolidation.max_input_tokens {
+                anyhow::bail!(
+                    "consolidation.chunk_input_tokens ({chunk_input_tokens}) cannot exceed \
+                     consolidation.max_input_tokens ({})",
+                    config.consolidation.max_input_tokens
+                );
+            }
+            let chunk_chars =
+                ai_memory_consolidate::effective_input_chars(chunk_input_tokens, safety_margin);
+            let minimum = ai_memory_consolidate::min_chunk_input_chars();
+            if chunk_chars < minimum {
+                anyhow::bail!(
+                    "consolidation.chunk_input_tokens must leave at least {minimum} \
+                     characters for a map stage ({chunk_input_tokens} tokens at \
+                     input_token_safety_margin = {safety_margin} gives {chunk_chars}); \
+                     raise chunk_input_tokens or input_token_safety_margin"
+                );
+            }
         }
         let min_output_tokens = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
         if config.consolidation.max_output_tokens < min_output_tokens {
@@ -6585,6 +6621,41 @@ max_input_tokens = {tokens}
                 "unexpected error for {value}: {error:#}"
             );
         }
+    }
+
+    /// The map-reduce key is off by default, stays at or below the main
+    /// input budget, and a positive value must leave room for one minimal
+    /// stage input at the configured margin.
+    #[test]
+    fn load_validates_the_optional_map_reduce_chunk_budget() {
+        assert_eq!(Config::default().consolidation.chunk_input_tokens, 0);
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        for (contents, expected) in [
+            (
+                "[consolidation]\nchunk_input_tokens = 16000\nmax_input_tokens = 9000\n",
+                "cannot exceed",
+            ),
+            (
+                "[consolidation]\nchunk_input_tokens = 1\n",
+                "must leave at least",
+            ),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            let error = Config::load(Some(&path), Some(tmp.path().to_path_buf()))
+                .expect_err("an infeasible chunk budget must fail closed");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected: {error:#}"
+            );
+        }
+        std::fs::write(
+            &path,
+            "[consolidation]\nchunk_input_tokens = 6000\nmax_input_tokens = 9000\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.consolidation.chunk_input_tokens, 6_000);
     }
 
     /// #884: the input-token safety margin must stay in `(0.0, 1.0]` — a

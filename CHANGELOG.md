@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added opt-in `[consolidation] chunk_input_tokens` (env
+  `AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`, default `0` = off). Sessions
+  whose projection would omit or truncate evidence are consolidated through
+  checkpointed, grounded map-reduce stages instead of a lossy single prompt;
+  sessions that fit kept the same request. Completed stages are scoped by
+  `(workspace, project, session, fingerprint)` and pruned after publication.
+
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
   Providers that return only JSON continue to contribute estimates.

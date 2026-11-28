@@ -916,6 +916,12 @@ fn is_terminal_session_consolidation_error(
             !llm.is_transient() && !llm.is_quota_exhausted() && !llm.is_transport_unreachable()
         }
         ai_memory_consolidate::ConsolidatorError::Serde(_) => true,
+        // Map-reduce validation is deterministic on unchanged input: a
+        // second attempt re-sends the same expensive stages and fails the
+        // same way. One queue attempt per execution.
+        ai_memory_consolidate::ConsolidatorError::UngroundedExtractions(_)
+        | ai_memory_consolidate::ConsolidatorError::IncompleteCoverage(_)
+        | ai_memory_consolidate::ConsolidatorError::ChunkDoesNotFit => true,
         _ => false,
     }
 }
@@ -3505,6 +3511,10 @@ fn configure_consolidator(
                 config.consolidation.max_input_tokens,
                 config.consolidation.max_output_tokens,
                 config.consolidation.input_token_safety_margin,
+            )
+            .with_chunking(
+                config.consolidation.chunk_input_tokens,
+                config.consolidation.input_token_safety_margin,
             ),
         )
     });
@@ -5797,6 +5807,10 @@ mod tests {
 
         let terminal = [
             ConsolidatorError::Serde("truncated json".into()),
+            // Map-reduce validation is deterministic: one queue attempt.
+            ConsolidatorError::UngroundedExtractions("private id".into()),
+            ConsolidatorError::IncompleteCoverage("private id".into()),
+            ConsolidatorError::ChunkDoesNotFit,
             ConsolidatorError::Llm(LlmError::AllCandidatesFailed {
                 attempted: 1,
                 summary: "mixed provider failure".into(),

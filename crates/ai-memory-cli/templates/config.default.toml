@@ -582,6 +582,17 @@ max_output_tokens = 32000
 # reaches the provider.
 # verbatim_residue = false
 #
+# Opt-in map-reduce for sessions whose observations do not fit the normal
+# projection. 0 (default) keeps the single-request pipeline untouched. A
+# positive value is the packing target in the same approximate token unit
+# as max_input_tokens and cannot exceed it: map/reduce stages pack parts toward
+# chunk_input_tokens * 3 * input_token_safety_margin effective characters.
+# A single larger part opens its own stage; every call is hard-capped by
+# max_input_tokens. Only sessions that would omit or truncate evidence pay
+# for the extra calls;
+# completed stages are checkpointed so an interrupted job resumes them.
+# chunk_input_tokens = 0
+#
 # Multiplier on the max_input_tokens budget, above 0 and at most 1.
 # max_input_tokens is a flat chars-per-token estimate, so it under-budgets denser
 # corpora: pt-BR text and source code tokenize at fewer characters per token

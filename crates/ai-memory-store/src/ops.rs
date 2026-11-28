@@ -8557,6 +8557,105 @@ pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreRe
     Ok(())
 }
 
+/// One recorded map-reduce consolidation stage, loaded for resume.
+/// Reuse decisions compare the content fingerprint, so the table's
+/// `created_at` bookkeeping column cannot change which stages resume.
+#[derive(Debug, Clone)]
+pub struct ConsolidationChunkRecord {
+    /// Content-derived fingerprint of the stage.
+    pub chunk_fingerprint: String,
+    /// The stage's validated output, serialized as JSON.
+    pub extraction_json: String,
+}
+
+/// Durably record one validated map-reduce stage. The scope triple is part
+/// of the primary key, so a foreign scope can neither read nor clobber it.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn record_consolidation_chunk(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+    chunk_fingerprint: &str,
+    extraction_json: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO consolidation_chunk_progress \
+         (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes(),
+            chunk_fingerprint,
+            extraction_json,
+            Timestamp::now().as_microsecond(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load every recorded stage for one session's scope, ordered by
+/// fingerprint — deterministic and independent of the wall clock.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn load_consolidation_chunks(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> StoreResult<Vec<ConsolidationChunkRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_fingerprint, extraction_json \
+         FROM consolidation_chunk_progress \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3 \
+         ORDER BY chunk_fingerprint",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                session_id.as_bytes(),
+            ],
+            |row| {
+                Ok(ConsolidationChunkRecord {
+                    chunk_fingerprint: row.get(0)?,
+                    extraction_json: row.get(1)?,
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete every recorded stage for one session's scope. Called after a
+/// successful publication; a crash before this delete is reconciled by the
+/// anchor page's marker.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn clear_consolidation_chunks(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM consolidation_chunk_progress \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Delete a project's rows inside one transaction.
 ///
 /// This is a *logical* delete unless `compaction` is [`Compaction::Reclaim`].
@@ -22946,5 +23045,50 @@ pub(crate) mod tests {
                 .unwrap(),
             "the re-parked session must stay out of the scheduler queue"
         );
+    }
+
+    /// The map-reduce checkpoint key is the full typed scope. Even an
+    /// identical fingerprint under another workspace, project or session
+    /// must be invisible to both load and clear.
+    #[test]
+    fn consolidation_chunk_progress_is_scoped_per_workspace_project_session() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let session = ai_memory_core::SessionId::new();
+        let foreign = [
+            (WorkspaceId::new(), proj, session),
+            (ws, ProjectId::new(), session),
+            (ws, proj, ai_memory_core::SessionId::new()),
+        ];
+        for (other_ws, other_proj, other_session) in &foreign {
+            record_consolidation_chunk(
+                &conn,
+                other_ws,
+                other_proj,
+                other_session,
+                "same-fingerprint",
+                "foreign stage",
+            )
+            .unwrap();
+        }
+        record_consolidation_chunk(&conn, &ws, &proj, &session, "same-fingerprint", "own stage")
+            .unwrap();
+        let loaded = load_consolidation_chunks(&conn, &ws, &proj, &session).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].extraction_json, "own stage");
+        clear_consolidation_chunks(&conn, &ws, &proj, &session).unwrap();
+        assert!(
+            load_consolidation_chunks(&conn, &ws, &proj, &session)
+                .unwrap()
+                .is_empty()
+        );
+        for (other_ws, other_proj, other_session) in &foreign {
+            let rows =
+                load_consolidation_chunks(&conn, other_ws, other_proj, other_session).unwrap();
+            assert_eq!(rows.len(), 1, "a foreign scope must keep its own row");
+            assert_eq!(rows[0].extraction_json, "foreign stage");
+        }
     }
 }

@@ -224,6 +224,86 @@ pub struct ConsolidatedBatch {
     pub rationale: String,
 }
 
+/// Semantic class of one typed evidence extraction from map-reduce
+/// consolidation. Closed vocabulary so the reduce stage merges
+/// like-with-like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionKind {
+    /// Project chose X over Y (ADR-shaped).
+    Decision,
+    /// A failure mode or surprise worth remembering.
+    Gotcha,
+    /// Durable project convention ("always X", "never Y").
+    Rule,
+    /// A reusable workflow or operating pattern.
+    Procedure,
+    /// An evergreen concept the session clarified.
+    Concept,
+    /// Episodic narrative or anything that fits no stronger category.
+    #[default]
+    Fact,
+}
+
+impl ExtractionKind {
+    /// Wire string for serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Gotcha => "gotcha",
+            Self::Rule => "rule",
+            Self::Procedure => "procedure",
+            Self::Concept => "concept",
+            Self::Fact => "fact",
+        }
+    }
+}
+
+/// One grounded evidence extraction produced by the map stage.
+///
+/// `observation_ids` is the load-bearing field: every extraction must cite
+/// the exact ids of the observations it came from. The reduce stage unions
+/// ids when merging; the final stage cites them in the page body.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EvidenceExtraction {
+    /// Observation ids this extraction is grounded in. Non-empty and
+    /// validated against the stage's input before it is checkpointed.
+    pub observation_ids: Vec<String>,
+    /// Semantic class of the extraction.
+    pub kind: ExtractionKind,
+    /// Short page-worthy title.
+    pub title: String,
+    /// One line of plain prose describing the evidence.
+    pub summary: String,
+    /// Short markdown note grounded only in the cited observations.
+    pub body_markdown: String,
+    /// Optional short tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Specific nouns this extraction names.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Model confidence in the extraction, 0..=1, checked at ingestion.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub confidence: f64,
+}
+
+/// Structured output of one map or reduce stage. At most ten extractions;
+/// every input id must be cited or listed in `no_durable_fact_ids`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExtractionResult {
+    /// Stage extractions. Empty is allowed only when
+    /// `no_durable_fact_ids` accounts for the whole stage input.
+    pub extractions: Vec<EvidenceExtraction>,
+    /// Brief LLM-authored note about what the stage did.
+    #[serde(default)]
+    pub rationale: String,
+    /// Input ids inspected but judged to carry no durable fact.
+    #[serde(default)]
+    pub no_durable_fact_ids: Vec<String>,
+}
+
 /// Outcome of a single consolidation call.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsolidationOutcome {
