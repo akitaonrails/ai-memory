@@ -36,6 +36,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         wiki,
         llm_providers: ai_memory_llm::LlmProviders::default(),
         auto_improve_require_approval: false,
+        auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
