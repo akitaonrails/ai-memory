@@ -219,7 +219,7 @@ installed instructions, like the harnesses in the last row below.
 | Codex | Automatic (native hook): `SessionStart` with source `compact`, as developer context before the next model request |
 | Factory Droid | Automatic (native hook): `SessionStart` with source `compact`, appended to the new session context |
 | OpenCode V1 | Automatic: the `experimental.session.compacting` hook adds one line to `output.context` asking the summary to keep the session id and point at ai-memory, and `session.compacted` arms the anchor for the system transform until the next compaction |
-| OpenCode V2 | Automatic: the `compaction` hook adds the same line as a `system` part, and `session.compaction.ended` arms the anchor for the `context` hook until the next compaction |
+| OpenCode V2 | Automatic: the `compaction` hook adds the same line as a `system` part, and the `context` hook arms the anchor from the `<conversation-checkpoint>` message that opens the history, so it rides every model call from the first one until the next compaction |
 | Gemini CLI, Cursor, GitHub Copilot CLI, Kimi Code, Grok Build, Kiro CLI, Cline, Muse Code and the rest | Instructions only: these harnesses have no hook that can add context after a compaction (Muse reports a `compact` source, but its output contract is unpublished, so its compaction start only skips the handoff claim), so the agent follows the installed instructions and reads its own session's prompts |
 
 When no anchor arrives, the agent calls `memory_read_session_observations`

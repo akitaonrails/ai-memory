@@ -535,7 +535,7 @@ por padrão através do caminho de mutação da wiki. Com `require_approval = tr
 | `memory_auto_improve` | Revisa manualmente a sessão mais recente concluída sem execução de autoaprimoramento persistida, ou executa novamente de forma explícita uma sessão indicada, e aplica ou prepara propostas validadas pelo mesmo caminho. Uma execução vazia registra uma dispensa preliminar para que a próxima chamada implícita avance. |
 | `ai-memory curator` | Revisão de manutenção baseada em regras, apenas relatório. |
 | `ai-memory curator --stage` | Prepara exatamente uma página de relatório do curador para aprovação em pending-writes. |
-| `ai-memory pending-writes list` | Exibe alterações preparadas na wiki. |
+| `ai-memory pending-writes list` | Exibe alterações preparadas na wiki em um workspace e projeto; uma resposta vazia informa o escopo lido. |
 | `ai-memory pending-writes diff <id>` | Exibe o diff em markdown. |
 | `ai-memory pending-writes approve <id>` | Aplica através do caminho normal de mutação da wiki. |
 | `ai-memory pending-writes reject <id>` | Descarta proposta com trilha de auditoria. |

@@ -7570,7 +7570,7 @@ mod tests {
         assert_eq!(
             store
                 .reader
-                .page_meta_by_id(session_id)
+                .page_meta_by_id(session_id, None)
                 .await
                 .unwrap()
                 .unwrap()
@@ -7580,7 +7580,7 @@ mod tests {
         assert_eq!(
             store
                 .reader
-                .page_meta_by_path("concepts/concept.md")
+                .page_meta_by_path("concepts/concept.md", None)
                 .await
                 .unwrap()
                 .unwrap()

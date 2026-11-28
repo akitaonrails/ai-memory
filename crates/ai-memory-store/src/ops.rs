@@ -8980,7 +8980,16 @@ pub fn purge_project(
     // Query signals this project's sessions filed under OTHER projects carry
     // their query text; the cascade below only reaches this project's rows.
     // Must run before the cascade removes the sessions it matches against.
-    delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
+    // A project id paired with another workspace deletes no project, so it
+    // must not take that live project's signals either.
+    let owned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1 AND workspace_id = ?2)",
+        rusqlite::params![&pid[..], workspace_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if owned {
+        delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
+    }
 
     // Explicit cleanup for map-reduce checkpoints alongside the FK cascade.
     tx.execute(

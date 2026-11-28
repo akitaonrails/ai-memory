@@ -23,8 +23,10 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::openai::normalize_openai_base;
-use crate::response::{provider_error, response_json_limited, response_text_limited};
-use crate::text::{truncate_for_embedding, truncate_with_ellipsis};
+use crate::response::{
+    provider_error, response_json_limited, response_text_limited, scrubbed_body,
+};
+use crate::text::truncate_for_embedding;
 
 /// Conservative per-request input cap for OpenAI-compatible embedding APIs
 /// (8192 token server limit; we stay well below with head truncation).
@@ -221,7 +223,7 @@ struct OpenAiEmbeddingDatum {
 pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResult<Vec<f32>> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| LlmError::Provider {
         status,
-        body: truncate_with_ellipsis(&format!("openai embeddings json: {e}; body={body}"), 1024),
+        body: scrubbed_body(&format!("openai embeddings json: {e}; body={body}"), 1024),
         retry_after: None,
     })?;
     if let Some(err) = v.get("error") {
@@ -232,17 +234,14 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
             .unwrap_or("unknown");
         return Err(LlmError::Provider {
             status,
-            body: truncate_with_ellipsis(msg, 1024),
+            body: scrubbed_body(msg, 1024),
             retry_after: None,
         });
     }
     if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
         let first = data.first().ok_or_else(|| LlmError::Provider {
             status,
-            body: truncate_with_ellipsis(
-                &format!("openai embeddings data[] empty; body={body}"),
-                512,
-            ),
+            body: scrubbed_body(&format!("openai embeddings data[] empty; body={body}"), 512),
             retry_after: None,
         })?;
         let emb = first
@@ -250,7 +249,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
             .and_then(|e| e.as_array())
             .ok_or_else(|| LlmError::Provider {
                 status,
-                body: truncate_with_ellipsis(
+                body: scrubbed_body(
                     &format!("missing embedding array in data[0]; body={body}"),
                     512,
                 ),
@@ -260,7 +259,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
         for n in emb {
             let f = n.as_f64().ok_or_else(|| LlmError::Provider {
                 status,
-                body: truncate_with_ellipsis(
+                body: scrubbed_body(
                     &format!("non-numeric embedding value in data[0]; body={body}"),
                     512,
                 ),
@@ -276,16 +275,13 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
     let parsed: OpenAiEmbeddingResponse =
         serde_json::from_value(v).map_err(|e| LlmError::Provider {
             status,
-            body: truncate_with_ellipsis(
-                &format!("openai embeddings shape: {e}; body={body}"),
-                1024,
-            ),
+            body: scrubbed_body(&format!("openai embeddings shape: {e}; body={body}"), 1024),
             retry_after: None,
         })?;
     let first = parsed.data.into_iter().next().ok_or_else(|| {
         LlmError::UnexpectedShape(format!(
             "openai response had no data[0]; body={}",
-            truncate_with_ellipsis(body, 512)
+            scrubbed_body(body, 512)
         ))
     })?;
     Ok(first.embedding)
@@ -1276,5 +1272,44 @@ mod tests {
         .with_prefixes("query: ", "passage: ");
         assert_eq!(e.query_prefix, "query: ");
         assert_eq!(e.document_prefix, "passage: ");
+    }
+
+    fn body_of(err: LlmError) -> String {
+        match err {
+            LlmError::Provider { body, .. } => body,
+            LlmError::UnexpectedShape(body) => body,
+            other => panic!("expected a body-carrying error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_errors_scrub_a_secret_in_the_provider_body() {
+        let secret = format!("ghp_{}", "FAKEfake0123".repeat(3));
+        let bodies = [
+            // Malformed JSON.
+            format!("not json {secret}"),
+            // Top-level `error` object.
+            format!(r#"{{"error":{{"message":"{secret}"}}}}"#),
+            // `data` present but empty.
+            format!(r#"{{"data":[],"x":"{secret}"}}"#),
+            // `data[0]` without an embedding array.
+            format!(r#"{{"data":[{{"x":"{secret}"}}]}}"#),
+            // A non-numeric embedding value.
+            format!(r#"{{"data":[{{"embedding":["{secret}"]}}]}}"#),
+            // Strict-shape fallback (no `data` array at all).
+            format!(r#"{{"x":"{secret}"}}"#),
+        ];
+        for body in bodies {
+            let error = parse_openai_embedding_values(&body, 200).expect_err("must fail");
+            let rendered = body_of(error);
+            assert!(
+                !rendered.contains(&secret),
+                "secret leaked into the error body: {rendered}"
+            );
+            assert!(
+                rendered.contains("[REDACTED"),
+                "expected a redaction marker: {rendered}"
+            );
+        }
     }
 }

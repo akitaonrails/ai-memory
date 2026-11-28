@@ -817,6 +817,112 @@ async fn purges_delete_query_signals_a_session_left_in_another_project() {
     );
 }
 
+/// Adversarial: `purge_project` with a project id paired with ANOTHER
+/// workspace deletes no project, so it must not delete the query text that
+/// live project's sessions left in a sibling project either. Control: the
+/// right pair removes it.
+#[tokio::test]
+async fn purge_project_with_a_foreign_workspace_keeps_the_query_signals() {
+    use ai_memory_core::{AgentKind, NewSession, SessionId};
+    use ai_memory_store::{Compaction, PurgeMode};
+    let (_tmp, store, ws, proj_a) = two_page_store().await;
+    let proj_b = store
+        .writer
+        .get_or_create_project(ws, "other".to_string(), None)
+        .await
+        .unwrap();
+    let foreign_ws = store
+        .writer
+        .get_or_create_workspace("foreign".to_string())
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: SessionId::from_native("a-live-session"),
+            workspace_id: ws,
+            project_id: proj_a,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    let page_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj_b,
+            "notes/by-live.md",
+            "by-live",
+            "zebraquux",
+            Tier::Semantic,
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .record_query_page_signal(
+            ws,
+            proj_b,
+            page_id,
+            "zebraquux private question".to_string(),
+            Some("a-live-session".to_string()),
+        )
+        .await
+        .unwrap();
+    let signal_survives = || async {
+        store
+            .reader
+            .query_signals_for_pages(ws, proj_b, vec![page_id])
+            .await
+            .unwrap()
+            .get(&page_id)
+            .is_some_and(|rows| !rows.is_empty())
+    };
+    assert!(signal_survives().await);
+
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        store
+            .writer
+            .purge_project(
+                foreign_ws,
+                proj_a,
+                "foreign/app",
+                None,
+                false,
+                Compaction::Skip,
+                mode,
+            )
+            .await
+            .unwrap();
+        assert!(
+            signal_survives().await,
+            "a foreign pair must not delete a live project's query signals ({mode:?})"
+        );
+    }
+
+    store
+        .writer
+        .purge_project(
+            ws,
+            proj_a,
+            "default/app",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !signal_survives().await,
+        "control: the right pair deletes the query text its sessions left"
+    );
+}
+
 /// `forget_query_page_signal` (the `not_helpful` negative signal) removes
 /// exactly the matching (query, page) association.
 #[tokio::test]

@@ -35,6 +35,7 @@ mod mcp_bridge_stdio;
 mod message_e2e;
 mod opencode_dialect;
 mod packaging;
+mod pending_writes_list;
 mod pi_session_usage;
 mod pi_tool_exposure;
 mod plugins;

@@ -139,29 +139,75 @@ struct Shadow {
     origin: Vec<usize>,
 }
 
-impl Shadow {
-    /// The view of `text`, or `None` when `text` reads the same without one.
+/// Transport views of `text` built once per snapshot:
+/// - `fused` drops `is_default_ignorable` characters and decodes one layer of
+///   JSON string escapes, so a secret split by an invisible character or
+///   JSON-escaped is redacted whole.
+/// - `decoded_only` decodes JSON string escapes while keeping
+///   `is_default_ignorable` characters as boundaries. It is built only when
+///   `text` both decoded at least one JSON escape and dropped at least one
+///   ignorable character — otherwise it is identical to either `fused` or
+///   plain `text`. Without it, a JSON string that escapes both an invisible
+///   separator and a prefix letter (e.g. `"Bearer …\u200bBearer a\u0069m_…"`)
+///   could let the first match swallow the second keyword in `fused` while the
+///   plain pass stops at `\`.
+struct Shadows {
+    fused: Shadow,
+    decoded_only: Option<Shadow>,
+}
+
+impl Shadows {
     fn of(text: &str) -> Option<Self> {
         if !text.contains(|c: char| c == '\\' || is_default_ignorable(c)) {
             return None;
         }
-        let mut shadow = String::with_capacity(text.len());
-        let mut origin = Vec::with_capacity(text.len());
+        let mut fused_text = String::with_capacity(text.len());
+        let mut fused_origin = Vec::with_capacity(text.len());
+        let mut saw_escape = false;
+        let mut dropped_ignorable = false;
         let mut index = 0;
         while let Some(c) = text[index..].chars().next() {
-            let (c, len) = json_escape_at(text.as_bytes(), index).unwrap_or((c, c.len_utf8()));
-            if !is_default_ignorable(c) {
-                shadow.push(c);
-                origin.extend(std::iter::repeat_n(index, c.len_utf8()));
+            let (c, len) = match json_escape_at(text.as_bytes(), index) {
+                Some(decoded) => {
+                    saw_escape = true;
+                    decoded
+                }
+                None => (c, c.len_utf8()),
+            };
+            if is_default_ignorable(c) {
+                dropped_ignorable = true;
+            } else {
+                fused_text.push(c);
+                fused_origin.extend(std::iter::repeat_n(index, c.len_utf8()));
             }
             index += len;
         }
+        let decoded_only = (saw_escape && dropped_ignorable).then(|| {
+            let mut dec_text = String::with_capacity(text.len());
+            let mut dec_origin = Vec::with_capacity(text.len());
+            let mut index = 0;
+            while let Some(c) = text[index..].chars().next() {
+                let (c, len) = json_escape_at(text.as_bytes(), index).unwrap_or((c, c.len_utf8()));
+                dec_text.push(c);
+                dec_origin.extend(std::iter::repeat_n(index, c.len_utf8()));
+                index += len;
+            }
+            Shadow {
+                text: dec_text,
+                origin: dec_origin,
+            }
+        });
         Some(Self {
-            text: shadow,
-            origin,
+            fused: Shadow {
+                text: fused_text,
+                origin: fused_origin,
+            },
+            decoded_only,
         })
     }
+}
 
+impl Shadow {
     /// The span of `text` a view match `start..end` covers: from the first
     /// byte of its first character through the last byte of its last,
     /// invisible characters between them and the escapes they were decoded
@@ -236,7 +282,17 @@ impl SortedSpans {
     fn new(spans: &[(usize, usize)]) -> Self {
         let mut sorted = spans.to_vec();
         sorted.sort_unstable();
-        Self(sorted)
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+        for (start, end) in sorted {
+            if let Some(last) = merged.last_mut()
+                && start < last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        Self(merged)
     }
 
     /// The spans that overlap `span`. One pattern's view matches never
@@ -381,23 +437,31 @@ fn whole_escapes(text: &str, (mut start, mut end): (usize, usize)) -> (usize, us
     (start, end)
 }
 
-/// `text` with each span replaced by `[REDACTED:<label>]`, overlapping
-/// spans merged into one.
-fn redact_spans(text: &str, spans: Vec<(usize, usize)>, label: &str) -> String {
+/// `text` with each labeled span replaced by `[REDACTED:<label>]`. Overlapping
+/// spans (`next.start < cur.end`) are merged into one, keeping the label of
+/// the span with the lowest `pattern_index` in the merged group.
+fn redact_labeled_spans(text: &str, spans: Vec<(usize, usize, usize, &'static str)>) -> String {
     let mut spans: Vec<_> = spans
         .into_iter()
-        .map(|span| whole_escapes(text, span))
+        .map(|(start, end, pattern_index, label)| {
+            let (start, end) = whole_escapes(text, (start, end));
+            (start, end, pattern_index, label)
+        })
         .collect();
-    spans.sort_unstable();
+    spans.sort_unstable_by_key(|&(start, end, pattern_index, _)| (start, end, pattern_index));
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut spans = spans.into_iter().peekable();
-    while let Some((start, mut end)) = spans.next() {
-        while let Some(&(next_start, next_end)) = spans.peek() {
+    while let Some((start, mut end, mut best_idx, mut label)) = spans.next() {
+        while let Some(&(next_start, next_end, next_idx, next_label)) = spans.peek() {
             if next_start >= end {
                 break;
             }
             end = end.max(next_end);
+            if next_idx < best_idx {
+                best_idx = next_idx;
+                label = next_label;
+            }
             spans.next();
         }
         debug!(label, "sanitize: redacted match");
@@ -410,6 +474,14 @@ fn redact_spans(text: &str, spans: Vec<(usize, usize)>, label: &str) -> String {
     out.push_str(&text[copied..]);
     out
 }
+
+/// Exclusive end index of Tier 1 (private key blocks) in [`BUILTIN_PATTERNS`].
+const PRIVATE_KEY_TIER_END: usize = 2;
+
+/// Exclusive end index of Tier 2 (credential/token rules: `bearer_token`
+/// through `url_credentials`, stopping before `auth_header`) in
+/// [`BUILTIN_PATTERNS`].
+const CREDENTIAL_TIER_END: usize = 20;
 
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
@@ -766,53 +838,115 @@ impl Sanitizer {
         // Before the redaction passes: an escape inside a secret would
         // otherwise split it out of reach of every pattern below.
         let mut out = self.strip_control(input);
-        // Each pattern runs twice: through the transport encoding (invisible
-        // characters, JSON string escapes), so a secret split by one or quoted
-        // by the other is redacted whole, and over the text as written, which
-        // finds a match that needs an invisible character as its word
-        // boundary. Outside JSON, overlapping spans merge to the widest, so
-        // the view only ever widens a redaction: plain text holding a literal
-        // `\n` or `\"` ends a value early in the view but not as written. In
-        // a line that parses as JSON the escapes are JSON's own, so a plain
-        // match the view already covers only lets each view value's tail
-        // grow as far as `json_value_end` allows: never past its JSON string
-        // or onto the next `.env` line.
-        let mut shadow = Shadow::of(&out);
-        for pattern in &self.inner.patterns {
-            let mut spans = self.spans(&out, shadow.as_ref(), pattern);
-            if shadow.is_some() {
-                let plain = self.spans(&out, None, pattern);
-                if !plain.is_empty() {
-                    let view = SortedSpans::new(&spans);
-                    let mut json_lines = JsonLines::new(&out);
-                    let kept: Vec<_> = plain
-                        .into_iter()
-                        .flat_map(|span| {
-                            let covered = view.overlapping(span);
-                            if covered.is_empty() || !json_lines.contains(span.0) {
-                                return vec![span];
-                            }
-                            // Only each view value's own tail grows; the
-                            // view spans already cover the rest.
-                            covered
-                                .iter()
-                                .map(|&(_, end)| (end, json_value_end(&out, end).min(span.1)))
-                                .filter(|&(start, end)| end > start)
-                                .collect()
-                        })
-                        .collect();
-                    spans.extend(kept);
-                }
-            }
-            if spans.is_empty() {
-                continue;
-            }
-            out = redact_spans(&out, spans, pattern.label);
-            // Dropped first, so two views of a large result never coexist.
-            drop(shadow.take());
-            shadow = Shadow::of(&out);
+        let mut shadows = Shadows::of(&out);
+
+        // Tier 1 — Private keys: run first while their base64 body lines are
+        // intact for the credential rules below to leave alone.
+        for pattern in &self.inner.patterns[..PRIVATE_KEY_TIER_END] {
+            self.apply_sequential_pattern(&mut out, &mut shadows, pattern);
         }
+
+        // Tier 2 — Credential/token rules (`bearer_token` through
+        // `url_credentials`, stopping before `auth_header`): collect all spans
+        // across the tier against the same snapshot and merge overlapping
+        // matches before rewriting once. Rewriting sequentially would inject
+        // `[` into a surrounding credential when an inner rule matches first
+        // (e.g. `sk-…` inside `aim_…`, or `aim_…` inside `Bearer aim_…<tail>`),
+        // breaking the outer rule and leaving prefix/suffix fragments in clear.
+        let mut tier2_spans = Vec::new();
+        {
+            let mut json_lines = JsonLines::new(&out);
+            for (offset, pattern) in self.inner.patterns[PRIVATE_KEY_TIER_END..CREDENTIAL_TIER_END]
+                .iter()
+                .enumerate()
+            {
+                let pattern_index = PRIVATE_KEY_TIER_END + offset;
+                let spans = self.pattern_spans(&out, shadows.as_ref(), &mut json_lines, pattern);
+                tier2_spans.extend(
+                    spans
+                        .into_iter()
+                        .map(|(start, end)| (start, end, pattern_index, pattern.label)),
+                );
+            }
+        }
+        if !tier2_spans.is_empty() {
+            out = redact_labeled_spans(&out, tier2_spans);
+            // Dropped first, so two views of a large result never coexist.
+            drop(shadows.take());
+            shadows = Shadows::of(&out);
+        }
+
+        // Tier 3 — Structured key/header/env/path rules (`auth_header` onward)
+        // and Tier 4 — Operator `extra_patterns`: run sequentially on the
+        // Tier-2 output so `auth_header` does not re-eat `[REDACTED:…]`.
+        for pattern in &self.inner.patterns[CREDENTIAL_TIER_END..] {
+            self.apply_sequential_pattern(&mut out, &mut shadows, pattern);
+        }
+
         out
+    }
+
+    fn apply_sequential_pattern(
+        &self,
+        out: &mut String,
+        shadows: &mut Option<Shadows>,
+        pattern: &Pattern,
+    ) {
+        let mut json_lines = JsonLines::new(out);
+        let spans = self.pattern_spans(out, shadows.as_ref(), &mut json_lines, pattern);
+        if spans.is_empty() {
+            return;
+        }
+        *out = redact_labeled_spans(
+            out,
+            spans
+                .into_iter()
+                .map(|(start, end)| (start, end, 0, pattern.label))
+                .collect(),
+        );
+        // Dropped first, so two views of a large result never coexist.
+        drop(shadows.take());
+        *shadows = Shadows::of(out);
+    }
+
+    /// Collect all non-allowlisted spans of `text` matched by `pattern`,
+    /// combining the transport-decoded view(s) with the plain-text pass while
+    /// preserving JSON value boundaries on JSON lines.
+    fn pattern_spans(
+        &self,
+        text: &str,
+        shadows: Option<&Shadows>,
+        json_lines: &mut JsonLines<'_>,
+        pattern: &Pattern,
+    ) -> Vec<(usize, usize)> {
+        let mut spans = self.spans(text, shadows.map(|s| &s.fused), pattern);
+        if let Some(shadows) = shadows {
+            if let Some(decoded_only) = shadows.decoded_only.as_ref() {
+                spans.extend(self.spans(text, Some(decoded_only), pattern));
+            }
+            let plain = self.spans(text, None, pattern);
+            if !plain.is_empty() {
+                let view = SortedSpans::new(&spans);
+                let kept: Vec<_> = plain
+                    .into_iter()
+                    .flat_map(|span| {
+                        let covered = view.overlapping(span);
+                        if covered.is_empty() || !json_lines.contains(span.0) {
+                            return vec![span];
+                        }
+                        // Only each view value's own tail grows; the
+                        // view spans already cover the rest.
+                        covered
+                            .iter()
+                            .map(|&(_, end)| (end, json_value_end(text, end).min(span.1)))
+                            .filter(|&(start, end)| end > start)
+                            .collect()
+                    })
+                    .collect();
+                spans.extend(kept);
+            }
+        }
+        spans
     }
 
     /// Whether `path` may be stored as a file index key: a valid key
@@ -2609,5 +2743,97 @@ mod tests {
                 "AWS key must be redacted: {aws:?} -> {out:?}"
             );
         }
+    }
+
+    /// Overlapping Tier-2 credential rules must merge their spans before
+    /// rewriting so an inner match never injects `[` into a surrounding
+    /// credential and leaves prefix/suffix bytes in clear (GHSA-m7mm-crc8-ffcq).
+    #[test]
+    fn overlapping_credential_rules_redact_the_entire_outer_credential() {
+        assert_eq!(BUILTIN_PATTERNS[PRIVATE_KEY_TIER_END].1, "bearer_token");
+        assert_eq!(
+            BUILTIN_PATTERNS[CREDENTIAL_TIER_END - 1].1,
+            "url_credentials"
+        );
+        assert_eq!(BUILTIN_PATTERNS[CREDENTIAL_TIER_END].1, "auth_header");
+
+        let s = s();
+        let z19 = "Z".repeat(19);
+        let a20 = "A".repeat(20);
+        let z42 = "Z".repeat(42);
+
+        // 1. `sk-…` embedded inside an `aim_…` key: previously `api_key`
+        // rewrote `sk-…` first, injecting `[` and leaving `aim_<19×Z>_` clear.
+        let aim_with_sk = format!("wordaim_{z19}_sk-{a20}");
+        let out = s.scrub(&aim_with_sk);
+        assert_eq!(out, "word[REDACTED:api_key]");
+        assert!(!out.contains(&z19) && !out.contains(&a20) && !out.contains("aim_"));
+        assert_eq!(s.scrub(&out), out);
+
+        // 2. `aim_…` inside a `Bearer` token with a `.YYYYYYY` suffix:
+        // previously `ai_memory_key` stopped at `.` if it won or split the
+        // outer bearer; merged spans keep the full bearer redaction.
+        let bearer_aim = format!("Authorization: Bearer aim_{z42}A.YYYYYYY");
+        let out = s.scrub(&bearer_aim);
+        assert_eq!(out, "Authorization: [REDACTED:bearer_token]");
+        assert!(!out.contains(&z42) && !out.contains("YYYYYYY") && !out.contains("aim_"));
+        assert_eq!(s.scrub(&out), out);
+
+        // 3. `sk-…` embedded inside a JWT and inside a dotless base64 JSON token:
+        // previously `api_key` ran before `jwt`/`base64_json_token` and left
+        // the outer header/payload/signature fragments in clear.
+        let jwt_overlap = format!(
+            "eyJ{}_sk-{}.{}.{}",
+            "A".repeat(17),
+            "B".repeat(20),
+            "C".repeat(16),
+            "D".repeat(16)
+        );
+        let out = s.scrub(&jwt_overlap);
+        assert_eq!(out, "[REDACTED:api_key]");
+        assert!(
+            !out.contains("eyJ")
+                && !out.contains(&"C".repeat(16))
+                && !out.contains(&"D".repeat(16))
+        );
+        assert_eq!(s.scrub(&out), out);
+
+        let b64_overlap = format!(
+            "eyJ{}_sk-{}{}=",
+            "A".repeat(20),
+            "B".repeat(20),
+            "C".repeat(10)
+        );
+        let out = s.scrub(&b64_overlap);
+        assert_eq!(out, "[REDACTED:api_key]");
+        assert!(!out.contains("eyJ") && !out.contains(&"C".repeat(10)));
+        assert_eq!(s.scrub(&out), out);
+
+        // 4. JSON string escaping both an invisible boundary (`\u200b`) and a
+        // prefix letter (`\u0069`): dropping `\u200b` in the single fused view
+        // caused the first `Bearer` to swallow the second `Bearer` while the
+        // plain pass stopped at `\`. Test both 8-char and 10-char first tokens
+        // (10 + 6 = 16 hits `bearer_token`'s 16-char floor in `fused`).
+        for first_tok in ["ABCDEFGH", "ABCDEFGHIJ"] {
+            let escaped = format!(r#""Bearer {first_tok}\u200bBearer a\u0069m_{z42}A=YYYYYYY""#);
+            let out = s.scrub(&escaped);
+            assert!(
+                !out.contains(&z42) && !out.contains("YYYYYYY") && !out.contains(r"a\u0069m_"),
+                "{escaped} -> {out}"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+                "redaction must preserve valid JSON: {out}"
+            );
+            assert_eq!(s.scrub(&out), out);
+        }
+
+        // 5. Controls: `auth_header` stays in Tier 3 so `X-Api-Key: Bearer …`
+        // keeps its header name, and benign `wordaim_short` stays unchanged.
+        assert_eq!(
+            s.scrub("X-Api-Key: Bearer FAKEfakeFAKEfake0123456789"),
+            "X-Api-Key: [REDACTED:bearer_token]"
+        );
+        assert_eq!(s.scrub("wordaim_short"), "wordaim_short");
     }
 }

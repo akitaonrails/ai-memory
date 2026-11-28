@@ -327,7 +327,7 @@ pub fn extract_all_links(
     page_path: &PagePath,
 ) -> Vec<LinkTarget> {
     let mut links = extract_links(body, page_path);
-    links.extend(extract_relation_links(frontmatter));
+    links.extend(relation_links(frontmatter, Some(page_path)));
     links
 }
 
@@ -371,13 +371,21 @@ fn last_segment_names_a_page(target: &str) -> bool {
 /// [`Relation`] vocabulary are skipped (a typo must not silently mint a
 /// new edge kind); malformed paths are skipped likewise.
 pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget> {
+    relation_links(frontmatter, None)
+}
+
+/// [`extract_relation_links`], naming `page` in each skip warning so an
+/// operator can find the page to fix. `None` is for a caller probing a target
+/// that is not on a stored page.
+fn relation_links(frontmatter: &serde_json::Value, page: Option<&PagePath>) -> Vec<LinkTarget> {
     let Some(relations) = frontmatter.get("relations").and_then(|v| v.as_object()) else {
         return Vec::new();
     };
+    let page = page.map(|page| log_bounded(page.as_str()));
     let mut out = Vec::new();
     for (key, targets) in relations {
         let Some(relation) = ai_memory_core::Relation::parse(key) else {
-            tracing::warn!(key = %log_bounded(key), "unknown relation key in frontmatter; skipping");
+            tracing::warn!(page = page.as_deref(), key = %log_bounded(key), "unknown relation key in frontmatter; skipping");
             continue;
         };
         let Some(list) = targets.as_array() else {
@@ -393,7 +401,7 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
             let names_a_page = last_segment_names_a_page(raw_path)
                 && (!last.contains('.') || raw_path.ends_with(".md"));
             if !names_a_page {
-                tracing::warn!(target = %log_bounded(target), "relation target is not a page; skipping");
+                tracing::warn!(page = page.as_deref(), target = %log_bounded(target), "relation target is not a page; skipping");
                 continue;
             }
             let normalized = if last.contains('.') {
@@ -402,7 +410,7 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
                 format!("{raw_path}.md")
             };
             let Ok(path) = PagePath::new(normalized) else {
-                tracing::warn!(target = %log_bounded(target), "unparseable relation target; skipping");
+                tracing::warn!(page = page.as_deref(), target = %log_bounded(target), "unparseable relation target; skipping");
                 continue;
             };
             out.push(LinkTarget {
@@ -1168,6 +1176,64 @@ fn resolve_relative(page_path: &PagePath, target: &str, root_relative: bool) -> 
 }
 
 #[cfg(test)]
+pub(crate) mod log_capture {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn warn_subscriber(writer: CapturedLog) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish()
+    }
+
+    /// Captures this thread's warnings. tracing-core caches each callsite's
+    /// interest process-wide, so a parallel test reaching the same `warn!`
+    /// with no subscriber can pin it to `never` and drop the line here. A
+    /// second live `Dispatch` stops that and `rebuild_interest_cache()` heals
+    /// a callsite already pinned; the caller holds both.
+    pub(crate) fn capture_warns() -> (
+        CapturedLog,
+        tracing::subscriber::DefaultGuard,
+        tracing::Dispatch,
+    ) {
+        let captured = CapturedLog::default();
+        let companion = tracing::Dispatch::new(warn_subscriber(CapturedLog::default()));
+        let guard = tracing::subscriber::set_default(warn_subscriber(captured.clone()));
+        tracing::callsite::rebuild_interest_cache();
+        (captured, guard, companion)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1202,6 +1268,56 @@ mod tests {
             "relations": { "x".repeat(5_000): ["ok.md"] }
         });
         assert!(extract_relation_links(&fm).is_empty());
+    }
+
+    /// An operator reading the log has to find the page to fix it, and the
+    /// target alone does not say which of the wiki's pages carries it. Every
+    /// skip reason names the page when the caller knows it.
+    #[test]
+    fn skipped_relations_name_the_page_that_carries_them() {
+        let (log, _guard, _companion) = super::log_capture::capture_warns();
+        let frontmatter = serde_json::json!({
+            "relations": {
+                "not-a-relation": ["notes/other.md"],
+                "fixes": ["notes/draft.txt", "../escape.md"],
+            }
+        });
+
+        let links = extract_all_links(&frontmatter, "body", &page());
+
+        assert!(links.is_empty(), "every entry here is skipped: {links:?}");
+        let text = log.text();
+        for message in [
+            "unknown relation key in frontmatter",
+            "relation target is not a page",
+            "unparseable relation target",
+        ] {
+            let line = text
+                .lines()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("`{message}` was not logged: {text}"));
+            assert!(
+                line.contains("notes/here.md"),
+                "`{message}` must name the page: {line}"
+            );
+        }
+    }
+
+    /// The consolidation guards probe a target that is not on any page yet,
+    /// so they have no page to name and must not invent one.
+    #[test]
+    fn relation_probe_without_a_page_logs_no_page_field() {
+        let (log, _guard, _companion) = super::log_capture::capture_warns();
+        let frontmatter = serde_json::json!({ "relations": { "fixes": ["notes/draft.txt"] } });
+
+        assert!(extract_relation_links(&frontmatter).is_empty());
+
+        let text = log.text();
+        assert!(
+            text.contains("relation target is not a page"),
+            "the skip is still logged: {text}"
+        );
+        assert!(!text.contains("page="), "no page to name: {text}");
     }
 
     #[test]

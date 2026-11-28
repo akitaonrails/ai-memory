@@ -513,7 +513,7 @@ async fn search_with_request(
     // browser cache replay one actor's hits at the same URL after the
     // credentials switch, so the filtering path must run on every request.
     Ok(with_no_store(
-        Json(enrich_hits(state, hits).await?).into_response(),
+        Json(enrich_hits(state, hits, viewer).await?).into_response(),
     ))
 }
 
@@ -1468,12 +1468,16 @@ async fn lookup_project(
     })
 }
 
-async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSearchHit>, Response> {
+async fn enrich_hits(
+    state: &WebState,
+    hits: Vec<PageHit>,
+    viewer: Option<ai_memory_core::UserId>,
+) -> Result<Vec<ApiSearchHit>, Response> {
     let mut out = Vec::with_capacity(hits.len());
     for hit in hits {
         if let Some(meta) = state
             .reader
-            .page_meta_by_id(hit.id)
+            .page_meta_by_id(hit.id, viewer)
             .await
             .map_err(internal_error)?
         {

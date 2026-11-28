@@ -245,6 +245,21 @@ assert_eq "extract cwd from cursor workspace_roots" "/home/u/cur" \
 PAYLOAD_CURSOR_TOOL='{"session_id":"x","cwd":"","hook_event_name":"postToolUse","workspace_roots":["/home/u/cur"]}'
 assert_eq "extract cwd falls through cursor empty cwd" "/home/u/cur" \
     "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_TOOL")"
+# Cursor tool events with a non-empty per-command `cwd` alongside
+# `workspace_roots` must prefer `workspace_roots[0]`, falling back to `cwd`
+# only when `workspace_roots` is missing or empty (#2546).
+PAYLOAD_CURSOR_TOOL_CWD='{"session_id":"x","cwd":"/home/u/.config/foo","hook_event_name":"postToolUse","cursor_version":"2026.11.01","workspace_roots":["/checkouts/repo-a"]}'
+assert_eq "extract cwd prefers cursor workspace_roots over tool cwd" "/checkouts/repo-a" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_TOOL_CWD")"
+PAYLOAD_CURSOR_SHELL_CWD='{"session_id":"x","cwd":"/home/u/.config/foo","hook_event_name":"beforeShellExecution","cursor_version":"2026.11.01","workspace_roots":["/checkouts/repo-a"]}'
+assert_eq "extract cwd prefers cursor workspace_roots over shell cwd" "/checkouts/repo-a" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_SHELL_CWD")"
+PAYLOAD_CURSOR_EMPTY_ROOTS_CWD='{"session_id":"x","cwd":"/home/u/.config/foo","hook_event_name":"postToolUse","cursor_version":"2026.11.01","workspace_roots":[]}'
+assert_eq "extract cwd falls back to cwd when cursor workspace_roots is empty" "/home/u/.config/foo" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_EMPTY_ROOTS_CWD")"
+PAYLOAD_NON_CURSOR_BOTH='{"session_id":"x","cwd":"/home/u/.config/foo","workspace_roots":["/checkouts/repo-a"]}'
+assert_eq "extract cwd keeps cwd for non-cursor payload" "/home/u/.config/foo" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_NON_CURSOR_BOTH")"
 # A large tool result must not make extraction quadratic in the payload
 # size: `${payload#*"key"}` pinned a CPU for minutes at a few hundred KB (#870).
 BIG=$(awk 'BEGIN { for (i = 0; i < 262144; i++) printf "x" }')

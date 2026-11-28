@@ -141,6 +141,53 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed OpenCode 2 token capture for native step completion events that
   identify the response with `assistantMessageID`. (#2486)
 
+## [3.6.5] - 2026-11-28
+
+### Security
+
+- Merged overlapping credential-tier redaction spans before rewriting in both
+  `ai-memory-core` and `ai-memory-client`, and added one-layer JSON string
+  escape decoding (with an invisible-preserving boundary pass) to
+  `ai-memory-client` and `Sanitizer::scrub`, preventing overlapping credential
+  rules from leaving unredacted prefix or suffix fragments in stored
+  observations and pages. (GHSA-m7mm-crc8-ffcq)
+
+### Changed
+
+- Documented LLMTR as an endpoint for the existing `openai-compat` provider. ([#2552](https://github.com/akitaonrails/ai-memory/pull/2552))
+
+### Fixed
+
+- Preserved hook fallback IDs when the server discards a `finalize-session`
+  event and reported the refusal. (#2519)
+- Scrubbed the embedding and OAuth SSE provider error bodies before they
+  could reach the health snapshot or the admin `llm-test` route. Those two
+  paths built their own error body without the provider-error helper, so a
+  credential-shaped string echoed by an upstream endpoint could have appeared
+  in operator-visible output ([#2534](https://github.com/akitaonrails/ai-memory/pull/2534))
+- Applied the readable-repository filter to `page_meta_by_id` and
+  `page_meta_by_path`, so a page in a restricted project is not resolved for a
+  viewer who cannot read that project. Also ordered the path lookup by
+  workspace and project name so the result is deterministic ([#2536](https://github.com/akitaonrails/ai-memory/pull/2536))
+- Hardened the user-mode systemd unit with the filesystem, kernel and
+  privilege protections the system unit already had (`ProtectSystem=full`,
+  `UMask=0077`, kernel/control-group restrictions). The unit still runs as the
+  invoking user with a writable data directory ([#2537](https://github.com/akitaonrails/ai-memory/pull/2537))
+- Preserved query signals when a project purge received a mismatched workspace and project ID (#2541).
+- Named the workspace and project when pending writes were empty (#2542).
+- Included the source page in skipped relation warnings (#2542).
+- Preferred `workspace_roots[0]` over per-command `cwd` for Cursor hook
+  payloads (identified by `cursor_version` or `agent=cursor`, including Cursor
+  running `~/.claude/settings.json` hooks) across the server, native CLI,
+  shell, and PowerShell extractors, falling back to `cwd` only when
+  `workspace_roots` is missing or empty. (#2546)
+- Armed the OpenCode V2 post-compaction anchor synchronously inside the
+  `context` hook from the opening `<conversation-checkpoint>` user message
+  instead of waiting for the async `session.compaction.ended` event, and
+  stopped `session.compaction.started` from clearing an already-armed
+  anchor, so step 1 carries the anchor and `system` stays identical across
+  steps to preserve the prompt cache. (#2551)
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
@@ -6677,7 +6724,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.4...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.5...HEAD
+[3.6.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.5
 [3.6.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.4
 [3.6.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.3
 [3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
