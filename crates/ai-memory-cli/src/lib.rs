@@ -115,6 +115,13 @@ async fn dispatch(
     }
     *active_language = config.language;
     let config = Arc::new(config);
+    // A local liveness probe must not create log files or resolve credentials
+    // before its request deadline starts. It needs only the loaded bind and
+    // base path, so dispatch it before the common logging and proxy setup.
+    let command = match command {
+        Command::Healthcheck(args) => return commands::healthcheck::run(&config, args).await,
+        other => other,
+    };
     // Only the long-running server warns when file logging degrades (an
     // operator wants to know persistent logs moved); one-shot client
     // commands degrade silently: their file logs are irrelevant and the
@@ -146,6 +153,8 @@ async fn dispatch(
             commands::service_host::run(&config, args, config_path.as_deref()).await
         }
         Command::Status(args) => commands::status::run(&config, args).await,
+        // `Healthcheck` is handled in the fast-path above (before logging).
+        Command::Healthcheck(args) => commands::healthcheck::run(&config, args).await,
         Command::ListProjects(args) => commands::list_projects::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,
         Command::Backfill(args) => commands::backfill::run(&config, args).await,

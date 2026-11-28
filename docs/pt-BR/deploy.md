@@ -101,11 +101,33 @@ services:
       AI_MEMORY_ALLOWED_HOSTS: "truenas.local,192.0.2.10,localhost,127.0.0.1"
 ```
 
-O healthcheck da imagem executa `ai-memory status`, de modo que o app é exibido como saudável
-assim que o servidor responder. Aponte os clientes para `http://<nas>:49374` com o mesmo
-token, conforme descrito abaixo para qualquer servidor na LAN. Backups do dataset seguem
-[Backups](#backups): tire snapshots com `ai-memory backup`, e não uma cópia de um arquivo
-SQLite em uso.
+O healthcheck da imagem executa `ai-memory healthcheck --timeout-ms 3000`. Por
+padrão, ele obtém o host e a porta de `AI_MEMORY_BIND` e o caminho base
+normalizado de `AI_MEMORY_BASE_PATH`, e consulta
+`http://<host>:<porta><base-path>/healthz`. Endereços curinga viram loopback
+(`0.0.0.0` vira `127.0.0.1`, `[::]` vira `[::1]`); um literal IP ou `localhost`
+mantém o host, então `bind = "[::1]:49374"` é sondado em `::1`. Qualquer outro
+nome de host é rejeitado com erro explícito antes da resolução. `localhost`
+pode usar o resolvedor do sistema. Use `--url <url-base>` para sondar
+explicitamente um bind por nome de host, ou defina `bind` como um literal IP ou
+um endereço curinga.
+Ele ignora `AI_MEMORY_SERVER_URL` e proxies de ambiente, não resolve nem envia
+autenticação, e não cria arquivos de log. Se `serve` receber `--bind` ou
+`--base-path` somente pela linha de comando, defina também a variável de
+ambiente correspondente para que o processo separado da sonda veja o mesmo
+alvo. O tempo limite começa após o carregamento da configuração e cobre a
+requisição local.
+
+Para uma sonda remota explícita, execute `ai-memory healthcheck --url <url-base>`.
+Somente esse modo usa a autenticação bearer/OIDC configurada e as configurações
+normais de proxy do cliente; o tempo limite também cobre essa etapa de
+autenticação. Ambos os modos aceitam somente 2xx e nunca seguem redirecionamentos.
+Os quatro modelos Compose herdam o `HEALTHCHECK` da imagem selecionada em vez de
+substituí-lo, de modo que uma imagem antiga fixada mantenha sua própria sonda
+funcional. Aponte os clientes para `http://<nas>:49374` com o mesmo token,
+conforme descrito abaixo para qualquer servidor na LAN. Backups do dataset
+seguem [Backups](#backups): tire snapshots com `ai-memory backup`, e não uma
+cópia de um arquivo SQLite em uso.
 
 ## Segurança - autenticação por bearer token + transporte criptografado
 
@@ -469,8 +491,9 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   contêiner não está em execução ou o mapeamento de portas está vinculado a `127.0.0.1`
   em vez de `0.0.0.0`. Verifique o `docker ps` no homelab.
 - **Status `unhealthy`**: o contêiner está rodando, mas o healthcheck embutido
-  `ai-memory status` está falhando. O mais provável é que as permissões do diretório
-  de dados não correspondam ao usuário do contêiner (uid 1000). Corrija
+  `ai-memory healthcheck` está falhando. O mais provável é que o servidor não
+  esteja aceitando conexões HTTP ou que as permissões do diretório de dados
+  não correspondam ao usuário do contêiner (uid 1000). Corrija as permissões
   com `sudo chown -R 1000:1000 $DEPLOY_DIR/data` no host. Uma causa de manifestação
   mais lenta (dias, não minutos) é o esgotamento de descritores de arquivo (fd) por conexões de pares inativos
   (suspensão de laptop, oscilação de VPN) acumulando-se sem TCP keepalive; `serve`

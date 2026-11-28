@@ -1124,6 +1124,7 @@ message                     doctor               backfill
 project                     reclaim-ledger-versions  repair-split
 repair-backfill-timestamps  server               backup-agents
 restore-agents              profile              setup
+healthcheck
 ```
 
 Run `ai-memory --help` for the full tree.

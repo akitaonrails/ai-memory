@@ -75,7 +75,7 @@ ENV AI_MEMORY_IN_CONTAINER=1
 WORKDIR /data
 EXPOSE 49374
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/ai-memory", "status"]
+    CMD ["/usr/local/bin/ai-memory", "healthcheck", "--timeout-ms", "3000"]
 # Reap orphaned grandchildren of helper processes while forwarding shutdown
 # signals to the server (which handles SIGTERM and SIGINT itself).
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ai-memory"]

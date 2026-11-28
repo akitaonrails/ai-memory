@@ -1095,6 +1095,7 @@ message                     doctor               backfill
 project                     reclaim-ledger-versions  repair-split
 repair-backfill-timestamps  server               backup-agents
 restore-agents              profile              setup
+healthcheck
 ```
 
 Execute `ai-memory --help` para a árvore completa.
