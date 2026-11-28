@@ -11,6 +11,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Followed a redirect when downloading the local embedding model only when it stays on HTTPS, so the host's CDN hop keeps working while an `http` downgrade is refused. Every downloaded file is still checked against its pinned SHA-256 before the atomic rename. ([#2535](https://github.com/akitaonrails/ai-memory/pull/2535))
+
 ## [3.6.5] - 2026-11-28
 
 ### Security
@@ -57,6 +61,7 @@ version in [`docs/changelog/`](docs/changelog/):
   stopped `session.compaction.started` from clearing an already-armed
   anchor, so step 1 carries the anchor and `system` stays identical across
   steps to preserve the prompt cache. (#2551)
+
 
 ## [3.6.4] - 2026-11-27
 
