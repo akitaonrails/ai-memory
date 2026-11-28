@@ -20,6 +20,11 @@ version in [`docs/changelog/`](docs/changelog/):
   rules from leaving unredacted prefix or suffix fragments in stored
   observations and pages. (GHSA-m7mm-crc8-ffcq)
 
+### Fixed
+
+- Preserved hook fallback IDs when the server discards a `finalize-session`
+  event and reported the refusal. (#2519)
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed

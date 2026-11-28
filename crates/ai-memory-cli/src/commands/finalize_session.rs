@@ -27,6 +27,13 @@ struct HookBatchItem<'a> {
 #[derive(Debug, Deserialize)]
 struct HookBatchAck {
     accepted: usize,
+    results: Option<Vec<HookBatchResult>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookBatchResult {
+    index: usize,
+    outcome: String,
 }
 
 /// Response shape of `GET /admin/open-sessions` on the server.
@@ -336,6 +343,22 @@ async fn post_session_end_batch(
             "server accepted {} of 1 synthetic session-end events",
             ack.accepted
         );
+    }
+    // Batch acknowledgements also count terminal drops. Use the reported
+    // outcome when available and keep accepting the count-only legacy reply.
+    if let Some(results) = ack.results {
+        let [HookBatchResult { index: 0, outcome }] = results.as_slice() else {
+            bail!("invalid hook batch result for the synthetic session-end");
+        };
+        if !matches!(
+            outcome.as_str(),
+            "stored" | "replayed" | "resumed" | "ignored_end"
+        ) {
+            bail!(
+                "server refused the synthetic session-end ({})",
+                terminal_text(outcome)
+            );
+        }
     }
     Ok(())
 }
@@ -699,6 +722,7 @@ mod tests {
         let older = SessionId::new();
         let active = SessionId::new();
         let refused = SessionId::new();
+        let dropped = SessionId::new();
 
         let app = Router::new()
             .route(
@@ -720,8 +744,21 @@ mod tests {
             .route(
                 "/hook/batch",
                 post(move |Json(items): Json<Vec<Value>>| async move {
-                    if items[0]["body"]["session_id"] == refused.to_string() {
+                    let session = &items[0]["body"]["session_id"];
+                    if *session == refused.to_string() {
                         axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else if *session == dropped.to_string() {
+                        Json(json!({
+                            "accepted": 1,
+                            "results": [{"index": 0, "outcome": "dropped_policy"}]
+                        }))
+                        .into_response()
+                    } else if *session == active.to_string() {
+                        Json(json!({
+                            "accepted": 1,
+                            "results": [{"index": 0, "outcome": "stored"}]
+                        }))
+                        .into_response()
                     } else {
                         Json(json!({"accepted": 1})).into_response()
                     }
@@ -749,6 +786,16 @@ mod tests {
         let error = finalize(&config, &args).await.unwrap_err();
         assert!(error.to_string().contains("503"), "{error:#}");
         assert_eq!(fs::read_to_string(&fallback).unwrap(), refused.to_string());
+
+        fs::write(&fallback, dropped.to_string()).unwrap();
+        args.session_id = Some(dropped);
+        let result = finalize(&config, &args).await;
+        assert_eq!(
+            fs::read_to_string(&fallback).expect("a discarded end must keep the fallback ID"),
+            dropped.to_string()
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("dropped_policy"), "{error:#}");
 
         fs::write(&fallback, active.to_string()).unwrap();
         args.session_id = None;
