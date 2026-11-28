@@ -180,6 +180,26 @@ pub(crate) enum WriteCmd {
         fingerprint: String,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    RecordConsolidationChunk {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        chunk_fingerprint: String,
+        extraction_json: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    LoadConsolidationChunks {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<Vec<ops::ConsolidationChunkRecord>>>,
+    },
+    ClearConsolidationChunks {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     UpsertPage {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
@@ -1616,6 +1636,74 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ClearBootstrapProgress {
             fingerprint,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Durably record one validated map-reduce consolidation stage, keyed by
+    /// the full typed scope plus a content-derived fingerprint.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_consolidation_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        chunk_fingerprint: String,
+        extraction_json: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordConsolidationChunk {
+            workspace_id,
+            project_id,
+            session_id,
+            chunk_fingerprint,
+            extraction_json,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Load every recorded map-reduce stage for one session's scope.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn load_consolidation_chunks(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<Vec<ops::ConsolidationChunkRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LoadConsolidationChunks {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete every recorded map-reduce stage for one session's scope.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn clear_consolidation_chunks(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearConsolidationChunks {
+            workspace_id,
+            project_id,
+            session_id,
             reply: tx,
         })
         .await?;
@@ -4702,6 +4790,44 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ClearBootstrapProgress { fingerprint, reply } => {
                 let result = ops::clear_bootstrap_progress(&conn, &fingerprint);
                 send_or_warn(reply, result, "clear_bootstrap_progress");
+            }
+            WriteCmd::RecordConsolidationChunk {
+                workspace_id,
+                project_id,
+                session_id,
+                chunk_fingerprint,
+                extraction_json,
+                reply,
+            } => {
+                let result = ops::record_consolidation_chunk(
+                    &conn,
+                    &workspace_id,
+                    &project_id,
+                    &session_id,
+                    &chunk_fingerprint,
+                    &extraction_json,
+                );
+                send_or_warn(reply, result, "record_consolidation_chunk");
+            }
+            WriteCmd::LoadConsolidationChunks {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result =
+                    ops::load_consolidation_chunks(&conn, &workspace_id, &project_id, &session_id);
+                send_or_warn(reply, result, "load_consolidation_chunks");
+            }
+            WriteCmd::ClearConsolidationChunks {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result =
+                    ops::clear_consolidation_chunks(&conn, &workspace_id, &project_id, &session_id);
+                send_or_warn(reply, result, "clear_consolidation_chunks");
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);

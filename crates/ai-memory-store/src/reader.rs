@@ -5369,6 +5369,44 @@ impl ReaderPool {
         .await
     }
 
+    /// Return every observation of one session that landed in the given
+    /// scope, in chronological order. The opt-in map-reduce path uses this
+    /// only after the bounded projection proves evidence would be lost; a
+    /// session that crossed repositories keeps its other-scope rows out.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn observations_for_session_in_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<Vec<Observation>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                        title, body, importance, created_at, trust_class \
+                 FROM observations \
+                 WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+                row_to_observation,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Whether the session in the given scope holds at least one prompt or
     /// tool use: the positive "real work" predicate
     /// ([`SUBSTANTIVE_OBSERVATION_KIND_SQL`]) the writer's lifecycle-only end

@@ -1554,6 +1554,35 @@ or one whose manifests were removed by hand. If `reindex` reports a missing mani
 start the server once against that data directory and let the backfill write
 it, then stop the server and reindex again.
 
+### Map-reduce consolidation (opt-in)
+
+`[consolidation] chunk_input_tokens` (env
+`AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`) is `0` by default: consolidation
+keeps the single-request prompt. A positive value enables map-reduce only when
+the normal projection would omit or truncate an observation. A session that
+fits sends exactly the same request as before.
+
+`chunk_input_tokens * 3 * input_token_safety_margin` effective characters is
+the packing target for stages, not a per-call ceiling. Map stages split bodies
+into ordered parts of at most 12,000 characters, still naming every
+observation id, and pack those parts into blocks toward that target; a single
+larger part opens its own block. Every call is hard-capped by
+`max_input_tokens`. Every id in a block must be cited by a grounded extraction or listed as
+having no durable fact; otherwise the job fails terminally on its first
+attempt. Reduce stages merge extractions until the final page prompt fits
+`max_input_tokens` (at most eight levels). The published page carries a
+`consolidation_marker` in its frontmatter: a crash between publication and
+checkpoint cleanup reconciles without another LLM call, while a page written by
+the agent is never reconciled or overwritten.
+
+Completed stages live in `consolidation_chunk_progress`, keyed by
+`(workspace_id, project_id, session_id, chunk_fingerprint)`. Fingerprints come
+from content (prompt versions, model, observation text and ids, stage position),
+never from a timestamp; rows are pruned after publication. A checkpoint from
+another scope is invisible to a resume. The key must not exceed
+`max_input_tokens`, and a positive value must leave room for one minimal map
+part plus the fixed stage prompts at the configured safety margin.
+
 ## Operator workflows
 
 ### "Fresh start" (wipe everything)

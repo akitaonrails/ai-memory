@@ -77,15 +77,16 @@ pub use maintenance::MaintenanceJob;
 pub use migrations::{SchemaStatus, schema_status};
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
-    ConditionalBatchUpsert, ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary,
-    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IdentityResolution,
-    IdleEndAction, IdleEndCandidate, IdleEndResult, IngestObservationOutcome,
-    LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
-    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
-    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
-    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
-    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    ConditionalBatchUpsert, ConditionalUpsert, ConsolidationChunkRecord, DateOnlyTtlPage,
+    DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
+    HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MergeProjectPage, MergeProjectSummary, MoveSessionSummary, MoveSummary,
+    ObservationPruneOutcome, OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition,
+    PageWindowBackfillSummary, PagesMode, ProjectAliasWriteResolution, PurgeMode,
+    PurgeSessionSummary, PurgeSummary, ReorgSummary, RepairSessionTimesSummary,
+    RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason, SkippedSessionTimes,
+    StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{

@@ -74,7 +74,7 @@ pub use consolidator::{
     DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
     MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, SessionPageConsolidation, build_batch_request,
     disambiguate_colliding_session_title, effective_input_chars, existing_session_page_titles,
-    redacted_error_summary,
+    min_chunk_input_chars, redacted_error_summary,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,

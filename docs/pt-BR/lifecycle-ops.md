@@ -1467,6 +1467,36 @@ ou uma cujos manifestos tenham sido removidos manualmente. Se o `reindex` relata
 inicie o servidor uma vez contra esse diretório de dados e deixe o backfill gravá-lo,
 depois pare o servidor e reindexe novamente.
 
+### Consolidação map-reduce (opcional)
+
+`[consolidation] chunk_input_tokens` (variável
+`AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`) é `0` por padrão: a consolidação
+continua usando um único prompt. Um valor positivo habilita map-reduce apenas
+quando a projeção normal omitiria ou truncaria alguma observação. Uma sessão que
+cabe envia exatamente a mesma requisição de antes.
+
+`chunk_input_tokens * 3 * input_token_safety_margin` caracteres efetivos é o
+alvo de empacotamento dos estágios, não um teto por chamada. O map divide corpos
+em partes ordenadas de no máximo 12.000 caracteres, mantendo o id de cada
+observação, e empacota essas partes em blocos até esse alvo; uma parte maior
+abre seu próprio bloco. Toda chamada tem teto rígido em `max_input_tokens`.
+Todo id do bloco precisa ser citado por uma extração fundamentada ou listado
+como sem fato durável; caso contrário a tarefa falha de forma terminal na
+primeira tentativa. O reduce funde as extrações até que o prompt final da página
+caiba em `max_input_tokens` (no máximo oito níveis). A página publicada leva um
+`consolidation_marker` no frontmatter: uma queda entre publicação e limpeza dos
+checkpoints reconcilia sem outra chamada ao LLM, enquanto uma página escrita pelo
+agente nunca é reconciliada nem sobrescrita.
+
+Estágios concluídos ficam em `consolidation_chunk_progress`, com chave
+`(workspace_id, project_id, session_id, chunk_fingerprint)`. As fingerprints vêm
+de conteúdo (versões dos prompts, modelo, texto e ids das observações, posição no
+estágio), nunca de timestamp; as linhas são removidas após a publicação. Um
+checkpoint de outro escopo é invisível para uma retomada. A chave não pode
+ultrapassar `max_input_tokens`, e um valor positivo precisa deixar espaço para
+uma parte mínima do map mais os prompts fixos, com a margem de segurança
+configurada.
+
 ## Fluxos de trabalho do operador
 
 ### "Começo do zero" (apagar tudo)

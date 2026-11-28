@@ -231,6 +231,7 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | `verbatim_residue` | `false` | `AI_MEMORY_CONSOLIDATION__VERBATIM_RESIDUE` | Add bounded literal excerpts of observations the normal projection omitted or truncated. |
 | `max_input_tokens` | `100000` (`DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS`) | `AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` | Approximate token target for the whole consolidation prompt. |
 | `max_output_tokens` | `32000` (`DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS`) | `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS` | Maximum tokens the provider may generate for one consolidation response. |
+| `chunk_input_tokens` | `0` (off) | `AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS` | Per-stage map-reduce packing target in the same approximate token unit as `max_input_tokens`; every call stays under the `max_input_tokens` ceiling, and the pipeline runs only when the projection would lose evidence. |
 | `input_token_safety_margin` | `0.8` (`DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`) | `AI_MEMORY_CONSOLIDATION__INPUT_TOKEN_SAFETY_MARGIN` | Multiplier on the input budget, above 0 and at most 1. |
 | `output_language` | unset (follows the input's dominant language) | `AI_MEMORY_CONSOLIDATION__OUTPUT_LANGUAGE` | Force the natural language of generated memory prose (for example `English`); evidence, code and paths stay verbatim. At most 40 characters, single line. |
 
