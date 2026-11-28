@@ -1815,6 +1815,14 @@ pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEve
             changed |= cap_candidate_group(nested, keys, max_bytes, truncate);
         }
     }
+    // Cline nests the prompt as `userPromptSubmit.prompt`, the shape
+    // `best_body_excerpt` reads after the shared candidates. Left uncapped, the
+    // server's prefix-only cut would drop the ending.
+    if event == HookEvent::UserPrompt
+        && let Some(nested) = raw.get_mut("userPromptSubmit")
+    {
+        changed |= cap_object_fields(nested, &["prompt"], max_bytes, truncate);
+    }
     changed
 }
 
@@ -4316,6 +4324,34 @@ mod tests {
             &mut raw,
             HookEvent::SessionStart
         ));
+    }
+
+    #[test]
+    fn client_prompt_selection_preserves_corrections_in_the_cline_shape() {
+        let beginning = "INITIAL_REQUEST: inspect the parser.\n";
+        let ending = "\nFINAL_CORRECTION: inspect the lexer.";
+        let prompt = format!("{beginning}{}{ending}", "é🧪".repeat(4_000));
+        let mut raw = serde_json::json!({
+            "taskId": "cline-task-1",
+            "userPromptSubmit": {"prompt": prompt}
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        let envelope = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        let text = envelope.body_excerpt.unwrap();
+        assert!(text.starts_with(beginning), "{text}");
+        assert!(text.ends_with(ending), "correction lost");
+        assert!(text.contains("...[truncated "));
+        assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
     }
 
     #[test]
