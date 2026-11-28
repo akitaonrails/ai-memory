@@ -8374,6 +8374,15 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![&sid[..], &wid[..], &pid[..]],
     )?;
 
+    // Map-reduce consolidation checkpoints for this session. FK cascade covers
+    // this when foreign_keys = ON; the explicit delete guarantees cleanup even
+    // on connections that did not enable foreign keys.
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+        rusqlite::params![&wid[..], &pid[..], &sid[..]],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -8870,6 +8879,13 @@ pub fn purge_project(
     // Must run before the cascade removes the sessions it matches against.
     delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
 
+    // Explicit cleanup for map-reduce checkpoints alongside the FK cascade.
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress \
+          WHERE workspace_id = ?1 AND project_id = ?2",
+        rusqlite::params![workspace_id.as_bytes(), &pid[..]],
+    )?;
+
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
     // other projects may still live there.
@@ -9124,6 +9140,11 @@ pub fn delete_workspace(
     // Same cross-scope query-signal cleanup as `purge_project`, before the
     // cascade removes the sessions it matches against.
     delete_query_signals_of_sessions(&tx, "workspace_id = ?1", &wid[..])?;
+    // Explicit cleanup for map-reduce checkpoints alongside the FK cascade.
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress WHERE workspace_id = ?1",
+        rusqlite::params![&wid[..]],
+    )?;
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
         rusqlite::params![&wid[..]],
@@ -23054,13 +23075,40 @@ pub(crate) mod tests {
     fn consolidation_chunk_progress_is_scoped_per_workspace_project_session() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::migrations::run(&mut conn).unwrap();
-        let ws = WorkspaceId::new();
-        let proj = ProjectId::new();
-        let session = ai_memory_core::SessionId::new();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let ws = get_or_create_workspace(&mut conn, "ws-own").unwrap();
+        let ws_other = get_or_create_workspace(&mut conn, "ws-other").unwrap();
+        let proj = get_or_create_project(&mut conn, &ws, "proj-own", None).unwrap();
+        let proj_other = get_or_create_project(&mut conn, &ws, "proj-other", None).unwrap();
+        let proj_ws_other =
+            get_or_create_project(&mut conn, &ws_other, "proj-ws-other", None).unwrap();
+        let make_session = |conn: &mut Connection, w: WorkspaceId, p: ProjectId| {
+            let sid = ai_memory_core::SessionId::new();
+            begin_session(
+                conn,
+                &NewSession {
+                    occurred_at: None,
+                    id: sid,
+                    workspace_id: w,
+                    project_id: p,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                    origin: None,
+                },
+            )
+            .unwrap();
+            sid
+        };
+        let session = make_session(&mut conn, ws, proj);
         let foreign = [
-            (WorkspaceId::new(), proj, session),
-            (ws, ProjectId::new(), session),
-            (ws, proj, ai_memory_core::SessionId::new()),
+            (
+                ws_other,
+                proj_ws_other,
+                make_session(&mut conn, ws_other, proj_ws_other),
+            ),
+            (ws, proj_other, make_session(&mut conn, ws, proj_other)),
+            (ws, proj, make_session(&mut conn, ws, proj)),
         ];
         for (other_ws, other_proj, other_session) in &foreign {
             record_consolidation_chunk(
@@ -23090,5 +23138,122 @@ pub(crate) mod tests {
             assert_eq!(rows.len(), 1, "a foreign scope must keep its own row");
             assert_eq!(rows[0].extraction_json, "foreign stage");
         }
+    }
+
+    #[test]
+    fn purge_clears_consolidation_chunk_progress_for_session_project_and_workspace() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let ws1 = get_or_create_workspace(&mut conn, "ws-1").unwrap();
+        let ws2 = get_or_create_workspace(&mut conn, "ws-2").unwrap();
+        let proj1a = get_or_create_project(&mut conn, &ws1, "proj-1a", None).unwrap();
+        let proj1b = get_or_create_project(&mut conn, &ws1, "proj-1b", None).unwrap();
+        let proj2 = get_or_create_project(&mut conn, &ws2, "proj-2", None).unwrap();
+
+        let make_session = |conn: &mut Connection, w: WorkspaceId, p: ProjectId| {
+            let sid = ai_memory_core::SessionId::new();
+            begin_session(
+                conn,
+                &NewSession {
+                    occurred_at: None,
+                    id: sid,
+                    workspace_id: w,
+                    project_id: p,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                    origin: None,
+                },
+            )
+            .unwrap();
+            record_consolidation_chunk(conn, &w, &p, &sid, "fp-1", "{\"extractions\":[]}").unwrap();
+            sid
+        };
+
+        let s1 = make_session(&mut conn, ws1, proj1a);
+        let s2 = make_session(&mut conn, ws1, proj1a);
+        let s3 = make_session(&mut conn, ws1, proj1b);
+        let s4 = make_session(&mut conn, ws2, proj2);
+
+        // 1. Session purge removes only s1's chunk progress.
+        purge_session(
+            &mut conn,
+            ws1,
+            proj1a,
+            s1,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        assert!(
+            load_consolidation_chunks(&conn, &ws1, &proj1a, &s1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws1, &proj1a, &s2)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws1, &proj1b, &s3)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws2, &proj2, &s4)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 2. Project purge removes s2's chunk progress, leaving sibling project and workspace intact.
+        purge_project(
+            &mut conn,
+            &ws1,
+            &proj1a,
+            "ws-1/proj-1a",
+            None,
+            true,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        assert!(
+            load_consolidation_chunks(&conn, &ws1, &proj1a, &s2)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws1, &proj1b, &s3)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws2, &proj2, &s4)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 3. Workspace delete removes s3's chunk progress, leaving ws2 intact.
+        delete_workspace(&mut conn, &ws1, true, Compaction::Skip, PurgeMode::Commit).unwrap();
+        assert!(
+            load_consolidation_chunks(&conn, &ws1, &proj1b, &s3)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws2, &proj2, &s4)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -201,23 +201,44 @@ mod tests {
         )
         .unwrap();
         run(&mut conn).unwrap();
-        let columns: Vec<String> = conn
+        let columns: Vec<(String, String)> = conn
             .prepare("PRAGMA table_info(consolidation_chunk_progress)")
             .unwrap()
-            .query_map([], |row| row.get(1))
+            .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(
             columns,
             vec![
-                "workspace_id",
-                "project_id",
-                "session_id",
-                "chunk_fingerprint",
-                "extraction_json",
-                "created_at",
+                ("workspace_id".to_owned(), "BLOB".to_owned()),
+                ("project_id".to_owned(), "BLOB".to_owned()),
+                ("session_id".to_owned(), "BLOB".to_owned()),
+                ("chunk_fingerprint".to_owned(), "TEXT".to_owned()),
+                ("extraction_json".to_owned(), "TEXT".to_owned()),
+                ("created_at".to_owned(), "INTEGER".to_owned()),
             ]
+        );
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute(
+            "INSERT INTO consolidation_chunk_progress \
+             (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+             VALUES (zeroblob(16), zeroblob(16), zeroblob(16), 'fp-1', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM sessions WHERE id = zeroblob(16)", [])
+            .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "deleting a session must cascade its consolidation_chunk_progress rows"
         );
         let version: i32 = conn
             .query_row(

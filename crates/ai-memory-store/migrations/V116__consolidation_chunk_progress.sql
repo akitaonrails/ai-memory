@@ -7,9 +7,9 @@
 -- page's exact `consolidation_marker` (prompt versions, model, mode,
 -- resolved instructions and length-prefixed observation fields).
 CREATE TABLE IF NOT EXISTS consolidation_chunk_progress (
-    workspace_id      TEXT    NOT NULL,
-    project_id        TEXT    NOT NULL,
-    session_id        TEXT    NOT NULL,
+    workspace_id      BLOB    NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    project_id        BLOB    NOT NULL REFERENCES projects(id)   ON DELETE CASCADE,
+    session_id        BLOB    NOT NULL REFERENCES sessions(id)   ON DELETE CASCADE,
     chunk_fingerprint TEXT    NOT NULL,
     extraction_json   TEXT    NOT NULL,
     created_at        INTEGER NOT NULL,
@@ -17,3 +17,7 @@ CREATE TABLE IF NOT EXISTS consolidation_chunk_progress (
 );
 CREATE INDEX IF NOT EXISTS idx_consolidation_chunk_progress_at
     ON consolidation_chunk_progress(created_at);
+CREATE INDEX IF NOT EXISTS idx_consolidation_chunk_progress_project
+    ON consolidation_chunk_progress(project_id);
+CREATE INDEX IF NOT EXISTS idx_consolidation_chunk_progress_session
+    ON consolidation_chunk_progress(session_id);

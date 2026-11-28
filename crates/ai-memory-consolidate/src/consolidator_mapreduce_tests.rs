@@ -830,3 +830,233 @@ async fn chunking_off_or_a_fitting_session_keeps_the_single_request_identical() 
         assert_same_request(&baseline, &requests[0]);
     }
 }
+
+#[test]
+fn map_and_reduce_system_prompts_enforce_security_boundary_and_accurate_id_header() {
+    for (name, prompt) in [("map", MAP_SYSTEM_PROMPT), ("reduce", REDUCE_SYSTEM_PROMPT)] {
+        assert!(
+            prompt.contains("## SECURITY BOUNDARY"),
+            "{name} prompt must contain ## SECURITY BOUNDARY"
+        );
+        assert!(
+            prompt.contains("untrusted") && prompt.contains("not instructions"),
+            "{name} prompt must frame input as untrusted data, not instructions"
+        );
+    }
+    assert!(
+        !MAP_SYSTEM_PROMPT.contains("`id:` lines"),
+        "MAP_SYSTEM_PROMPT must not refer to nonexistent `id:` lines"
+    );
+    assert!(
+        MAP_SYSTEM_PROMPT.contains("--- observation <id>"),
+        "MAP_SYSTEM_PROMPT must reference the actual `--- observation <id> ... ---` header"
+    );
+}
+
+#[tokio::test]
+async fn final_request_fits_checks_unclipped_evidence_and_output_language() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[1]).await;
+    let llm = Arc::new(StagedLlm::new());
+    let consolidator = staged_consolidator(&store, wiki.clone(), llm.clone(), ws, proj, 4_000);
+
+    // Oversized evidence: previously `build_final_request_single` clipped it
+    // before measuring, making `final_request_fits` falsely return `true`.
+    let oversized: Vec<EvidenceExtraction> = (0..30)
+        .map(|i| EvidenceExtraction {
+            observation_ids: vec![format!("obs-{i}")],
+            kind: ExtractionKind::Fact,
+            title: format!("Fact {i}"),
+            summary: format!("Summary {i}"),
+            body_markdown: "x".repeat(1_800),
+            tags: Vec::new(),
+            entities: Vec::new(),
+            confidence: 0.9,
+        })
+        .collect();
+    assert!(
+        !consolidator
+            .final_request_fits(session, &oversized, "", None, &[])
+            .unwrap(),
+        "unclipped evidence exceeding max_input_chars must not report as fitting"
+    );
+
+    // Exact boundary check for `with_output_language`: pick a budget that fits
+    // the base `SYSTEM_PROMPT` but overflows once `output_language` is appended.
+    let single = vec![EvidenceExtraction {
+        observation_ids: vec!["obs-1".into()],
+        kind: ExtractionKind::Fact,
+        title: "One".into(),
+        summary: "Short".into(),
+        body_markdown: "y".repeat(200),
+        tags: Vec::new(),
+        entities: Vec::new(),
+        confidence: 0.9,
+    }];
+    let base_prompt = crate::with_output_language(SYSTEM_PROMPT, None);
+    let lang_prompt = crate::with_output_language(SYSTEM_PROMPT, Some("Portuguese (Brazil)"));
+    assert!(count_chars(&lang_prompt) > count_chars(&base_prompt));
+    let base_total = {
+        let (header, evidence, suffix) = render_final_single_parts(
+            session,
+            &single,
+            "",
+            None,
+            PromptBudgets::from_limits_with_margin(100_000, 32_000, 0.8),
+            &[],
+            &base_prompt,
+        );
+        count_chars(&base_prompt)
+            + count_chars(&header)
+            + count_chars(&evidence)
+            + count_chars(&suffix)
+            + schema_chars::<ConsolidatedPage>()
+            + PROMPT_ENVELOPE_RESERVE_CHARS
+    };
+    let tight_budgets = PromptBudgets {
+        max_input_chars: base_total,
+        max_output_tokens: 4_096,
+    };
+    let mut base_consolidator = Consolidator::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki.clone(),
+        llm.clone(),
+        ws,
+        proj,
+    );
+    base_consolidator.budgets = tight_budgets;
+    assert!(
+        base_consolidator
+            .final_request_fits(session, &single, "", None, &[])
+            .unwrap(),
+        "control: exact budget fits without output_language"
+    );
+    let lang_consolidator =
+        base_consolidator.with_output_language(Some("Portuguese (Brazil)".into()));
+    assert!(
+        !lang_consolidator
+            .final_request_fits(session, &single, "", None, &[])
+            .unwrap(),
+        "output_language suffix pushing past max_input_chars must report as not fitting"
+    );
+}
+
+#[test]
+fn plan_map_blocks_rejects_input_exceeding_max_map_blocks() {
+    let observations: Vec<Observation> = (0..=MAX_MAP_BLOCKS)
+        .map(|i| chunk_observation(format!("block-{i} ").repeat(200)))
+        .collect();
+    let cfg = ChunkingConfig {
+        target_chars: 1_500,
+        model: "m1".into(),
+    };
+    let err = plan_map_blocks(SessionId::new(), &observations, &cfg, 20_000)
+        .err()
+        .expect("exceeding MAX_MAP_BLOCKS must fail closed");
+    assert!(matches!(err, ConsolidatorError::ChunkDoesNotFit));
+}
+
+/// Provider whose reduce stage echoes two distinct extractions back verbatim
+/// without reducing either count or rendered size, verifying the strict-shrink
+/// guard fails closed on the first non-shrinking round.
+struct NonShrinkingReduceLlm {
+    reduce_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for NonShrinkingReduceLlm {
+    fn name(&self) -> &'static str {
+        "non-shrinking"
+    }
+    fn model(&self) -> &str {
+        "non-shrinking"
+    }
+    async fn complete(
+        &self,
+        _request: ChatRequest,
+    ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+        unreachable!("consolidation uses structured output")
+    }
+    async fn complete_structured_raw(
+        &self,
+        request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+        let user = &request.messages[0].content;
+        if request
+            .system
+            .as_deref()
+            .is_some_and(|s| s.contains("reduce stage"))
+        {
+            self.reduce_calls.fetch_add(1, Ordering::SeqCst);
+            let ids = observation_ids_in_reduce_request(user);
+            let extractions: Vec<serde_json::Value> = ids
+                .into_iter()
+                .map(|id| {
+                    serde_json::json!({
+                        "observation_ids": [id],
+                        "kind": "fact",
+                        "title": "Echoed extraction",
+                        "summary": "Unchanged summary.",
+                        "body_markdown": "z".repeat(1_800),
+                        "confidence": 0.9,
+                    })
+                })
+                .collect();
+            return Ok(serde_json::json!({
+                "extractions": extractions,
+                "rationale": "",
+                "no_durable_fact_ids": [],
+            }));
+        }
+        unreachable!("test invokes chunked_reduce_extractions directly")
+    }
+}
+
+#[tokio::test]
+async fn chunked_reduce_fails_closed_when_round_makes_no_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[1]).await;
+    let llm = Arc::new(NonShrinkingReduceLlm {
+        reduce_calls: AtomicUsize::new(0),
+    });
+    let consolidator = Consolidator::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki,
+        llm.clone(),
+        ws,
+        proj,
+    )
+    .with_prompt_limits(6_000, 32_000, 0.8)
+    .with_chunking(4_000, 0.8);
+    let extractions: Vec<EvidenceExtraction> = (0..10)
+        .map(|i| EvidenceExtraction {
+            observation_ids: vec![format!("00000000-0000-0000-0000-{i:012}")],
+            kind: ExtractionKind::Fact,
+            title: "Echoed extraction".into(),
+            summary: "Unchanged summary.".into(),
+            body_markdown: "z".repeat(1_800),
+            tags: Vec::new(),
+            entities: Vec::new(),
+            confidence: 0.9,
+        })
+        .collect();
+    let run = ChunkedRun {
+        ws,
+        proj,
+        session,
+        observations: Vec::new(),
+        operation_id: LlmOperationId::new(),
+    };
+    let err = consolidator
+        .chunked_reduce_extractions(&run, extractions, "", None, &[])
+        .await
+        .expect_err("a reduce round that shrinks neither count nor size must fail closed");
+    assert!(matches!(err, ConsolidatorError::ChunkDoesNotFit));
+    assert!(
+        llm.reduce_calls.load(Ordering::SeqCst) < MAX_REDUCE_DEPTH,
+        "strict-shrink check must stop after the first non-shrinking round, not burn all {MAX_REDUCE_DEPTH} depths"
+    );
+}
