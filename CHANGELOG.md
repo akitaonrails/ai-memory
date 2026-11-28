@@ -147,7 +147,7 @@ version in [`docs/changelog/`](docs/changelog/):
   session kept its page instead of losing it. Finished sub-blocks checkpointed
   under their own fingerprints, so a resume reused them without another LLM
   call. Grounding stayed strict: an id cited outside the stage input still
-  failed terminally.
+  failed terminally. (#2558)
 
 ## [3.6.5] - 2026-11-28
 
