@@ -432,12 +432,16 @@ pub(crate) fn profile_prompts_since(
     // boundaries, so the harvest mark advances past rows it never read. The
     // cutoff CTE finds the timestamp of the limit-th row and keeps every row up
     // to and including that group, tie-broken by id, so a mark at that
-    // timestamp skips none of it.
+    // timestamp skips none of it. The cutoff counts only the rows the origin
+    // filter keeps: a window made of automation prompts alone would return
+    // nothing, leave the mark where it was, and repeat on every later pass.
     let sql = format!(
         "WITH cutoff(at) AS ( \
-           SELECT created_at FROM observations \
-           WHERE workspace_id = ?1 AND project_id = ?2 AND kind = ?3 AND created_at > ?4 \
-           ORDER BY created_at ASC LIMIT 1 OFFSET ?5 - 1) \
+           SELECT o.created_at FROM observations o \
+           LEFT JOIN sessions s ON s.id = o.session_id \
+           WHERE o.workspace_id = ?1 AND o.project_id = ?2 AND o.kind = ?3 \
+             AND o.created_at > ?4 {origin_filter}\
+           ORDER BY o.created_at ASC LIMIT 1 OFFSET ?5 - 1) \
          SELECT o.session_id, o.created_at, o.body, s.actor_user \
          FROM observations o LEFT JOIN sessions s ON s.id = o.session_id \
          WHERE o.workspace_id = ?1 AND o.project_id = ?2 AND o.kind = ?3 \

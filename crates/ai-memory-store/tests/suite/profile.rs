@@ -742,6 +742,86 @@ async fn session_start_digest_read_is_bounded_but_scope_reads_are_not() {
     );
 }
 
+/// With `harvest_prompts = "interactive"` the batch window is counted over
+/// the prompts the filter keeps. A window filled by automation prompts alone
+/// returns nothing, so the mark cannot move and every later pass reads the
+/// same empty window: the interactive prompts behind it are never harvested.
+#[tokio::test]
+async fn harvest_reads_past_a_batch_of_automation_prompts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = default_workspace(&store).await;
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_owned(), None)
+        .await
+        .unwrap();
+    for (origin, at, body) in [
+        (
+            Some(ai_memory_core::SessionOrigin::Automation),
+            2_000_000,
+            "Generated orchestrator brief.",
+        ),
+        (None, 3_000_000, "Always use pnpm."),
+    ] {
+        let session = SessionId::new();
+        let new_session = NewSession {
+            occurred_at: Some(1_000_000),
+            id: session,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin,
+        };
+        let obs = NewObservation {
+            session_id: session,
+            workspace_id: ws,
+            project_id: app,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "prompt".into(),
+            body: body.into(),
+            importance: 5,
+            occurred_at: Some(at),
+            file_path: None,
+            trust_class: None,
+        };
+        store
+            .writer
+            .admit_hook_session_event(
+                new_session,
+                Sanitized::new(obs, &Sanitizer::builtin()),
+                ai_memory_core::OwnerFilter::Any,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mark = ai_memory_store::ProfileHarvestMark::default();
+    let (all, _, _) = store
+        .reader
+        .profile_harvest_inputs(ws, app, mark, 50, false)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2, "both prompts are stored");
+    let (kept, _, _) = store
+        .reader
+        .profile_harvest_inputs(ws, app, mark, 1, true)
+        .await
+        .unwrap();
+    let bodies: Vec<&str> = kept.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(
+        bodies,
+        vec!["Always use pnpm."],
+        "an automation prompt filled the batch window and hid the interactive one"
+    );
+}
+
 /// Imported prompts keep their own `occurred_at`, so several can share one
 /// timestamp, and a page batch can share one `updated_at`. A harvest pass
 /// that ends inside such a group must still return the rest of it, or the
