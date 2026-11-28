@@ -107,9 +107,12 @@ jobs:
               - 'crates/ai-memory-cli/src/commands/render_shared.rs'
               - 'crates/ai-memory-cli/src/commands/service_host.rs'
               - 'crates/ai-memory-cli/src/commands/user_service.rs'
-              # The remaining CLI command modules that carry #[cfg(windows)]
+              # The remaining CLI modules that carry #[cfg(windows)]
               # code, so a PR touching only them still runs the native Windows
               # job instead of relying on the `windows` label.
+              - 'crates/ai-memory-cli/src/config.rs'
+              - 'crates/ai-memory-cli/src/install_layout.rs'
+              - 'crates/ai-memory-cli/src/main.rs'
               - 'crates/ai-memory-cli/src/commands/hook_drain_process.rs'
               - 'crates/ai-memory-cli/src/commands/hook_spool.rs'
               - 'crates/ai-memory-cli/src/commands/install_mcp.rs'
