@@ -46,6 +46,17 @@ version in [`docs/changelog/`](docs/changelog/):
   behave as before. The NixOS module refuses these lists in `settings`, as it
   refuses `llm_headers`. (#2553)
 
+- Added `--pre-migration-package` to `ai-memory restore` so boot-time
+  pre-migration archives (full data-dir snapshots produced before OKF/format
+  migrations) can be restored directly. Under `--pre-migration-package`,
+  unsafe-path, link, and entry-type validation still runs unconditionally on
+  every archive member, only `config.toml`, `db/memory.sqlite`,
+  `db/memory.sqlite-wal`, and `wiki/*` are extracted (with owner-only
+  permissions on `db/memory.sqlite-wal` as well as `db/memory.sqlite`),
+  non-data entries are skipped and counted, and `Store::open_snapshot` opens
+  read-write without `SQLITE_OPEN_CREATE` so an uncheckpointed `-wal` without
+  `-shm` recovers cleanly without losing WAL-only rows. (#2543)
+
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
   Providers that return only JSON continue to contribute estimates.

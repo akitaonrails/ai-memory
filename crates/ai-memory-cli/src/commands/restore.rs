@@ -80,6 +80,34 @@ enum ConfigPlacement {
     Divert,
 }
 
+/// Which archive layout `restore` expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveMode {
+    /// Standard `ai-memory backup` tarball: strict data-only layout allowlist.
+    StandardBackup,
+    /// Boot-time pre-migration package (`create_pre_migration_backup`): full
+    /// data-dir snapshot where only `config.toml`, `db/memory.sqlite`,
+    /// `db/memory.sqlite-wal`, and `wiki/*` are extracted and other safe
+    /// entries are skipped.
+    PreMigrationPackage,
+}
+
+/// Disposition of a validated tar entry during extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryDisposition {
+    /// Extract this entry into staging.
+    Extract,
+    /// Skip this safe non-data entry (only in [`ArchiveMode::PreMigrationPackage`]).
+    SkipNonData,
+}
+
+/// Summary of entries skipped or filtered while unpacking an archive.
+#[derive(Debug, Default)]
+struct UnpackSummary {
+    left_out_git: Vec<PathBuf>,
+    skipped_non_data: usize,
+}
+
 /// Lock a directory a restore creates down to owner-only (`0700`).
 ///
 /// A backup holds the SQLite database (API-key hashes, session and
@@ -126,10 +154,12 @@ fn restrict_staged_tree(staging: &Path) -> Result<()> {
                 .with_context(|| format!("restricting permissions on {}", staged.display()))?;
         }
     }
-    let staged_db = staging.join("db").join("memory.sqlite");
-    if staged_db.is_file() {
-        restrict_file_to_owner(&staged_db)
-            .with_context(|| format!("restricting permissions on {}", staged_db.display()))?;
+    for db_file in ["memory.sqlite", "memory.sqlite-wal"] {
+        let staged_db = staging.join("db").join(db_file);
+        if staged_db.is_file() {
+            restrict_file_to_owner(&staged_db)
+                .with_context(|| format!("restricting permissions on {}", staged_db.display()))?;
+        }
     }
     let staged_config = staging.join(CONFIG_FILE);
     if staged_config.is_file() {
@@ -163,7 +193,12 @@ pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
         );
     }
 
-    let outcome = restore_data_dir_with_legacy_pepper(
+    let archive_mode = if args.pre_migration_package {
+        ArchiveMode::PreMigrationPackage
+    } else {
+        ArchiveMode::StandardBackup
+    };
+    let outcome = restore_data_dir_with_options(
         &config.i18n,
         &config.data_dir,
         &args.from,
@@ -171,6 +206,7 @@ pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
         args.with_config,
         config.auth.token_pepper.as_deref(),
         args.accept_legacy_api_key_pepper,
+        archive_mode,
     )
     .await?;
     info!("restore complete");
@@ -209,6 +245,7 @@ async fn restore_data_dir(
     restore_data_dir_with_legacy_pepper(i18n, data_dir, from, force, with_config, None, false).await
 }
 
+#[cfg(test)]
 async fn restore_data_dir_with_legacy_pepper(
     i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
@@ -217,6 +254,30 @@ async fn restore_data_dir_with_legacy_pepper(
     with_config: bool,
     token_pepper: Option<&str>,
     accept_legacy_api_key_pepper: bool,
+) -> Result<ConfigOutcome> {
+    restore_data_dir_with_options(
+        i18n,
+        data_dir,
+        from,
+        force,
+        with_config,
+        token_pepper,
+        accept_legacy_api_key_pepper,
+        ArchiveMode::StandardBackup,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_data_dir_with_options(
+    i18n: &ai_memory_core::i18n::Localizer,
+    data_dir: &Path,
+    from: &Path,
+    force: bool,
+    with_config: bool,
+    token_pepper: Option<&str>,
+    accept_legacy_api_key_pepper: bool,
+    archive_mode: ArchiveMode,
 ) -> Result<ConfigOutcome> {
     let wiki = data_dir.join("wiki");
     let db = data_dir.join("db").join("memory.sqlite");
@@ -255,6 +316,7 @@ async fn restore_data_dir_with_legacy_pepper(
         with_config,
         token_pepper,
         accept_legacy_api_key_pepper,
+        archive_mode,
     )
     .await;
     // The staging dir is scratch in every outcome: on success its contents
@@ -287,6 +349,7 @@ async fn stage_then_swap(
     with_config: bool,
     token_pepper: Option<&str>,
     accept_legacy_api_key_pepper: bool,
+    archive_mode: ArchiveMode,
 ) -> Result<ConfigOutcome> {
     std::fs::create_dir(staging)
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
@@ -301,8 +364,25 @@ async fn stage_then_swap(
     let file = std::fs::File::open(from).with_context(|| format!("opening {}", from.display()))?;
     let decoder = GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
-    let left_out = unpack_checked_archive(&mut archive, staging)
+    let unpacked = unpack_checked_archive_with_mode(&mut archive, staging, archive_mode)
         .with_context(|| format!("extracting {} into {}", from.display(), staging.display()))?;
+    if unpacked.skipped_non_data > 0 {
+        info!(
+            count = unpacked.skipped_non_data,
+            "restore skipped non-data entries from pre-migration package"
+        );
+        eprintln!(
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "ai-memory: skipped {} non-data entry/entries from the pre-migration package",
+                    unpacked.skipped_non_data
+                )
+            )
+        );
+    }
+    let left_out = unpacked.left_out_git;
     if !left_out.is_empty() {
         let names: Vec<String> = left_out
             .iter()
@@ -593,19 +673,40 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 /// Extract every allowed entry into `data_dir` and return the wiki git files
 /// left out ([`wiki_git_entry_kept`]). When the archive carried the wiki's
 /// `.git`, its config is replaced by a freshly generated one.
+#[cfg(test)]
 fn unpack_checked_archive<R: std::io::Read>(
     archive: &mut tar::Archive<R>,
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
+    Ok(
+        unpack_checked_archive_with_mode(archive, data_dir, ArchiveMode::StandardBackup)?
+            .left_out_git,
+    )
+}
+
+/// Extract every allowed entry into `data_dir` under `mode`, returning both
+/// the wiki git files left out ([`wiki_git_entry_kept`]) and the count of
+/// non-data entries skipped under [`ArchiveMode::PreMigrationPackage`].
+fn unpack_checked_archive_with_mode<R: std::io::Read>(
+    archive: &mut tar::Archive<R>,
+    data_dir: &Path,
+    mode: ArchiveMode,
+) -> Result<UnpackSummary> {
     archive.set_preserve_permissions(false);
-    let mut left_out = Vec::new();
+    let mut summary = UnpackSummary::default();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         let entry_type = entry.header().entry_type();
-        validate_restore_entry(&path, entry_type)?;
+        match classify_restore_entry(&path, entry_type, mode)? {
+            EntryDisposition::Extract => {}
+            EntryDisposition::SkipNonData => {
+                summary.skipped_non_data += 1;
+                continue;
+            }
+        }
         if !wiki_git_entry_kept(&path, entry_type) {
-            left_out.push(path);
+            summary.left_out_git.push(path);
             continue;
         }
         entry
@@ -619,7 +720,7 @@ fn unpack_checked_archive<R: std::io::Read>(
         std::fs::write(git_dir.join("config"), config)
             .with_context(|| format!("writing {}", git_dir.join("config").display()))?;
     }
-    Ok(left_out)
+    Ok(summary)
 }
 
 /// Whether `component` names a git directory as git itself would resolve it:
@@ -694,8 +795,21 @@ fn is_regular_file(entry_type: tar::EntryType) -> bool {
     entry_type.is_file() || entry_type == tar::EntryType::GNUSparse
 }
 
+#[cfg(test)]
 fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()> {
-    if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+    classify_restore_entry(path, entry_type, ArchiveMode::StandardBackup).map(|_| ())
+}
+
+fn classify_restore_entry(
+    path: &Path,
+    entry_type: tar::EntryType,
+    mode: ArchiveMode,
+) -> Result<EntryDisposition> {
+    // Run unsafe-path, link, and entry-type checks unconditionally BEFORE
+    // deciding whether to skip a non-data entry so hostile entries hidden
+    // under skipped paths are always rejected.
+    if path.as_os_str().is_empty() || !path.components().all(|c| matches!(c, Component::Normal(_)))
+    {
         bail!("backup contains unsafe path: {}", path.display());
     }
     if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -705,15 +819,34 @@ fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
         bail!("backup contains unsupported entry type: {}", path.display());
     }
     let path_str = path.to_string_lossy();
-    let allowed = if entry_type.is_dir() {
-        path_str == "wiki" || path_str.starts_with("wiki/") || path_str == "db"
-    } else {
-        path_str == "config.toml" || path_str == "db/memory.sqlite" || path_str.starts_with("wiki/")
+    let allowed = match mode {
+        ArchiveMode::StandardBackup => {
+            if entry_type.is_dir() {
+                path_str == "wiki" || path_str.starts_with("wiki/") || path_str == "db"
+            } else {
+                path_str == "config.toml"
+                    || path_str == "db/memory.sqlite"
+                    || path_str.starts_with("wiki/")
+            }
+        }
+        ArchiveMode::PreMigrationPackage => {
+            if entry_type.is_dir() {
+                path_str == "wiki" || path_str.starts_with("wiki/") || path_str == "db"
+            } else {
+                path_str == "config.toml"
+                    || path_str == "db/memory.sqlite"
+                    || path_str == "db/memory.sqlite-wal"
+                    || path_str.starts_with("wiki/")
+            }
+        }
     };
-    if !allowed {
+    if allowed {
+        Ok(EntryDisposition::Extract)
+    } else if mode == ArchiveMode::PreMigrationPackage {
+        Ok(EntryDisposition::SkipNonData)
+    } else {
         bail!("backup contains unexpected path: {}", path.display());
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2195,6 +2328,256 @@ mod tests {
         assert_eq!(
             std::fs::read(data.path().join("config.toml")).unwrap(),
             b"# old config\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_pre_migration_package_recovers_uncheckpointed_wal_and_skips_non_data_entries()
+    {
+        // Build a realistic source data dir with wiki, config, non-data files,
+        // and a SQLite DB with committed WAL-only rows (autocheckpoint=0 while
+        // the writer connection stays open during backup).
+        let src = tempfile::TempDir::new().unwrap();
+        let store = Store::open(src.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let _proj = store
+            .writer
+            .get_or_create_project(ws, "okf-proj", None)
+            .await
+            .unwrap();
+        drop(store);
+
+        let wiki_page = src.path().join("wiki/default/okf-proj/notes/pre.md");
+        std::fs::create_dir_all(wiki_page.parent().unwrap()).unwrap();
+        std::fs::write(&wiki_page, "# Pre-migration note\n").unwrap();
+        std::fs::write(src.path().join("config.toml"), "# archived config\n").unwrap();
+
+        // Populate non-data files that a real data dir carries and that
+        // `create_pre_migration_backup` archives.
+        std::fs::write(src.path().join("auth.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(src.path().join("auth-tokens")).unwrap();
+        std::fs::write(src.path().join("auth-tokens/bearer"), "secret-token\n").unwrap();
+        std::fs::create_dir_all(src.path().join("hooks")).unwrap();
+        std::fs::write(src.path().join("hooks/capture.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(src.path().join("hook-spool")).unwrap();
+        std::fs::write(src.path().join("hook-spool/pending.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(src.path().join("keys")).unwrap();
+        std::fs::write(src.path().join("keys/local.key"), "key\n").unwrap();
+
+        // Keep an open WAL writer with autocheckpoint disabled so the new
+        // workspace row lives exclusively in `-wal` while `create_pre_migration_backup`
+        // archives the data dir (alongside `-shm`).
+        let src_db = src.path().join("db/memory.sqlite");
+        let writer = rusqlite::Connection::open(&src_db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute(
+                "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'wal-only-workspace', '2026-01-01T00:00:00Z')",
+                rusqlite::params![ai_memory_core::WorkspaceId::new().as_bytes()],
+            )
+            .unwrap();
+        assert!(
+            std::fs::metadata(src.path().join("db/memory.sqlite-wal"))
+                .unwrap()
+                .len()
+                > 0,
+            "WAL file must hold the uncheckpointed row"
+        );
+
+        let backup_dest = tempfile::TempDir::new().unwrap();
+        let receipt = ai_memory_wiki::backup::create_pre_migration_backup(
+            src.path(),
+            "okf-v0.2-migration",
+            Some(backup_dest.path()),
+        )
+        .unwrap();
+        drop(writer);
+
+        // Standard restore (without `--pre-migration-package`) must still reject
+        // the full data-dir package.
+        let standard_target = tempfile::TempDir::new().unwrap();
+        let err = restore_data_dir_with_options(
+            &ai_memory_core::i18n::Localizer::default(),
+            standard_target.path(),
+            &receipt.archive_path,
+            true,
+            false,
+            None,
+            false,
+            ArchiveMode::StandardBackup,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unexpected path"),
+            "standard restore must reject pre-migration package: {err:#}"
+        );
+
+        // Verify skipped count directly via `unpack_checked_archive_with_mode`.
+        {
+            let probe_dir = tempfile::TempDir::new().unwrap();
+            let file = std::fs::File::open(&receipt.archive_path).unwrap();
+            let mut archive = tar::Archive::new(GzDecoder::new(file));
+            let summary = unpack_checked_archive_with_mode(
+                &mut archive,
+                probe_dir.path(),
+                ArchiveMode::PreMigrationPackage,
+            )
+            .unwrap();
+            // At least auth.json, auth-tokens/bearer, hooks/capture.sh,
+            // hook-spool/pending.json, keys/local.key, and db/memory.sqlite-shm.
+            assert!(
+                summary.skipped_non_data >= 5,
+                "expected non-data entries to be skipped and counted, got {}",
+                summary.skipped_non_data
+            );
+            assert!(probe_dir.path().join("db/memory.sqlite-wal").is_file());
+            assert!(!probe_dir.path().join("db/memory.sqlite-shm").exists());
+        }
+
+        // Full restore with `--pre-migration-package` must succeed, recover the
+        // WAL-only row, restore wiki & config, and skip all non-data files.
+        let restored_dir = tempfile::TempDir::new().unwrap();
+        let outcome = restore_data_dir_with_options(
+            &ai_memory_core::i18n::Localizer::default(),
+            restored_dir.path(),
+            &receipt.archive_path,
+            true,
+            false,
+            None,
+            false,
+            ArchiveMode::PreMigrationPackage,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ConfigOutcome::Restored);
+        assert_eq!(
+            std::fs::read_to_string(
+                restored_dir
+                    .path()
+                    .join("wiki/default/okf-proj/notes/pre.md")
+            )
+            .unwrap(),
+            "# Pre-migration note\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(restored_dir.path().join("config.toml")).unwrap(),
+            "# archived config\n"
+        );
+        for skipped in [
+            "auth.json",
+            "auth-tokens",
+            "hooks",
+            "hook-spool",
+            "keys",
+            "pre-migration-backup.json",
+        ] {
+            assert!(
+                !restored_dir.path().join(skipped).exists(),
+                "non-data path `{skipped}` must not be restored"
+            );
+        }
+
+        let restored_store = Store::open(restored_dir.path()).unwrap();
+        drop(restored_store);
+        let verify_conn =
+            rusqlite::Connection::open(restored_dir.path().join("db/memory.sqlite")).unwrap();
+        let wal_only_exists: bool = verify_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE name = 'wal-only-workspace')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            wal_only_exists,
+            "WAL-only row must survive pre-migration package restore"
+        );
+    }
+
+    #[test]
+    fn restore_pre_migration_package_rejects_hostile_entries_under_skipped_paths() {
+        // Path traversal under a skipped prefix must still be rejected.
+        for bad_path in ["../auth.json", "hooks/../../escape.sh", "/etc/passwd"] {
+            let err = classify_restore_entry(
+                Path::new(bad_path),
+                tar::EntryType::Regular,
+                ArchiveMode::PreMigrationPackage,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("unsafe path"),
+                "expected unsafe path error for `{bad_path}`, got: {err:#}"
+            );
+        }
+
+        // Symlink and hardlink entries under skipped paths must still be rejected.
+        for (skipped_path, entry_type) in [
+            ("hooks/evil-link", tar::EntryType::symlink()),
+            ("auth-tokens/link", tar::EntryType::hard_link()),
+            ("pre-migration-backup.json", tar::EntryType::symlink()),
+            ("db/memory.sqlite-shm", tar::EntryType::symlink()),
+        ] {
+            let bytes = archive_with_entry(skipped_path, entry_type);
+            let restore_dir = tempfile::TempDir::new().unwrap();
+            let mut archive = tar::Archive::new(bytes.as_slice());
+            let err = unpack_checked_archive_with_mode(
+                &mut archive,
+                restore_dir.path(),
+                ArchiveMode::PreMigrationPackage,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported link entry"),
+                "expected link rejection for `{skipped_path}`, got: {err:#}"
+            );
+        }
+
+        // Unsupported entry types (e.g. FIFO) under skipped paths must be rejected.
+        let fifo_bytes = archive_with_entry("keys/evil-fifo", tar::EntryType::Fifo);
+        let restore_dir = tempfile::TempDir::new().unwrap();
+        let mut archive = tar::Archive::new(fifo_bytes.as_slice());
+        let err = unpack_checked_archive_with_mode(
+            &mut archive,
+            restore_dir.path(),
+            ArchiveMode::PreMigrationPackage,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported entry type"),
+            "expected entry type rejection for FIFO under skipped path, got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_staged_tree_restricts_sqlite_wal_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let staging = tempfile::TempDir::new().unwrap();
+        let db_dir = staging.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db = db_dir.join("memory.sqlite");
+        let wal = db_dir.join("memory.sqlite-wal");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(&wal, b"wal").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_staged_tree(staging.path()).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }

@@ -1073,3 +1073,4 @@ diag-pi-tool-overrides-missing-required-param = pi_tool_overrides for `{ $tool }
 
 diag-decay-token-call-tool-retention-days-must-be-greater = decay.token_call_tool_retention_days must be greater than or equal to zero (0 disables token call tool pruning)
 diag-about-to-migrate-the-database-schema-without-a = about to migrate the database schema without a new backup: this boot did not create a pre-migration package (current schema { $current }, target schema { $target }). Run `ai-memory backup` with the previous binary before upgrading to keep a restorable snapshot
+diag-restore-skipped-pre-migration-non-data = ai-memory: skipped { $value0 } non-data entry/entries from the pre-migration package

@@ -232,10 +232,14 @@ impl Store {
             }
             Err(error) => return Err(error.into()),
         }
-        // Read-only and without CREATE: this check must not manufacture the
-        // evidence that distinguishes a snapshot from a fresh database.
+        // Open read-write WITHOUT SQLITE_OPEN_CREATE: a pre-migration package
+        // can carry an uncheckpointed `-wal` sidecar without `-shm`, and
+        // SQLite's `SQLITE_OPEN_READ_ONLY` refuses to recover a WAL without
+        // `-shm`. Opening read-write without CREATE lets SQLite recover the
+        // WAL and rebuild `-shm` while still never creating an absent file or
+        // manufacturing migration history.
         let conn =
-            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         let has_history: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
              WHERE type = 'table' AND name = 'refinery_schema_history')",
@@ -464,6 +468,76 @@ mod tests {
             })
             .unwrap();
         assert!(applied > 1, "the historical snapshot must still migrate");
+    }
+
+    #[tokio::test]
+    async fn open_snapshot_recovers_uncheckpointed_wal_without_shm() {
+        let src = TempDir::new().unwrap();
+        let src_store = Store::open(src.path()).unwrap();
+        let ws = src_store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = src_store
+            .writer
+            .get_or_create_project(ws, "wal-test", None)
+            .await
+            .unwrap();
+        drop(src_store);
+
+        // Open a direct WAL connection with autocheckpoint disabled so a new
+        // committed row lives exclusively in `-wal`, never in the main DB file.
+        let src_db = src.path().join("db").join(DB_FILENAME);
+        let writer = Connection::open(&src_db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute(
+                "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'wal-only-ws', '2026-01-01T00:00:00Z')",
+                params![WorkspaceId::new().as_bytes()],
+            )
+            .unwrap();
+
+        let src_wal = src.path().join("db").join("memory.sqlite-wal");
+        assert!(
+            std::fs::metadata(&src_wal).unwrap().len() > 0,
+            "WAL file must contain the uncheckpointed transaction"
+        );
+
+        // Copy only the main DB and `-wal` (deliberately omitting `-shm`),
+        // matching what `restore --pre-migration-package` extracts.
+        let snap = TempDir::new().unwrap();
+        std::fs::create_dir(snap.path().join("db")).unwrap();
+        std::fs::copy(&src_db, snap.path().join("db").join(DB_FILENAME)).unwrap();
+        std::fs::copy(&src_wal, snap.path().join("db").join("memory.sqlite-wal")).unwrap();
+        drop(writer);
+
+        assert!(!snap.path().join("db").join("memory.sqlite-shm").exists());
+
+        let restored = Store::open_snapshot(snap.path())
+            .expect("open_snapshot must recover uncheckpointed -wal without -shm");
+        assert!(
+            restored
+                .reader
+                .list_projects_with_stats(None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.project_id == proj.to_string()),
+            "pre-existing rows must also survive"
+        );
+        drop(restored);
+
+        let verify_conn = Connection::open(snap.path().join("db").join(DB_FILENAME)).unwrap();
+        let wal_only_exists: bool = verify_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE name = 'wal-only-ws')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(wal_only_exists, "WAL-only row must survive open_snapshot");
     }
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {

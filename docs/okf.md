@@ -153,7 +153,10 @@ Order is fixed; each step gates the next:
    plus "everything looks right → delete the archive" and "something
    is missing → restore steps" (linking `MIGRATION-2.0.md`).
 
-Rollback: restore the archive (blunt, no git knowledge needed), or the
+Rollback: stop the server and run `ai-memory restore --from <archive>
+--pre-migration-package --force` (blunt, no git knowledge needed; extracts
+`wiki/`, `db/memory.sqlite`, `db/memory.sqlite-wal`, and `config.toml` while
+skipping non-data entries from the full data-dir snapshot), or restore the
 pre-migration git checkpoint + `reindex` (surgical).
 
 ### Repairs to already-migrated stores
