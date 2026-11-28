@@ -464,10 +464,6 @@ async fn search_with_request(
     owner: &ai_memory_core::OwnerFilter,
 ) -> Result<Response, Response> {
     let term = request.q.trim().to_owned();
-    if term.is_empty() {
-        return Ok(Json(Vec::<ApiSearchHit>::new()).into_response());
-    }
-
     let limit = request.limit.unwrap_or_else(default_limit).clamp(1, 100);
     if !request.scopes.is_empty()
         && (request
@@ -484,7 +480,14 @@ async fn search_with_request(
             "scopes cannot be combined with workspace/project",
         ));
     }
-    let hits = match scoped_search_mode(state, &request, viewer).await? {
+    // The scope is validated before the blank-query answer, so a partial
+    // scope, an oversized `scopes` list or an unknown project is refused the
+    // same way with or without a search term.
+    let mode = scoped_search_mode(state, &request, viewer).await?;
+    if term.is_empty() {
+        return Ok(Json(Vec::<ApiSearchHit>::new()).into_response());
+    }
+    let hits = match mode {
         SearchMode::Global => state.reader.search_pages(term, limit, viewer).await,
         SearchMode::Scoped(scopes) => {
             let scopes: Vec<(WorkspaceId, ProjectId)> = scopes

@@ -3414,6 +3414,41 @@ async fn api_search_empty_query_returns_empty_array() {
     );
 }
 
+/// A blank `q` answers `[]` only for a request whose scope is valid: the scope
+/// rules do not depend on the search term.
+#[tokio::test]
+async fn api_search_validates_scope_before_answering_an_empty_query() {
+    let (_tmp, store, wiki) = setup().await;
+
+    for (uri, status) in [
+        ("/search?q=&workspace=default", StatusCode::BAD_REQUEST),
+        (
+            "/search?q=%20&workspace=nope&project=nope",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let app = api_router(store.reader.clone(), wiki.clone());
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), status, "{uri}");
+    }
+
+    let scopes: Vec<Value> = (0..26)
+        .map(|i| serde_json::json!({"workspace": "default", "project": format!("p{i}")}))
+        .collect();
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/search")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"q": "", "scopes": scopes}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn api_search_rejects_non_integer_limit() {
     let (_tmp, store, wiki) = setup().await;
