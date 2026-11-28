@@ -3569,6 +3569,24 @@ from those you've enabled. To pin a specific model instead, use an id from
 [Standard Compute docs](https://docs.standardcompute.com) for details. This
 example configures the LLM only; configure embeddings separately.
 
+[LLMTR](https://llmtr.com) is a prepaid OpenAI-compatible LLM gateway and also
+uses the existing `openai-compat` provider. Create a key at
+https://llmtr.com/dashboard/keys and pass it through the generic compatibility
+credential:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://llmtr.com/v1
+-e AI_MEMORY_LLM_MODEL=qwen/qwen3.8-flash
+-e LLM_API_KEY="$LLMTR_API_KEY"
+```
+
+Model ids use the `vendor/model` format, e.g. `qwen/qwen3.8-flash` or
+`anthropic/claude-sonnet-5.5`; `GET https://llmtr.com/v1/models` is public and
+lists the current ids. Some models in that listing only support the Responses
+API, so pick one whose `supported_endpoints` includes `/v1/chat/completions`.
+This example configures the LLM only; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash

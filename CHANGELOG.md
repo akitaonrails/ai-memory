@@ -11,6 +11,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- Documented LLMTR as an endpoint for the existing `openai-compat` provider.
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
