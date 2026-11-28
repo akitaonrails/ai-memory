@@ -264,6 +264,12 @@ pub struct FallbackProfile {
     /// Copilot); every other provider must set it — it is never inherited
     /// from the primary provider's own env var.
     pub api_key_env: Option<String>,
+    /// Extra HTTP headers for this candidate only, in the `llm_headers`
+    /// format. Layered over `llm_headers`: a header named in both takes this
+    /// profile's value (names compare case-insensitively). Exists for keys
+    /// that only work with a per-account header, such as Anthropic's
+    /// `anthropic-workspace-id`, where one global value cannot fit two keys.
+    pub headers: Vec<String>,
 }
 
 /// Provider and exclusive fallback chain for one LLM workload.
@@ -274,6 +280,9 @@ pub struct TaskLlmSettings {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Extra headers for this task's primary, layered over `llm_headers`
+    /// the same way as [`FallbackProfile::headers`].
+    pub headers: Vec<String>,
     pub fallbacks: Vec<FallbackProfile>,
 }
 
@@ -3233,13 +3242,16 @@ impl Config {
                     .profile_provider_auth(provider, explicit_key, key, task.base_url.as_deref())
                     .with_context(|| format!("validating LLM task profile {path}"))?,
             };
-            let primary = config
+            let mut primary = config
                 .make_provider_config(
                     provider,
                     task.model.as_deref(),
                     auth,
                     non_empty(task.base_url.as_deref()).map(str::to_string),
                 )
+                .with_context(|| format!("validating LLM task profile {path}"))?;
+            primary.extra_headers = config
+                .profile_extra_headers(&path, &task.headers)
                 .with_context(|| format!("validating LLM task profile {path}"))?;
             let fallbacks = config.resolve_fallbacks(
                 &format!("{path}.fallbacks"),
@@ -3277,6 +3289,17 @@ impl Config {
     /// sets itself.
     pub fn llm_extra_headers(&self) -> LlmResult<ExtraHeaders> {
         ExtraHeaders::parse(&self.llm_headers)
+    }
+
+    /// [`Self::llm_extra_headers`] with one profile's own `headers` layered
+    /// on top, so a profile can replace a global header for its key alone.
+    fn profile_extra_headers(&self, path: &str, headers: &[String]) -> LlmResult<ExtraHeaders> {
+        let mut merged = self.llm_extra_headers()?;
+        merged.overlay(ExtraHeaders::parse_labeled(
+            &format!("{path}.headers"),
+            headers,
+        )?);
+        Ok(merged)
     }
 
     /// Build the configured LLM provider settings, if LLM support is enabled.
@@ -3454,12 +3477,14 @@ impl Config {
                 profile.base_url.as_deref(),
             )
             .map_err(|error| LlmError::NotConfigured(format!("{path}: {error}")))?;
-        self.make_provider_config(
+        let mut config = self.make_provider_config(
             provider,
             Some(&model),
             auth,
             non_empty(profile.base_url.as_deref()).map(str::to_string),
-        )
+        )?;
+        config.extra_headers = self.profile_extra_headers(path, &profile.headers)?;
+        Ok(config)
     }
 
     /// Resolve profile auth without inheriting the global provider's endpoint.
@@ -9444,6 +9469,7 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
             model: "gemini-3.5-flash".into(),
             base_url: None,
             api_key_env: Some("GEMINI_FALLBACK_KEY".into()),
+            ..FallbackProfile::default()
         };
         let provider_cfg = cfg
             .fallback_provider_config(0, &profile, Some(SecretString::from("sk-fallback-test")))
@@ -9470,12 +9496,141 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
             model: "qwen3:32b".into(),
             base_url: Some("http://gateway.internal/v1".into()),
             api_key_env: Some("COMPAT_FALLBACK_KEY".into()),
+            ..FallbackProfile::default()
         };
         let provider_cfg = cfg
             .fallback_provider_config(0, &profile, Some(SecretString::from("sk-fallback-test")))
             .unwrap();
         assert_eq!(provider_cfg.provider, ProviderChoice::OpenAiCompat);
         assert!(provider_cfg.request_metadata_headers);
+    }
+
+    /// Keys scoped to one account need a header value per key (Anthropic's
+    /// `anthropic-workspace-id`). A profile's `headers` replace the global
+    /// header of the same name for that profile only; profiles without
+    /// `headers`, and the global primary, keep `llm_headers` unchanged.
+    #[test]
+    fn profile_headers_layer_over_llm_headers_per_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let env = RuntimeEnv {
+            process_env: CapturedProcessEnv(vec![
+                ("KEY_B".into(), "key-b".into()),
+                ("KEY_C".into(), "key-c".into()),
+            ]),
+            anthropic_api_key: Some(SecretString::from("key-a")),
+            ..RuntimeEnv::default()
+        };
+        let cfg = load_with_env(
+            &tmp,
+            "llm_provider = 'anthropic'\n\
+             llm_headers = ['anthropic-workspace-id: ws-a', 'x-tool: t']\n\
+             [[llm_fallbacks]]\n\
+             provider = 'anthropic'\nmodel = 'm'\napi_key_env = 'KEY_B'\n\
+             headers = ['Anthropic-Workspace-Id: ws-b', 'x-extra: e']\n\
+             [[llm_fallbacks]]\n\
+             provider = 'anthropic'\nmodel = 'm'\napi_key_env = 'KEY_C'\n\
+             [llm.lint]\n\
+             provider = 'anthropic'\napi_key_env = 'KEY_B'\n\
+             headers = ['anthropic-workspace-id: ws-lint']\n\
+             [[llm.lint.fallbacks]]\n\
+             provider = 'anthropic'\nmodel = 'm'\napi_key_env = 'KEY_C'\n\
+             headers = ['anthropic-workspace-id=ws-c']\n",
+            env,
+        );
+        let expect = |entries: &[&str]| ExtraHeaders::parse(entries).unwrap();
+        let global = expect(&["anthropic-workspace-id: ws-a", "x-tool: t"]);
+        assert_eq!(
+            cfg.llm_provider_config().unwrap().unwrap().extra_headers,
+            global
+        );
+        assert_eq!(
+            cfg.llm_fallback_configs[0].extra_headers,
+            expect(&["anthropic-workspace-id: ws-b", "x-tool: t", "x-extra: e"])
+        );
+        assert_eq!(cfg.llm_fallback_configs[1].extra_headers, global);
+        let lint = &cfg.llm_task_configs["lint"];
+        assert_eq!(
+            lint.primary.extra_headers,
+            expect(&["anthropic-workspace-id: ws-lint", "x-tool: t"])
+        );
+        assert_eq!(
+            lint.fallbacks[0].extra_headers,
+            expect(&["anthropic-workspace-id: ws-c", "x-tool: t"])
+        );
+    }
+
+    /// A task primary without `headers` keeps the global set, like a fallback
+    /// without them; the per-profile layering is not applied to every primary.
+    #[test]
+    fn a_task_primary_without_headers_keeps_llm_headers() {
+        let cfg = load_with_toml(
+            "llm_headers = ['x-tool: t']
+             [llm.lint]
+provider = 'openai'
+api_key_env = 'K'
+             [llm.profile]
+provider = 'openai'
+api_key_env = 'K'
+             headers = ['x-tool: profile']
+",
+        )
+        .unwrap();
+        let tasks = &cfg.llm_task_configs;
+        assert_eq!(
+            tasks["lint"].primary.extra_headers,
+            ExtraHeaders::parse(["x-tool: t"]).unwrap()
+        );
+        assert_eq!(
+            tasks["profile"].primary.extra_headers,
+            ExtraHeaders::parse(["x-tool: profile"]).unwrap()
+        );
+    }
+
+    /// The openai-compat provider owns `x-request-id`; a fallback's own
+    /// `headers` cannot set it any more than `llm_headers` can, and the load
+    /// error names the profile.
+    #[test]
+    fn a_fallback_header_cannot_set_what_openai_compat_sends_itself() {
+        let error = load_with_toml(
+            "[[llm_fallbacks]]
+provider = 'openai-compat'
+model = 'm'
+             base_url = 'http://127.0.0.1:9/v1'
+headers = ['x-request-id: static']
+",
+        )
+        .expect_err("a static x-request-id must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("llm_fallbacks[0]"), "{rendered}");
+        assert!(rendered.contains("x-request-id"), "{rendered}");
+        assert!(rendered.contains("a profile's headers"), "{rendered}");
+    }
+
+    /// A profile's `headers` go through the `llm_headers` validation, and the
+    /// error names the list without echoing the offending entry.
+    #[rstest::rstest]
+    #[case::fallback(
+        "[[llm_fallbacks]]\nprovider = 'openai'\nmodel = 'm'\napi_key_env = 'K'\n",
+        "llm_fallbacks[0].headers entry 1"
+    )]
+    #[case::task_fallback(
+        "[llm.lint]\nprovider = 'openai'\n[[llm.lint.fallbacks]]\n\
+         provider = 'openai'\nmodel = 'm'\napi_key_env = 'K'\n",
+        "llm.lint.fallbacks[0].headers entry 1"
+    )]
+    #[case::task_primary("[llm.lint]\nprovider = 'openai'\n", "llm.lint.headers entry 1")]
+    fn load_rejects_an_invalid_profile_header(#[case] profile: &str, #[case] source: &str) {
+        for (entry, reason) in [
+            ("sk-pasted-secret", "neither"),
+            ("x-api-key: sk-pasted-secret", "set by ai-memory itself"),
+        ] {
+            let error = load_with_toml(&format!("{profile}headers = ['{entry}']\n"))
+                .expect_err("an invalid profile header must fail closed");
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains(source), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            assert!(!rendered.contains("sk-pasted-secret"), "{rendered}");
+        }
     }
 
     #[test]
@@ -9613,6 +9768,7 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
             model: "m".into(),
             base_url: Some("https://fallback.example".into()),
             api_key_env: None,
+            ..FallbackProfile::default()
         };
         let cfg = Config {
             llm_base_url: Some("https://global.example".into()),
@@ -9643,6 +9799,7 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
             model: "claude-sonnet-4-6".into(),
             base_url: None,
             api_key_env: None,
+            ..FallbackProfile::default()
         };
         let provider_cfg = cfg.fallback_provider_config(0, &profile, None).unwrap();
         assert_eq!(provider_cfg.provider, ProviderChoice::AnthropicOAuth);
@@ -9784,6 +9941,94 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
             "cooldown {remaining}s is not the configured 7200s"
         );
         assert_eq!(health[0].circuit_reason.as_deref(), Some("quota-exhausted"));
+        server.abort();
+    }
+
+    /// On the wire, each candidate of a chain sends its own profile header and
+    /// never the global value it replaces. The primary's workspace answers
+    /// with Anthropic's out-of-credit 400, so the fallback must take over with
+    /// its own workspace (sending the global one would get Anthropic's
+    /// "Workspace not found" instead).
+    #[tokio::test]
+    async fn each_chain_candidate_sends_its_own_profile_header_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                let head_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at;
+                    }
+                    if n == 0 {
+                        return;
+                    }
+                };
+                let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                let workspaces: Vec<String> = head
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("anthropic-workspace-id:"))
+                    .map(|value| value.trim().to_string())
+                    .collect();
+                let (status, body) = if workspaces == ["ws-primary"] {
+                    (
+                        "400 Bad Request",
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"model":"m","content":[{"type":"text","text":"from fallback"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+                    )
+                };
+                recorder.lock().unwrap().push(workspaces);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let tmp = TempDir::new().unwrap();
+        let env = RuntimeEnv {
+            process_env: CapturedProcessEnv(vec![("KEY_B".into(), "key-b".into())]),
+            anthropic_api_key: Some(SecretString::from("key-a")),
+            ..RuntimeEnv::default()
+        };
+        let cfg = load_with_env(
+            &tmp,
+            &format!(
+                "llm_provider = 'anthropic'\nllm_model = 'm'\nllm_base_url = '{uri}'\n\
+                 llm_headers = ['anthropic-workspace-id: ws-primary']\n\
+                 [[llm_fallbacks]]\n\
+                 provider = 'anthropic'\nmodel = 'm'\nbase_url = '{uri}'\n\
+                 api_key_env = 'KEY_B'\n\
+                 headers = ['Anthropic-Workspace-Id: ws-fallback']\n"
+            ),
+            env,
+        );
+        let chain = cfg.llm_provider_chain().unwrap().unwrap();
+        let response = chain
+            .complete(ai_memory_llm::ChatRequest::user_prompt("hi"))
+            .await
+            .expect("the fallback answers with its own workspace");
+        assert_eq!(response.text, "from fallback");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                vec!["ws-primary".to_string()],
+                vec!["ws-fallback".to_string()]
+            ],
+            "each candidate must send exactly its own workspace header"
+        );
         server.abort();
     }
 

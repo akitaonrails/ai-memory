@@ -67,6 +67,7 @@ An array of tables. Each entry is tried in order after the primary provider, onl
 | `model` | empty (required) | - | Model id for this candidate. |
 | `base_url` | unset | - | Endpoint override for this candidate. Required for `openai-compat`. |
 | `api_key_env` | unset | - | Name of the environment variable holding this candidate's key. Required unless the provider has a native credential source. `copilot` and `anthropic-oauth` use the named key instead of their native token; `openai-oauth`, `codex`, `cursor` and `vertex` reject it. |
+| `headers` | `[]` | - | Extra HTTP headers for this candidate only, in the `llm_headers` format. They are layered over `llm_headers`, and a header named in both takes this entry's value (names compare case-insensitively). Validated like `llm_headers`, and values are never logged. |
 
 ## `[llm.<task>]`
 
@@ -83,6 +84,7 @@ which uses the `lint` provider.
 | `model` | selected provider's default | `AI_MEMORY_LLM__<TASK>__MODEL` | Model override for this task; required for `openai-compat`. |
 | `base_url` | selected provider's default | `AI_MEMORY_LLM__<TASK>__BASE_URL` | Endpoint override; required for `openai-compat`. The global endpoint is not inherited. |
 | `api_key_env` | provider's normal credential source | `AI_MEMORY_LLM__<TASK>__API_KEY_ENV` | Name of the environment variable holding the credential, never the credential itself. |
+| `headers` | `[]` | - | Extra HTTP headers for this task's primary, layered over `llm_headers` like a fallback entry's `headers`. |
 | `fallbacks` | `[]` | - | Ordered fallback profiles, with the same fields and requirements as `[[llm_fallbacks]]`. |
 
 Replace `<TASK>` with an uppercase task key, for example

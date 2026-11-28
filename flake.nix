@@ -175,6 +175,30 @@
           settings.llm_headers = [ "Authorization: Bearer sekrit" ];
         };
       };
+      profileHeadersInSettings = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          settings.llm_fallbacks = [
+            { provider = "openai"; model = "m"; }
+            { provider = "openai"; model = "m"; headers = [ "x-tenant: sekrit" ]; }
+          ];
+          settings.llm.lint = {
+            provider = "openai";
+            headers = [ "x-tenant: sekrit" ];
+            fallbacks = [ { provider = "openai"; model = "m"; headers = [ "x-tenant: sekrit" ]; } ];
+          };
+        };
+      };
+      profilesWithoutHeaders = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          settings.llm_fallbacks = [ { provider = "openai"; model = "m"; api_key_env = "K"; } ];
+          settings.llm.lint = {
+            provider = "openai";
+            fallbacks = [ { provider = "openai"; model = "m"; api_key_env = "K"; } ];
+          };
+        };
+      };
       bindInSettings = mkNixos {
         services.ai-memory = {
           enable = true;
@@ -208,6 +232,8 @@
       ageEnvironmentFailing = failingAssertions ageAndEnvironmentFile;
       secretsFailing = failingAssertions secretsInSettings;
       headersFailing = failingAssertions headersInSettings;
+      profileHeadersFailing = failingAssertions profileHeadersInSettings;
+      profilesWithoutHeadersFailing = failingAssertions profilesWithoutHeaders;
       bindFailing = failingAssertions bindInSettings;
 
       enabledSc = enabled.config.systemd.services.ai-memory.serviceConfig;
@@ -313,6 +339,13 @@
           assert lib.any (a: lib.hasInfix "settings.auth must not contain secrets" a.message)
             secretsFailing;
           assert lib.any (a: lib.hasInfix "settings.llm_headers" a.message) headersFailing;
+          assert lib.any
+            (a: lib.hasInfix
+              "(llm_fallbacks[1].headers, llm.lint.headers, llm.lint.fallbacks[0].headers)"
+              a.message)
+            profileHeadersFailing;
+          assert !lib.any (a: lib.hasInfix "LLM profile headers" a.message)
+            profilesWithoutHeadersFailing;
           assert lib.any (a: lib.hasInfix "settings.bind is not allowed" a.message)
             bindFailing;
           assert (customSc.StateDirectory or null) == null;

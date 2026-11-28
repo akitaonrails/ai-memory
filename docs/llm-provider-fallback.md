@@ -40,9 +40,11 @@ When a task has no profile, it shares the same default provider instance and
 fallback chain. A task profile replaces that chain with its own primary and
 ordered fallbacks; global fallbacks are not appended. Task profiles work when
 the global provider is unset, without enabling other tasks. Existing timeout,
-compatibility, header and reasoning settings apply globally, and so does
+compatibility and reasoning settings apply globally, and so does
 `llm_quota_cooldown_secs` (see
-[Credit and quota exhaustion](#credit-and-quota-exhaustion)).
+[Credit and quota exhaustion](#credit-and-quota-exhaustion)). `llm_headers`
+also applies to every candidate, and a task primary or fallback can layer its
+own `headers` on top (see [Per-candidate headers](#per-candidate-headers)).
 
 Scalar fields have nested environment forms, such as
 `AI_MEMORY_LLM__BOOTSTRAP__PROVIDER` and `AI_MEMORY_LLM__BOOTSTRAP__MODEL`.
@@ -111,6 +113,45 @@ block), not exported in every shell.
 
 The primary runs first, then the fallbacks in declaration order. Fallback
 profiles have no environment-variable shorthand.
+
+### Per-candidate headers
+
+`llm_headers` goes to every candidate. A fallback entry, a task primary
+(`[llm.<task>]`) and a task fallback can each set `headers`, a list in the same
+`Name: Value` or `Name=Value` format, sent by that candidate only. The entry's
+list is layered over `llm_headers`: a header named in both takes the entry's
+value, and names compare case-insensitively, so exactly one value goes on the
+wire. Entries without `headers` keep `llm_headers` unchanged. A list can add
+or replace a header but cannot remove one: in a chain that also has an
+`openai` fallback, an `anthropic-workspace-id` in `llm_headers` reaches that
+fallback too. Keep provider-specific headers in `llm_headers` only when every
+candidate accepts them.
+
+This covers keys that need a different header value per key. An Anthropic key
+that belongs to a workspace-scoped service account is refused without an
+`anthropic-workspace-id` header, and a workspace id from another organization
+is refused as not found, so one global value cannot serve two such keys:
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-haiku-4-5"
+llm_headers = ["anthropic-workspace-id: wrkspc_PRIMARY"]
+
+[[llm_fallbacks]]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+api_key_env = "SECOND_ANTHROPIC_KEY"
+headers = ["anthropic-workspace-id: wrkspc_SECOND"]
+```
+
+Each list is validated at load like `llm_headers`, including the headers
+ai-memory sets itself (`authorization`, `x-api-key`, `anthropic-version`, ...),
+and an error names the list (`llm_fallbacks[0].headers entry 1`) without
+echoing the entry. Values never appear in logs, status or health. Unlike
+`llm_headers`, which can come from `AI_MEMORY_LLM_HEADERS`, these lists live
+only in `config.toml`, so keep that file private if a value is a credential.
+The NixOS module refuses them in `settings` for the same reason it refuses
+`llm_headers`: that file lands in the world-readable Nix store.
 
 ## Implementation boundary
 

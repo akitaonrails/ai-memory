@@ -208,12 +208,17 @@ log_level = "info"
 # source (OpenAI OAuth, Copilot) must set it, and it is never inherited from the
 # primary provider. A missing provider or model, or an unknown provider, fails
 # config load. A named variable that is unset fails when the server builds the
-# LLM chain. There is no environment shorthand. See docs/llm-provider-fallback.md.
+# LLM chain. `headers` adds HTTP headers for that entry only, in the
+# `llm_headers` format; a header named in both takes the entry's value. Use it
+# when each key needs its own header value, such as Anthropic's
+# `anthropic-workspace-id`. There is no environment shorthand. See
+# docs/llm-provider-fallback.md.
 #   [[llm_fallbacks]]
 #   provider    = "openai-compat"
 #   model       = "poolside/laguna-s-2.1-free"
 #   base_url    = "http://127.0.0.1:49375/v1"
 #   api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+#   headers     = ["x-gateway-tenant: team-b"]
 
 # How long a fallback chain (the default one or a task's) skips a candidate
 # that reported exhausted credit, quota or billing before the next call tries
@@ -431,8 +436,9 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # the global endpoint. api_key_env names an environment variable, never a key
 # value; when omitted, the provider uses its normal credential source. OpenAI
 # OAuth, Codex and Cursor reject api_key_env and keep their native login.
-# A named variable that is missing fails serve startup. Timeout, compatibility
-# options, headers and reasoning effort remain global.
+# A named variable that is missing fails serve startup. `headers` adds headers
+# for the task's primary over `llm_headers`, like a fallback entry's `headers`.
+# Timeout, compatibility options and reasoning effort remain global.
 #
 # Nested scalar environment overrides use double underscores, for example
 # AI_MEMORY_LLM__BOOTSTRAP__PROVIDER. Fallback lists are config-only.

@@ -462,7 +462,8 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             // same fail-closed way reserved headers are refused.
             if extra_headers.contains(REQUEST_ID_HEADER) {
                 return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_HEADERS must not set {REQUEST_ID_HEADER}: the \
+                    "LLM headers (llm_headers or a profile's headers) must not set \
+                     {REQUEST_ID_HEADER}: the \
                      openai-compat provider sends it itself on every chat attempt \
                      with the logical operation id"
                 )));
@@ -476,7 +477,8 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 .find(|name| extra_headers.contains(name))
             {
                 return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_HEADERS must not set {name}: the openai-compat \
+                    "LLM headers (llm_headers or a profile's headers) must not set \
+                     {name}: the openai-compat \
                      provider reserves it for the per-operation request metadata \
                      (llm_request_metadata_headers)"
                 )));
