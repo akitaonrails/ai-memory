@@ -4840,6 +4840,9 @@ const OPENCODE2_BINDING: &str = r#"
     // lookup into a request (and a server worker) per model call.
     const handoffFailures = new Map<SessionID, number>();
     const HANDOFF_MAX_ATTEMPTS = 3;
+    // SHA-256 digest of the compaction checkpoint each root session's anchor
+    // was armed for.
+    const anchorCheckpoints = new Map<SessionID, string>();
     const SESSION_MARKER_CAP = 512;
     // Stops listening on unload. Deliveries keep `hookAbort` until the queued
     // events have had their drain budget.
@@ -4952,6 +4955,22 @@ const OPENCODE2_BINDING: &str = r#"
       handoffFailures.delete(id);
       recapFetches.delete(id);
       anchorFetches.delete(id);
+      anchorCheckpoints.delete(id);
+    }
+
+    // After a compaction OpenCode opens the history with the checkpoint, a
+    // user message whose text starts with `<conversation-checkpoint>`.
+    function compactionCheckpoint(messages: unknown): string | undefined {
+      const first = Array.isArray(messages) ? messages[0] : undefined;
+      if (first?.role !== "user") return undefined;
+      const text = typeof first.content === "string"
+        ? first.content
+        : Array.isArray(first.content)
+          ? first.content.find((part: { type?: string }) => part?.type === "text")?.text
+          : undefined;
+      return typeof text === "string" && text.startsWith("<conversation-checkpoint>")
+        ? createHash("sha256").update(text).digest("hex")
+        : undefined;
     }
 
     async function ensureSession(id: SessionID): Promise<SessionInfo | undefined> {
@@ -5084,17 +5103,9 @@ const OPENCODE2_BINDING: &str = r#"
               sessionCwds.delete(id);
             } else if (event.type === "session.compaction.started") {
               recapFetches.delete(event.data.sessionID);
-              anchorFetches.delete(event.data.sessionID);
               const session = await ensureSession(event.data.sessionID);
               if (!session) continue;
               postPreCompact(event.data.sessionID, session.location.directory);
-            } else if (event.type === "session.compaction.ended") {
-              // The summary has replaced the history; the next model call's
-              // context hook carries the anchor until the next compaction.
-              const id = event.data.sessionID;
-              const session = await ensureSession(id);
-              if (!session || session.parentID) continue;
-              anchorFetches.set(id, fetchRecap(session.location.directory, id, true));
             }
           } catch (error) {
             if (!unload.signal.aborted) console.warn("ai-memory event capture failed", error);
@@ -5142,6 +5153,16 @@ const OPENCODE2_BINDING: &str = r#"
       const recap = await recapFetches.get(id);
       if (recap) {
         event.system.push({ type: "text", text: recap });
+      }
+      // Armed from the checkpoint in this request, not on
+      // `session.compaction.ended`: OpenCode runs the first request after a
+      // compaction without waiting for the event stream, so an anchor armed
+      // there misses step 1 and changes `event.system` on step 2, which
+      // invalidates the provider's prompt cache.
+      const checkpoint = compactionCheckpoint(event.messages);
+      if (checkpoint && anchorCheckpoints.get(id) !== checkpoint) {
+        anchorCheckpoints.set(id, checkpoint);
+        anchorFetches.set(id, fetchRecap(session.location.directory, id, true));
       }
       const anchor = await anchorFetches.get(id);
       if (anchor) {
@@ -15219,21 +15240,27 @@ model = "gpt-5"
         assert_eq!(plugin.matches("anchorFetches.delete(id);").count(), 2);
     }
 
-    /// #1983: OpenCode 2 publishes `session.compaction.ended` and runs the
-    /// `compaction` session hook with the summary request's `system` parts
-    /// (both present in the OpenCode 2.2.5 binary).
+    /// #1983 / #2551: OpenCode 2 opens the history after a compaction with a
+    /// `<conversation-checkpoint>` user message and runs the `compaction`
+    /// session hook with the summary request's `system` parts. The anchor is
+    /// armed from that checkpoint in `context`, never from the event stream,
+    /// which OpenCode does not wait for before the next model request.
     #[test]
     fn opencode2_plugin_arms_the_anchor_after_a_compaction() {
         let plugin =
             build_opencode2_plugin("http://127.0.0.1:49374", None, None, "denylist", false)
                 .unwrap();
-        assert!(plugin.contains("event.type === \"session.compaction.ended\""));
+        assert!(plugin.contains("text.startsWith(\"<conversation-checkpoint>\")"));
+        assert!(plugin.contains("createHash(\"sha256\").update(text).digest(\"hex\")"));
+        assert!(plugin.contains("const checkpoint = compactionCheckpoint(event.messages);"));
         assert!(
             plugin.contains(
                 "anchorFetches.set(id, fetchRecap(session.location.directory, id, true));"
             )
         );
-        assert!(plugin.contains("anchorFetches.delete(event.data.sessionID);"));
+        assert!(plugin.contains("anchorCheckpoints.delete(id);"));
+        assert!(!plugin.contains("event.type === \"session.compaction.ended\""));
+        assert!(!plugin.contains("anchorFetches.delete(event.data.sessionID);"));
         assert!(plugin.contains("event.system.push({ type: \"text\", text: anchor });"));
         assert!(plugin.contains("ctx.session.hook(\"compaction\""));
         assert!(plugin.contains(

@@ -126,11 +126,15 @@ try {
   assert.ok(requests.some((r) => r.payload?.output === "content-only tool evidence"));
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end"));
 
-  // #1983: the compaction request gets one line naming the session, its end
-  // arms the anchor for every later model call, and the next compaction's
-  // start forgets it. A subagent's compaction gets neither.
+  // #1983 / #2551: the compaction request gets one line naming the session.
+  // The checkpoint that opens the next request's history arms the anchor, from
+  // that first request on, and a later checkpoint re-arms it. A subagent's
+  // compaction gets neither.
   const anchors = () => requests.filter((r) => r.url.pathname === "/recap" && r.url.searchParams.get("mode") === "anchor");
   const stopCount = () => requests.filter((r) => r.url.searchParams.get("event") === "stop").length;
+  const anchorA = "> 🧭 ai-memory: post-compaction anchor for this session (root-a)";
+  const checkpoint = (summary) => [{ role: "user", content: `<conversation-checkpoint>\n<summary>\n${summary}\n</summary>\n</conversation-checkpoint>` }];
+  const checkpointParts = (summary) => [{ role: "user", content: [{ type: "text", text: `<conversation-checkpoint>\n<summary>\n${summary}\n</summary>\n</conversation-checkpoint>` }] }];
   a.emit({ type: "session.compaction.started", data: { sessionID: "root-a", reason: "auto" } });
   await until(() => requests.some((r) => r.url.searchParams.get("event") === "pre-compact"), "compaction start captured");
   const summaryRequest = { sessionID: "root-a", system: [] };
@@ -143,33 +147,42 @@ try {
   assert.equal(childSummary.system.length, 0, "a subagent compaction gets no note");
   a.emit({ type: "session.compaction.ended", data: { sessionID: "root-a", reason: "auto", text: "summary" } });
   a.emit({ type: "session.compaction.ended", data: { sessionID: "child", reason: "auto", text: "summary" } });
-  await until(() => anchors().length === 1, "compaction end arms the anchor");
+  // No wait: OpenCode runs the next model request without waiting for the
+  // event stream to deliver the compaction's end.
+  const steps = [];
+  for (let i = 0; i < 2; i++) {
+    const call = { sessionID: "root-a", system: [], messages: checkpoint("first") };
+    await a.hooks.get("session.context")(call);
+    assert.ok(call.system.some((part) => part.text === anchorA), "anchor rides every model call from the first one");
+    steps.push(call.system);
+  }
+  assert.deepEqual(steps[0], steps[1], "the system parts stay identical across steps");
+  assert.equal(anchors().length, 1, "the anchor is fetched once per compaction");
   assert.equal(anchors()[0].url.searchParams.get("session_id"), "root-a");
   assert.equal(anchors()[0].url.searchParams.get("budget"), "2000");
-  for (let i = 0; i < 2; i++) {
-    const call = { sessionID: "root-a", system: [] };
-    await a.hooks.get("session.context")(call);
-    assert.ok(call.system.some((part) => part.text === "> 🧭 ai-memory: post-compaction anchor for this session (root-a)"), "anchor rides every model call until the next compaction");
-  }
-  assert.equal(anchors().length, 1, "the anchor is fetched once per compaction");
+  const childCall = { sessionID: "child", system: [], messages: checkpointParts("child") };
+  await a.hooks.get("session.context")(childCall);
+  assert.equal(childCall.system.length, 0, "a subagent compaction never arms an anchor");
+  assert.equal(anchors().length, 1, "a subagent compaction never fetches an anchor");
   const stopsBefore = stopCount();
   a.emit({ type: "session.compaction.started", data: { sessionID: "root-a", reason: "auto" } });
   a.emit({ type: "session.execution.succeeded", data: { sessionID: "root-a" } });
   await until(() => stopCount() > stopsBefore, "events after the next compaction start processed");
-  const afterNext = { sessionID: "root-a", system: [] };
+  const stillArmed = { sessionID: "root-a", system: [], messages: checkpoint("first") };
+  await a.hooks.get("session.context")(stillArmed);
+  assert.ok(stillArmed.system.some((part) => part.text === anchorA), "a late compaction.started event must not wipe an armed anchor");
+  assert.equal(anchors().length, 1, "same checkpoint does not refetch the anchor");
+  const afterNext = { sessionID: "root-a", system: [], messages: checkpointParts("second") };
   await a.hooks.get("session.context")(afterNext);
-  assert.ok(!afterNext.system.some((part) => part.text === "> 🧭 ai-memory: post-compaction anchor for this session (root-a)"), "the next compaction forgets the anchor");
-  assert.equal(anchors().length, 1, "a subagent compaction never fetches an anchor");
-  a.emit({ type: "session.compaction.ended", data: { sessionID: "root-slow", reason: "auto", text: "summary" } });
-  await until(() => anchors().length === 2, "an older server is still asked");
-  const oldServer = { sessionID: "root-slow", system: [] };
+  assert.ok(afterNext.system.some((part) => part.text === anchorA), "the next checkpoint re-arms the anchor");
+  assert.equal(anchors().length, 2, "a new checkpoint fetches a new anchor");
+  const oldServer = { sessionID: "root-slow", system: [], messages: checkpoint("slow") };
   await a.hooks.get("session.context")(oldServer);
+  assert.equal(anchors().length, 3, "an older server is still asked");
   assert.ok(!oldServer.system.some((part) => part.text.includes("compaction recap")), "an older server's recap is never injected");
   // Deleting a session forgets its armed anchor along with the rest of its state.
   const anchorC = "> 🧭 ai-memory: post-compaction anchor for this session (root-c)";
-  a.emit({ type: "session.compaction.ended", data: { sessionID: "root-c", reason: "auto", text: "summary" } });
-  await until(() => anchors().length === 3, "compaction end arms root-c's anchor");
-  const armed = { sessionID: "root-c", system: [] };
+  const armed = { sessionID: "root-c", system: [], messages: checkpointParts("c") };
   await a.hooks.get("session.context")(armed);
   assert.ok(armed.system.some((part) => part.text === anchorC), "root-c's anchor is armed");
   a.emit({ type: "session.deleted", data: { sessionID: "root-c" } });
@@ -177,7 +190,7 @@ try {
   const afterDelete = { sessionID: "root-c", system: [] };
   await a.hooks.get("session.context")(afterDelete);
   assert.ok(!afterDelete.system.some((part) => part.text === anchorC), "a deleted session's anchor is forgotten");
-  assert.equal(anchors().length, 3, "a deleted session never refetches its anchor");
+  assert.equal(anchors().length, 4, "a deleted session never refetches its anchor");
 
   await b.hooks.get("session.prompt")({ sessionID: "root-b", messageID: "b1", prompt: { text: "beta" } });
   await b.hooks.get("session.context")({ sessionID: "root-b", system: [] });

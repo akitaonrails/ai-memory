@@ -68,6 +68,15 @@ version in [`docs/changelog/`](docs/changelog/):
   shell, and PowerShell extractors, falling back to `cwd` only when
   `workspace_roots` is missing or empty. (#2546)
 
+### Fixed
+
+- Armed the OpenCode V2 post-compaction anchor synchronously inside the
+  `context` hook from the opening `<conversation-checkpoint>` user message
+  instead of waiting for the async `session.compaction.ended` event, and
+  stopped `session.compaction.started` from clearing an already-armed
+  anchor, so step 1 carries the anchor and `system` stays identical across
+  steps to preserve the prompt cache. (#2551)
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
