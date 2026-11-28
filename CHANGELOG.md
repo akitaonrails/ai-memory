@@ -25,6 +25,14 @@ version in [`docs/changelog/`](docs/changelog/):
 - Preserved hook fallback IDs when the server discards a `finalize-session`
   event and reported the refusal. (#2519)
 
+### Fixed
+
+- Scrubbed the embedding and OAuth SSE provider error bodies before they
+  could reach the health snapshot or the admin `llm-test` route. Those two
+  paths built their own error body without the provider-error helper, so a
+  credential-shaped string echoed by an upstream endpoint could have appeared
+  in operator-visible output ([#2534](https://github.com/akitaonrails/ai-memory/pull/2534))
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
