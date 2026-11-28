@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   whose projection would omit or truncate evidence are consolidated through
   checkpointed, grounded map-reduce stages instead of a lossy single prompt;
   sessions that fit kept the same request. Completed stages are scoped by
-  `(workspace, project, session, fingerprint)` and pruned after publication.
+  `(workspace, project, session, fingerprint)` and pruned after publication (#2550).
 
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
