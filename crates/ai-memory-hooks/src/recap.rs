@@ -165,7 +165,10 @@ async fn build_recap(
             },
         )
         .await?;
-    let limit_hit = page.records.len() >= RECAP_ROW_LIMIT;
+    // A read that returned every matching row is complete even when it is
+    // exactly `RECAP_ROW_LIMIT` long, so compare against the scope's total
+    // instead of the page length.
+    let limit_hit = page.total > page.records.len() as u64;
     let Some(window) = select_window(&page.records, limit_hit) else {
         return Ok(no_compaction_notice(raw_session_id));
     };
@@ -1887,6 +1890,28 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        /// A window that fills the row limit exactly was read whole. Only a
+        /// session with more matching rows than the read returned has earlier
+        /// rows the recap did not see.
+        #[tokio::test]
+        async fn recap_marks_unread_rows_only_past_the_row_limit() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let mut rows = vec![(ObservationKind::UserPrompt, "P"); RECAP_ROW_LIMIT - 1];
+            rows.push((ObservationKind::PreCompact, ""));
+            let exact = seed(&state, None, &rows).await;
+            rows.insert(0, (ObservationKind::UserPrompt, "P"));
+            let over = seed(&state, None, &rows).await;
+
+            let (status, body) = recap(&state, Some(exact.to_string()), None, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(!body.contains("were not read"), "{body}");
+
+            let (status, body) = recap(&state, Some(over.to_string()), None, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body.contains("were not read"), "{body}");
         }
 
         /// Devin's `post-compaction` closes the recap window like `pre-compact`.

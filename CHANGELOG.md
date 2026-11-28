@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped the session recap from saying `Earlier rows of this window were not
+  read` when the window held exactly the 400 rows one recap reads. The recap
+  now compares the rows it read with the session's total, so the note appears
+  only when older rows exist. (#2559)
+
 ## [3.6.5] - 2026-11-28
 
 ### Security
