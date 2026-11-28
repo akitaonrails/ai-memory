@@ -249,7 +249,7 @@ impl DecaySettings {
 /// at startup — a missing/empty provider or model, an unknown provider, or
 /// a missing credential fails startup rather than leaving a latent fallback
 /// that only fails under an outage.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FallbackProfile {
     /// Provider selection (same wire names as `llm_provider`).
@@ -272,8 +272,46 @@ pub struct FallbackProfile {
     pub headers: Vec<String>,
 }
 
+/// Formats `Name: Value` / `Name=Value` header entries for `Debug` without
+/// ever exposing header values (or bare entries that may be pasted secrets).
+struct RedactedHeaders<'a>(&'a [String]);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        for entry in self.0 {
+            let sep = match (entry.find(':'), entry.find('=')) {
+                (Some(colon), Some(equals)) => Some(colon.min(equals)),
+                (Some(colon), None) => Some(colon),
+                (None, Some(equals)) => Some(equals),
+                (None, None) => None,
+            };
+            match sep
+                .map(|at| entry[..at].trim())
+                .filter(|name| !name.is_empty())
+            {
+                Some(name) => list.entry(&format!("{name}: [REDACTED]")),
+                None => list.entry(&"[REDACTED]"),
+            };
+        }
+        list.finish()
+    }
+}
+
+impl std::fmt::Debug for FallbackProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FallbackProfile")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .finish()
+    }
+}
+
 /// Provider and exclusive fallback chain for one LLM workload.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TaskLlmSettings {
     pub provider: String,
@@ -284,6 +322,19 @@ pub struct TaskLlmSettings {
     /// the same way as [`FallbackProfile::headers`].
     pub headers: Vec<String>,
     pub fallbacks: Vec<FallbackProfile>,
+}
+
+impl std::fmt::Debug for TaskLlmSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskLlmSettings")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("fallbacks", &self.fallbacks)
+            .finish()
+    }
 }
 
 /// Load-time provider settings, including credentials, never serialized.
@@ -4942,6 +4993,46 @@ mod tests {
                 assert!(
                     !rendered.contains(sentinel),
                     "Debug output exposed {sentinel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_and_task_llm_debug_redacts_header_values() {
+        let fallback = FallbackProfile {
+            provider: "anthropic".into(),
+            model: "claude-haiku-4-5".into(),
+            base_url: None,
+            api_key_env: Some("SECOND_ANTHROPIC_KEY".into()),
+            headers: vec![
+                "anthropic-workspace-id: wrkspc_FALLBACK_SECRET".into(),
+                "X-Tenant=tenant_eq_secret".into(),
+                "bare-pasted-token-secret".into(),
+            ],
+        };
+        let task = TaskLlmSettings {
+            provider: "anthropic".into(),
+            model: Some("claude-sonnet-4-5".into()),
+            base_url: None,
+            api_key_env: Some("TASK_ANTHROPIC_KEY".into()),
+            headers: vec!["anthropic-workspace-id: wrkspc_TASK_SECRET".into()],
+            fallbacks: vec![fallback.clone()],
+        };
+
+        for rendered in [format!("{fallback:?}"), format!("{task:?}")] {
+            assert!(rendered.contains("anthropic-workspace-id: [REDACTED]"));
+            assert!(rendered.contains("X-Tenant: [REDACTED]"));
+            assert!(rendered.contains("\"[REDACTED]\""));
+            for sentinel in [
+                "wrkspc_FALLBACK_SECRET",
+                "tenant_eq_secret",
+                "bare-pasted-token-secret",
+                "wrkspc_TASK_SECRET",
+            ] {
+                assert!(
+                    !rendered.contains(sentinel),
+                    "Debug output exposed header secret {sentinel}: {rendered}"
                 );
             }
         }

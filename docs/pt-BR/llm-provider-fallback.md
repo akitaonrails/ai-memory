@@ -40,9 +40,12 @@ Quando uma tarefa não possui perfil, ela compartilha a mesma instância de prov
 cadeia de fallback. O perfil de uma tarefa substitui essa cadeia por seu próprio primário e seus
 fallbacks ordenados; fallbacks globais não são anexados. Perfis de tarefas funcionam quando
 o provedor global não está definido, sem habilitar outras tarefas. Configurações existentes de timeout,
-compatibilidade, cabeçalhos e raciocínio se aplicam globalmente, assim como
+compatibilidade e raciocínio se aplicam globalmente, assim como
 `llm_quota_cooldown_secs` (veja
-[Exaustão de crédito e cota](#exaustão-de-crédito-e-cota)).
+[Exaustão de crédito e cota](#exaustão-de-crédito-e-cota)). `llm_headers`
+também se aplica a todos os candidatos, e um primário ou fallback de tarefa pode
+aplicar seus próprios `headers` por cima (veja
+[Cabeçalhos por candidato](#cabeçalhos-por-candidato)).
 
 Campos escalares possuem formas aninhadas de variáveis de ambiente, como
 `AI_MEMORY_LLM__BOOTSTRAP__PROVIDER` e `AI_MEMORY_LLM__BOOTSTRAP__MODEL`.
