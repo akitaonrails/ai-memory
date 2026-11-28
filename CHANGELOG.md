@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+
+- Merged overlapping credential-tier redaction spans before rewriting in both
+  `ai-memory-core` and `ai-memory-client`, and added one-layer JSON string
+  escape decoding (with an invisible-preserving boundary pass) to
+  `ai-memory-client` and `Sanitizer::scrub`, preventing overlapping credential
+  rules from leaving unredacted prefix or suffix fragments in stored
+  observations and pages. (GHSA-m7mm-crc8-ffcq)
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
