@@ -89,6 +89,8 @@ version in [`docs/changelog/`](docs/changelog/):
   diagnostics for Antigravity CLI status line setup. (#2486)
 - Fixed Windows command rendering for the Antigravity CLI status line token
   observer by using the same path rendering as its lifecycle hooks. (#2486)
+- Fixed OpenCode 2 token capture for native step completion events that
+  identify the response with `assistantMessageID`. (#2486)
 
 ## [3.6.4] - 2026-11-27
 

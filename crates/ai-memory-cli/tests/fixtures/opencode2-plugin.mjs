@@ -268,6 +268,32 @@ try {
     },
   ], "repeated updates and step-finish for the same message must merge into one call_id");
 
+  const stopsBeforeNativeUsage = stopCount();
+  const nativeStep = {
+    type: "session.step.ended",
+    data: {
+      sessionID: "root-a",
+      assistantMessageID: "msg_native_step",
+      finish: "stop",
+      cost: 0.0001,
+      tokens: { input: 125, output: 23, reasoning: 0, cache: { read: 30, write: 4 } },
+    },
+  };
+  a.emit(nativeStep);
+  a.emit(nativeStep);
+  a.emit({ type: "session.execution.succeeded", data: { sessionID: "root-a" } });
+  await until(() => stopCount() > stopsBeforeNativeUsage, "native usage stop delivered");
+  const nativeUsageStop = requests.filter((r) => r.url.searchParams.get("event") === "stop").at(-1);
+  assert.deepEqual(nativeUsageStop.payload._ai_memory_usage_calls, [
+    {
+      call_id: "msg_native_step",
+      input_tokens: 125,
+      output_tokens: 23,
+      cache_write_tokens: 4,
+      cache_read_tokens: 30,
+    },
+  ], "a native OpenCode 2 step must report usage once under its assistant message ID");
+
   // 2. A stop with no new measured usage (or only zero/invalid counters) must
   //    omit _ai_memory_usage_calls completely.
   const stopsBeforeEmptyUsage = stopCount();

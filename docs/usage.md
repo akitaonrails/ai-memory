@@ -1119,10 +1119,11 @@ therefore includes inherited usage, not only work billed after the fork.
 Pi does **not** yet send individual response records to the Token usage ledger;
 session totals and coverage can be present while its response table is empty.
 
-OpenCode 2 reports measured assistant response usage via its updated generated
-plugin (`ai-memory install-hooks --agent opencode2 --apply`), deduplicated by
-native message ID on `stop` and `session-end` so streaming updates and plugin
-reloads do not double-count. Antigravity CLI reports cumulative session totals
+OpenCode 2's generated plugin (`ai-memory install-hooks --agent opencode2
+--apply`) collects measured usage from assistant response updates and native
+step completion events. It reports usage on `stop` and `session-end`,
+deduplicated by native assistant message ID across streaming updates and
+plugin reloads. Antigravity CLI reports cumulative session totals
 by observing its `statusLine` payload (`ai-memory install-hooks --agent
 antigravity-cli --apply`), caching measured `total_input_tokens` and
 `total_output_tokens` locally and attaching them on `stop` and `session-end`
