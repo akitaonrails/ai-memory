@@ -51,6 +51,22 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 
+    if args.dry_run {
+        println!(
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-delete-page-dry-run-would-delete",
+                &[
+                    ("value0", args.path.clone()),
+                    ("value1", workspace.to_string()),
+                    ("value2", project.to_string())
+                ]
+            )
+        );
+        return Ok(());
+    }
+
     let endpoint = ServerEndpoint::for_checkout(config).await?;
     let resp: DeletePageResponseBody = post_json(
         &endpoint,
@@ -90,7 +106,19 @@ mod tests {
             path: path.into(),
             workspace: None,
             project: project.map(str::to_string),
+            dry_run: false,
         }
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_prints_the_target_without_a_request() {
+        let config = Config::default();
+        let mut a = args("notes/example.md", Some("app"));
+        a.workspace = Some("default".into());
+        a.dry_run = true;
+        run(&config, a)
+            .await
+            .expect("a dry run succeeds without a server");
     }
 
     #[tokio::test]

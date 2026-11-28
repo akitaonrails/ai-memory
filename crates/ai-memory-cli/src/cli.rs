@@ -2475,6 +2475,9 @@ pub struct DeletePageArgs {
     /// (same heuristic write-page/read-page use).
     #[arg(long)]
     pub project: Option<String>,
+    /// Print the target and exit without deleting.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments for `reset`.
