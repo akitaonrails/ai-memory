@@ -16,7 +16,8 @@
 //! Built-in patterns cover bearer tokens, vendor-prefixed API keys
 //! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_/rk_live_…,
 //! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
-//! github_pat_…, Google AIza… and AQ.Ab… plus OAuth refresh tokens 1//…, Meta /
+//! github_pat_…, GitLab glpat-/gldt-/glrt-… tokens, npm npm_… and PyPI
+//! pypi-… tokens, Google AIza… and AQ.Ab… plus OAuth refresh tokens 1//…, Meta /
 //! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
 //! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
 //! keys, URL-embedded credentials (`postgres://user:pass@host`), and
@@ -481,7 +482,7 @@ const PRIVATE_KEY_TIER_END: usize = 2;
 /// Exclusive end index of Tier 2 (credential/token rules: `bearer_token`
 /// through `url_credentials`, stopping before `auth_header`) in
 /// [`BUILTIN_PATTERNS`].
-const CREDENTIAL_TIER_END: usize = 20;
+const CREDENTIAL_TIER_END: usize = 23;
 
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
@@ -532,6 +533,30 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
+    // GitLab's token prefixes, from
+    // <https://docs.gitlab.com/security/tokens/#token-prefixes>: `glpat-` for
+    // personal, project, group and impersonation tokens, then deploy
+    // (`gldt-`), runner (`glrt-`, `glrtr-`), CI/CD job (`glcbt-`), trigger
+    // (`glptt-`), feed (`glft-`), agent for Kubernetes (`glagent-`), workspace
+    // (`glwt-`), OAuth application secret (`gloas-`), SCIM (`glsoat-`) and
+    // feature flag client (`glffct-`) tokens. The incoming mail prefix
+    // `glimt-` is left out: `glimt` is also a Danish and Norwegian word, and a
+    // slug such as `bodo-glimt-…` would lose its text for good.
+    (
+        r"gl(?:pat|dt|rtr?|cbt|ptt|ft|agent|wt|oas|soat|ffct)-[0-9A-Za-z_\-]{20,}",
+        "gitlab_token",
+    ),
+    // Package registry tokens, which can publish a release. npm adopted
+    // GitHub's token format in 2021: `npm_` and base62 characters ending in a
+    // CRC32 checksum
+    // (<https://github.blog/changelog/2021-09-23-npm-has-a-new-access-token-format/>).
+    // PyPI prefixes `pypi-` to a base64url macaroon in format version 2 whose
+    // first field is its location, so every token starts `pypi-AgE`
+    // (`create_macaroon` in
+    // <https://github.com/pypi/warehouse/blob/main/warehouse/macaroons/services.py>).
+    // That anchor keeps hyphenated names such as `pypi-publish` intact.
+    (r"npm_[A-Za-z0-9]{36,}", "npm_token"),
+    (r"pypi-AgE[A-Za-z0-9_\-]{50,}", "pypi_token"),
     // ai-memory's own keys: native DB-user (`aim_`), web-session (`ams_`), and
     // external mcp-auth (`amk_`). Each is the prefix plus a 256-bit base64url
     // secret (43 characters); the 40-character floor keeps snake_case
