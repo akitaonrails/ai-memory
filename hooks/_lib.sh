@@ -289,6 +289,22 @@ ai_memory_after_key() {
 
 ai_memory_extract_cwd() {
     payload="${1:-$(cat)}"
+    # Cursor stamps `cursor_version` on every hook payload (including when
+    # running `~/.claude/settings.json` hooks). Its tool events send a
+    # per-command `cwd` alongside `workspace_roots`, so prefer
+    # `workspace_roots[0]` over `cwd` for Cursor payloads and fall back to
+    # `cwd` only when `workspace_roots` is missing or empty (#2546).
+    if ai_memory_payload_has_top_level_key "$payload" "cursor_version"; then
+        if rest=$(printf '%s' "$payload" | ai_memory_after_key workspace_roots); then
+            raw=$(printf '%s' "$rest" \
+                | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
+                | head -n 1)
+            if [ -n "$raw" ]; then
+                ai_memory_json_unescape_path "$raw"
+                return 0
+            fi
+        fi
+    fi
     if rest=$(printf '%s' "$payload" | ai_memory_after_key cwd); then
         raw=$(printf '%s' "$rest" \
             | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
@@ -299,9 +315,8 @@ ai_memory_extract_cwd() {
         fi
     fi
     # Antigravity CLI sends `workspacePaths`, Cursor `workspace_roots`.
-    # Cursor never sends a usable `cwd`: `sessionStart` / `sessionEnd` omit it
-    # and its tool events send `cwd: ""`, so an empty match above must fall
-    # through to here rather than returning the empty string.
+    # Older Cursor payloads omit `cwd` on `sessionStart` / `sessionEnd` and
+    # send `cwd: ""` on tool events, so an empty match above falls through.
     for key in workspacePaths workspace_roots; do
         rest=$(printf '%s' "$payload" | ai_memory_after_key "$key") || continue
         raw=$(printf '%s' "$rest" \

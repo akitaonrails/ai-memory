@@ -34,11 +34,11 @@ use crate::server_profiles::{self, ProfileName, Route as HookRoute};
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
-    hook_scope, inbox_notice_query_suffix, marker_capture_policy, marker_query_suffix,
-    marker_query_suffix_for_subagent_brief, marker_query_suffix_without_briefing,
-    marker_requests_briefing, marker_requests_inbox_notice, marker_requests_subagent_briefing,
-    resolve_cwd_with_fallbacks, url_encode,
+    HookScope, build_client, canonical_context, canonical_context_for_agent, capture_policy,
+    extract_cwd, get_handoff, hook_scope, inbox_notice_query_suffix, marker_capture_policy,
+    marker_query_suffix, marker_query_suffix_for_subagent_brief,
+    marker_query_suffix_without_briefing, marker_requests_briefing, marker_requests_inbox_notice,
+    marker_requests_subagent_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -696,7 +696,7 @@ fn resolve_hook_cwd_with(
     current_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<String> {
     let agent_kind = AgentKind::from_wire(agent);
-    let (canonical_cwd, _) = canonical_context(raw);
+    let (canonical_cwd, _) = canonical_context_for_agent(agent_kind, raw);
     if canonical_cwd.is_some() {
         canonical_cwd
     } else if agent_kind == AgentKind::Devin {

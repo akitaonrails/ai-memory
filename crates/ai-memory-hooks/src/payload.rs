@@ -686,6 +686,31 @@ pub struct HookPayloadContext {
 /// Extract the session and checkout exactly as [`HookEnvelope`] does.
 #[must_use]
 pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
+    hook_payload_context_with_cursor(agent_from_payload(raw) == Some(AgentKind::Cursor), raw)
+}
+
+/// Extract the session and checkout with knowledge of the declared harness.
+///
+/// Cursor tool events (`preToolUse`, `postToolUse`, `beforeShellExecution`)
+/// send a per-command top-level `cwd` alongside `workspace_roots`. When the
+/// payload is from Cursor — either declared via `agent == AgentKind::Cursor`
+/// or identified by a non-empty `cursor_version` marker — prefer
+/// `workspace_roots[0]` so every tool call stays anchored to the workspace
+/// root instead of spawning projects for transient directories (#2546).
+#[must_use]
+pub fn hook_payload_context_for_agent(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> HookPayloadContext {
+    let is_cursor =
+        agent == AgentKind::Cursor || agent_from_payload(raw) == Some(AgentKind::Cursor);
+    hook_payload_context_with_cursor(is_cursor, raw)
+}
+
+fn hook_payload_context_with_cursor(
+    prefer_cursor_workspace_roots: bool,
+    raw: &serde_json::Value,
+) -> HookPayloadContext {
     let session_id = extract_string(
         raw,
         &[
@@ -712,27 +737,32 @@ pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
             ],
         )
     });
-    let cwd = extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"])
-        .or_else(|| {
+    let cwd = if prefer_cursor_workspace_roots {
+        extract_first_string_array_item(raw, &["workspace_roots"])
+            .or_else(|| extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"]))
+            .or_else(|| extract_first_string_array_item(raw, &["workspacePaths", "workspaceRoots"]))
+    } else {
+        extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"]).or_else(|| {
             extract_first_string_array_item(
                 raw,
                 &["workspacePaths", "workspace_roots", "workspaceRoots"],
             )
         })
-        .or_else(|| {
-            extract_string_path(
-                raw,
-                &[
-                    &["path", "cwd"],
-                    &["info", "directory"],
-                    &["properties", "info", "directory"],
-                    &["event", "properties", "info", "directory"],
-                    &["payload", "path", "cwd"],
-                    &["payload", "info", "directory"],
-                    &["payload", "properties", "info", "directory"],
-                ],
-            )
-        });
+    }
+    .or_else(|| {
+        extract_string_path(
+            raw,
+            &[
+                &["path", "cwd"],
+                &["info", "directory"],
+                &["properties", "info", "directory"],
+                &["event", "properties", "info", "directory"],
+                &["payload", "path", "cwd"],
+                &["payload", "info", "directory"],
+                &["payload", "properties", "info", "directory"],
+            ],
+        )
+    });
     HookPayloadContext { session_id, cwd }
 }
 
@@ -749,7 +779,7 @@ impl HookEnvelope {
         // Gemini CLI appends `@`-referenced file contents to the user's words;
         // nothing below may read them as the prompt.
         crate::gemini::strip_gemini_prompt_expansion(agent, &mut raw);
-        let context = hook_payload_context(&raw);
+        let context = hook_payload_context_for_agent(agent, &raw);
         let session_id = context
             .session_id
             .or_else(|| query.session_id.filter(|s| !s.is_empty()));
@@ -2687,6 +2717,91 @@ mod tests {
         let env = HookEnvelope::from_query_and_body(q, raw);
 
         assert_eq!(env.cwd.as_deref(), Some("/checkouts/repo-a"));
+    }
+
+    /// Newer Cursor releases send a non-empty per-command `cwd` alongside
+    /// `workspace_roots` on tool events (`postToolUse`, `beforeShellExecution`).
+    /// Resolution must prefer `workspace_roots[0]` over `cwd` for both
+    /// `agent=cursor` and `agent=claude-code` + `cursor_version`, fall back
+    /// to `cwd` when `workspace_roots` is empty, and leave non-Cursor payloads
+    /// unchanged (#2546).
+    #[test]
+    fn envelope_prefers_cursor_workspace_roots_over_non_empty_tool_cwd() {
+        for (event, hook_event_name, declared_agent) in [
+            ("post-tool-use", "postToolUse", "cursor"),
+            ("pre-tool-use", "beforeShellExecution", "cursor"),
+            ("post-tool-use", "postToolUse", "claude-code"),
+            ("pre-tool-use", "beforeShellExecution", "claude-code"),
+        ] {
+            let raw = serde_json::json!({
+                "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+                "hook_event_name": hook_event_name,
+                "cursor_version": "2026.11.01",
+                "cwd": "/home/u/.config/foo",
+                "workspace_roots": ["/checkouts/repo-a"]
+            });
+            let ctx = hook_payload_context(&raw);
+            assert_eq!(ctx.cwd.as_deref(), Some("/checkouts/repo-a"));
+
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some(declared_agent.into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert_eq!(env.agent, AgentKind::Cursor);
+            assert_eq!(env.cwd.as_deref(), Some("/checkouts/repo-a"));
+        }
+
+        // Declared `agent=cursor` without `cursor_version` also prefers `workspace_roots`.
+        let env_declared_only = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cursor".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s-cursor",
+                "cwd": "/home/u/.config/foo",
+                "workspace_roots": ["/checkouts/repo-a"]
+            }),
+        );
+        assert_eq!(env_declared_only.cwd.as_deref(), Some("/checkouts/repo-a"));
+
+        // Empty `workspace_roots` falls back to `cwd`.
+        let env_empty_roots = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cursor".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s-cursor-fallback",
+                "hook_event_name": "postToolUse",
+                "cursor_version": "2026.11.01",
+                "cwd": "/home/u/.config/foo",
+                "workspace_roots": []
+            }),
+        );
+        assert_eq!(env_empty_roots.cwd.as_deref(), Some("/home/u/.config/foo"));
+
+        // Non-Cursor payloads keep `cwd` ahead of `workspace_roots`.
+        let env_non_cursor = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s-claude",
+                "cwd": "/home/u/.config/foo",
+                "workspace_roots": ["/checkouts/repo-a"]
+            }),
+        );
+        assert_eq!(env_non_cursor.agent, AgentKind::ClaudeCode);
+        assert_eq!(env_non_cursor.cwd.as_deref(), Some("/home/u/.config/foo"));
     }
 
     /// The Cursor CLI also runs the hook commands declared in Claude Code's
