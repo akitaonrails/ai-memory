@@ -20,56 +20,35 @@ version in [`docs/changelog/`](docs/changelog/):
   rules from leaving unredacted prefix or suffix fragments in stored
   observations and pages. (GHSA-m7mm-crc8-ffcq)
 
+### Changed
+
+- Documented LLMTR as an endpoint for the existing `openai-compat` provider. ([#2552](https://github.com/akitaonrails/ai-memory/pull/2552))
+
 ### Fixed
 
 - Preserved hook fallback IDs when the server discards a `finalize-session`
   event and reported the refusal. (#2519)
-
-### Fixed
-
 - Scrubbed the embedding and OAuth SSE provider error bodies before they
   could reach the health snapshot or the admin `llm-test` route. Those two
   paths built their own error body without the provider-error helper, so a
   credential-shaped string echoed by an upstream endpoint could have appeared
   in operator-visible output ([#2534](https://github.com/akitaonrails/ai-memory/pull/2534))
-
-### Fixed
-
 - Applied the readable-repository filter to `page_meta_by_id` and
   `page_meta_by_path`, so a page in a restricted project is not resolved for a
   viewer who cannot read that project. Also ordered the path lookup by
   workspace and project name so the result is deterministic ([#2536](https://github.com/akitaonrails/ai-memory/pull/2536))
-
-### Fixed
-
 - Hardened the user-mode systemd unit with the filesystem, kernel and
   privilege protections the system unit already had (`ProtectSystem=full`,
   `UMask=0077`, kernel/control-group restrictions). The unit still runs as the
   invoking user with a writable data directory ([#2537](https://github.com/akitaonrails/ai-memory/pull/2537))
-
-### Fixed
-
 - Preserved query signals when a project purge received a mismatched workspace and project ID (#2541).
-
-### Fixed
-
 - Named the workspace and project when pending writes were empty (#2542).
 - Included the source page in skipped relation warnings (#2542).
-
-### Changed
-
-- Documented LLMTR as an endpoint for the existing `openai-compat` provider.
-
-### Fixed
-
 - Preferred `workspace_roots[0]` over per-command `cwd` for Cursor hook
   payloads (identified by `cursor_version` or `agent=cursor`, including Cursor
   running `~/.claude/settings.json` hooks) across the server, native CLI,
   shell, and PowerShell extractors, falling back to `cwd` only when
   `workspace_roots` is missing or empty. (#2546)
-
-### Fixed
-
 - Armed the OpenCode V2 post-compaction anchor synchronously inside the
   `context` hook from the opening `<conversation-checkpoint>` user message
   instead of waiting for the async `session.compaction.ended` event, and
