@@ -26,6 +26,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -378,6 +379,7 @@ async fn rename_project_pages_still_searchable() {
     // the single-writer invariant is preserved. We need two states because
     // axum's `oneshot` consumes the router.
     let state2 = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
@@ -458,6 +460,7 @@ async fn rename_project_after_purge_returns_404_not_silent_200() {
 
     // Purge the row out from under any in-flight rename.
     let purge_state = AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: state.writer.clone(),

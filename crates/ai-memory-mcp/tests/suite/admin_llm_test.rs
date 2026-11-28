@@ -98,6 +98,7 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
         trusted_proxy_identity: false,
+        compact_jobs: Default::default(),
     }
 }
 

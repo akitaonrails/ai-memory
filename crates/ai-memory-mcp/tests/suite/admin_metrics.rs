@@ -138,6 +138,7 @@ async fn harness_with(index_file_paths: bool) -> Harness {
         active_project,
         scope_invalidator: None,
         trusted_proxy_identity: false,
+        compact_jobs: Default::default(),
     });
 
     let auth_state = Arc::new(AuthState::new(Some(ROOT.to_string())).with_multiuser(

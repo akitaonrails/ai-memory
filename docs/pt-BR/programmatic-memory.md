@@ -180,6 +180,14 @@ qualquer chamador que a autenticação do servidor permita.
 | Expurgar um projeto inteiro | `POST /admin/purge-project` com `{workspace, project, confirm}` | Irreversível. `dry_run`, `compact` e `force` opcionais (expurga apesar de um lease ativo de workstream gerenciado). |
 | Ler versões substituídas | MCP `memory_query` com `include_superseded=true` | Versões mais antigas são rotuladas como `superseded: true`. Uma exclusão as remove juntamente com a versão atual. |
 
+`POST /admin/compact` com `{"confirm": true}` reconstrói os índices FTS e executa o
+`VACUUM`, respondendo 200 com as contagens de bytes. Com `"background": true` responde
+202 com um job `running` em vez de esperar o `VACUUM`; `GET /admin/compact` informa o
+job atual ou o último (`idle`, `running`, `succeeded`, `failed`) a partir da memória do
+processo. As duas formas de POST compartilham um slot e respondem 409 com o job em
+curso enquanto uma compactação está em andamento. Veja
+[deploy.md](deploy.md#recuperando-espaço-em-disco) para o caso de timeout do proxy.
+
 Ambas as rotas de expurgo recusam com 400 a menos que `confirm` seja `true`, e `dry_run`
 prevalece sobre `confirm`: um corpo com ambos definidos apenas pré-visualiza as contagens. `confirm`
 é um campo obrigatório, portanto uma pré-visualização o envia como `false`. Quando a exclusividade de root se aplicar,

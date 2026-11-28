@@ -184,6 +184,14 @@ any caller the server's auth lets in.
 | Purge a whole project | `POST /admin/purge-project` with `{workspace, project, confirm}` | Irreversible. Optional `dry_run`, `compact`, and `force` (purge despite a live managed-workstream lease). |
 | Read superseded versions | MCP `memory_query` with `include_superseded=true` | Older versions are labelled `superseded: true`. A delete removes them along with the current version. |
 
+`POST /admin/compact` with `{"confirm": true}` rebuilds the FTS indexes and
+`VACUUM`s, replying 200 with the byte counts. Add `"background": true` to get
+202 with a running job instead of waiting for the `VACUUM`; `GET
+/admin/compact` then reports the current or last job (`idle`, `running`,
+`succeeded`, `failed`) from process memory. The two POST forms share one slot
+and answer 409 with the running job while a compaction is in progress. See
+[deploy.md](deploy.md#reclaiming-disk-space) for the proxy-timeout case.
+
 Both purge routes refuse with 400 unless `confirm` is `true`, and `dry_run`
 wins over `confirm`: a body with both set only previews the counts. `confirm`
 is a required field, so a preview sends it as `false`. Once root-only applies,

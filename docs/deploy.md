@@ -365,6 +365,22 @@ ssh "$SERVER" "docker exec ai-memory /usr/local/bin/ai-memory compact --confirm"
 
 Compaction deletes nothing. It rebuilds the FTS indexes and `VACUUM`s.
 
+On a large store the `VACUUM` can outlast a reverse proxy's timeout (Cloudflare
+returns `524` after 120 s while the server keeps compacting). Start it in the
+background and follow it instead, with the root bearer token from
+[bearer-token auth](#security---bearer-token-auth--encrypted-transport):
+
+```bash
+curl -X POST http://homelab:49374/admin/compact \
+     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+     -d '{"confirm": true, "background": true}'          # → 202, state: running
+curl http://homelab:49374/admin/compact \
+     -H "Authorization: Bearer $TOKEN"                   # state: running | succeeded | failed
+```
+
+The status lives in the server's memory: a restart reports `idle` again. The
+routes are root-only once the server has users, like every `/admin/*` route.
+
 ### Do not schedule an unconditional nightly VACUUM
 
 Avoid a nightly cron entry for it:

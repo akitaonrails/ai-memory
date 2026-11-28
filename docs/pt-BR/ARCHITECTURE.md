@@ -980,6 +980,20 @@ pode aparecer em uma série, e escopo nunca é um rótulo. A rota fica protegida
 portão `require_root_for_multiuser_admin` que toda rota `/admin/*`: exclusiva de root assim que
 a implantação distingue operadores. Os contadores são zerados na reinicialização.
 
+### `POST /admin/compact` e `GET /admin/compact`
+
+A forma síncrona (`{"confirm": true}`) espera a reconstrução do FTS e o
+`VACUUM` e responde 200 com `CompactReport`. A forma em background acrescenta
+`"background": true`, responde 202 com um `CompactJobStatus` em `running` e
+roda a compactação do writer numa task própria; `GET /admin/compact` lê o
+último job de um slot `CompactJobs` em memória (veja
+`ai-memory-mcp/src/compact_job.rs`), então responde mesmo com o writer preso
+nesse `VACUUM`. Os estados são `idle`, `running`, `succeeded` e `failed`; o
+slot guarda a duração do último sucesso para o próximo job. As duas formas de
+POST disputam o mesmo slot single-flight: um chamador concorrente recebe 409
+com o status do job em curso. Um reinício do processo esquece o slot, e as
+duas rotas ficam atrás do mesmo portão de admin exclusivo de root.
+
 ### Telemetria de cargas de trabalho de LLM
 
 O snapshot de `GET /admin/status` protegido por root inclui um array limitado
