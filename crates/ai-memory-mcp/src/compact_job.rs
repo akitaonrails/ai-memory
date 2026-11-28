@@ -131,6 +131,14 @@ impl CompactJobs {
         }
     }
 
+    /// Snapshot of the currently running job, if any. Used as an in-memory
+    /// fast-path before touching SQLite so conflicting requests do not wait on
+    /// `busy_timeout` while a `VACUUM` holds the database lock.
+    pub(crate) fn running_status(&self) -> Option<CompactJobStatus> {
+        let slot = self.lock();
+        slot.is_running().then(|| slot.snapshot())
+    }
+
     /// Current status for `GET /admin/compact`.
     pub(crate) fn status(&self) -> CompactJobStatus {
         self.lock().snapshot()

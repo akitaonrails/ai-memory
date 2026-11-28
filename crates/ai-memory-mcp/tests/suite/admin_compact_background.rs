@@ -186,6 +186,7 @@ async fn a_second_request_while_a_compaction_runs_is_409_in_either_form() {
     assert_eq!(code, StatusCode::ACCEPTED);
     let job_id = started["job_id"].clone();
 
+    let conflict_start = std::time::Instant::now();
     let (code, conflict) = send(
         &router,
         "POST",
@@ -202,6 +203,10 @@ async fn a_second_request_while_a_compaction_runs_is_409_in_either_form() {
     let (code, conflict) = start_background(&router).await;
     assert_eq!(code, StatusCode::CONFLICT, "background form: {conflict}");
     assert_eq!(conflict["job"]["job_id"], job_id);
+    assert!(
+        conflict_start.elapsed() < Duration::from_secs(1),
+        "conflicting POSTs must fail fast from memory instead of waiting on SQLite busy_timeout"
+    );
 
     // The refused requests did not disturb the job they collided with.
     let still = status(&router).await;
@@ -263,44 +268,48 @@ async fn status_answers_while_the_writer_is_held() {
     wait_for_state(&router, "succeeded").await;
 }
 
-/// Test 4 of the contract, through the writer's own busy timeout. The first
-/// run succeeds so there is a previous duration to keep; the second is held
-/// past the timeout and must end `failed` with the error and no report, while
-/// the previous duration is kept.
-#[tokio::test]
-async fn a_failed_compaction_ends_failed_and_keeps_the_last_success() {
-    let tmp = TempDir::new().unwrap();
-    let (state, store) = make_state(&tmp).await;
-    let router = admin_router(state);
+mod slow {
+    use super::*;
 
-    let (code, _) = send(
-        &router,
-        "POST",
-        "/admin/compact",
-        Some(json!({ "confirm": true })),
-        None,
-    )
-    .await;
-    assert_eq!(code, StatusCode::OK);
-    let first = status(&router).await;
-    assert_eq!(first["state"], "succeeded");
-    let first_ms = first["elapsed_ms"].clone();
+    /// Test 4 of the contract, through the writer's own busy timeout. The first
+    /// run succeeds so there is a previous duration to keep; the second is held
+    /// past the timeout and must end `failed` with the error and no report, while
+    /// the previous duration is kept.
+    #[tokio::test]
+    async fn a_failed_compaction_ends_failed_and_keeps_the_last_success() {
+        let tmp = TempDir::new().unwrap();
+        let (state, store) = make_state(&tmp).await;
+        let router = admin_router(state);
 
-    let lock = WriteLockHeld::take(store.db_path());
-    let (code, _) = start_background(&router).await;
-    assert_eq!(code, StatusCode::ACCEPTED);
+        let (code, _) = send(
+            &router,
+            "POST",
+            "/admin/compact",
+            Some(json!({ "confirm": true })),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let first = status(&router).await;
+        assert_eq!(first["state"], "succeeded");
+        let first_ms = first["elapsed_ms"].clone();
 
-    let failed = wait_for_state(&router, "failed").await;
-    drop(lock);
+        let lock = WriteLockHeld::take(store.db_path());
+        let (code, _) = start_background(&router).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
 
-    let error = failed["error"].as_str().expect("error is set");
-    assert!(
-        error.contains("locked"),
-        "the failure should be the writer's busy timeout, got: {error}"
-    );
-    assert!(failed["report"].is_null());
-    assert!(failed["finished_at"].is_string());
-    assert_eq!(failed["previous_duration_ms"], first_ms);
+        let failed = wait_for_state(&router, "failed").await;
+        drop(lock);
+
+        let error = failed["error"].as_str().expect("error is set");
+        assert!(
+            error.contains("locked"),
+            "the failure should be the writer's busy timeout, got: {error}"
+        );
+        assert!(failed["report"].is_null());
+        assert!(failed["finished_at"].is_string());
+        assert_eq!(failed["previous_duration_ms"], first_ms);
+    }
 }
 
 /// The estimate survives a newer job that has not finished yet.

@@ -5816,6 +5816,9 @@ async fn handle_compact(
         )
             .into_response();
     }
+    if let Some(job) = state.compact_jobs.running_status() {
+        return compact_conflict_response(job);
+    }
     // Read before claiming the slot, so the claim itself never awaits: a client
     // that disconnects here leaves nothing marked running.
     let (database_bytes, reclaimable_bytes) = match state.reader.storage_status().await {
@@ -5833,16 +5836,7 @@ async fn handle_compact(
         .try_start(database_bytes, reclaimable_bytes)
     {
         Ok(claimed) => claimed,
-        Err(job) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "a compaction is already running",
-                    "job": job,
-                })),
-            )
-                .into_response();
-        }
+        Err(job) => return compact_conflict_response(*job),
     };
     let outcome = spawn_compaction(&state, job_id);
     if req.background {
@@ -5906,6 +5900,17 @@ fn spawn_compaction_job(
         let _ = tx.send(outcome);
     });
     rx
+}
+
+fn compact_conflict_response(job: CompactJobStatus) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "a compaction is already running",
+            "job": job,
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /admin/compact` — status of the latest compaction job. Never touches
@@ -15891,6 +15896,7 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/compact", serde_json::Value::Null),
             ("POST", "/admin/llm-test", serde_json::Value::Null),
             ("GET", "/admin/metrics", serde_json::Value::Null),
             (
