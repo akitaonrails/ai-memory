@@ -54,3 +54,5 @@ f269b640037ad48de6b90feb7d1088e64f9e4cb6:crates/ai-memory-core/src/sanitize.rs:s
 # release/3.5 allowlists it in .gitleaks.toml, but the scheduled full-history
 # scan runs main's config over every branch, so main needs the fingerprint.
 abc9dc843abb60129d41bf639e401c6cbf9cb6bf:crates/ai-memory-llm/tests/support/vertex_test_service_account_key.pem:private-key:1
+# `bodo-glimt-…` URL slug in the #2556 sanitizer control test: gitleaks' gitlab-incoming-mail-token rule reads the word `glimt` as a token prefix, which is why the sanitizer leaves that prefix out. Contains no credential material.
+1ef59166b20d019d4c0e7e515ace9aa00e931f79:crates/ai-memory-core/src/sanitize.rs:gitlab-incoming-mail-token:1489

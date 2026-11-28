@@ -11,6 +11,21 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the secret scrubber letting GitLab, npm and PyPI tokens reach storage
+  verbatim. Such a token was redacted only beside a name another rule
+  recognizes (`GITLAB_TOKEN=`, a `Private-Token:` header, `_authToken=`,
+  `password =`), so one passed on a command line (`glab auth login --token`,
+  `uv publish --token`, `poetry config pypi-token.pypi`, `npm token revoke`),
+  pasted into a prompt or written after a short `token:` key was stored
+  intact. GitLab's documented token prefixes (`glpat-`, `gldt-`, `glrt-`,
+  `glcbt-` and the rest, except `glimt-`), npm `npm_` tokens and PyPI
+  `pypi-AgE…` tokens are now redacted as `gitlab_token`, `npm_token` and
+  `pypi_token`. A `Private-Token:` header, an `_authToken=` line or a
+  `password =` line holding one now keeps its key, and only the value is
+  redacted. (#2556)
+
 ## [3.6.5] - 2026-11-28
 
 ### Security
