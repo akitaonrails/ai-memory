@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.6.5] - 2026-11-28
+
 ### Security
 
 - Merged overlapping credential-tier redaction spans before rewriting in both
@@ -6592,7 +6594,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.4...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.5...HEAD
+[3.6.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.5
 [3.6.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.4
 [3.6.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.3
 [3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
