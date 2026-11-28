@@ -244,6 +244,7 @@ cli-help-root-restore-from-help = { "Arquivo tar de origem" }
 cli-help-root-restore-force-help = { "Sobrescrever um diretório de dados existente não vazio" }
 cli-help-root-restore-with-config-help = { "Substituir o `config.toml` atual pelo do backup. Sem esta opção, a configuração existente é mantida e a cópia do backup é salva ao lado como `config.toml.from-backup` para revisão: configurações podem executar comandos e redirecionar dados; adote somente backups confiáveis" }
 cli-help-root-restore-accept-legacy-api-key-pepper-help = { "Confirmar que o token pepper configurado é o original de um backup anterior ao verificador que já contém chaves de API nativas" }
+cli-help-root-restore-pre-migration-package-help = { "Restaurar a partir de um pacote de pré-migração da inicialização, extraindo `wiki/`, `db/memory.sqlite`, `db/memory.sqlite-wal` e `config.toml` enquanto ignora entradas que não são de dados do arquivo completo do diretório de dados" }
 cli-help-root-restore-agents-about = { "Restaurar configurações, skills e plugins de agentes de IA a partir de um arquivo" }
 cli-help-root-restore-agents-from-help = { "Arquivo de origem (`.tar.gz`)" }
 cli-help-root-restore-agents-agents-help = { "Lista opcional de agentes a restaurar, separados por vírgula. Padrão: todos os presentes no arquivo" }

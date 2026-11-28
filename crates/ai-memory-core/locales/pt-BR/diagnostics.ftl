@@ -1077,3 +1077,4 @@ diag-pi-tool-overrides-invalid-param-description = a descrição em pi_tool_over
 diag-pi-tool-overrides-missing-required-param = pi_tool_overrides para `{ $tool }` omite o parâmetro obrigatório `{ $param }`
 
 diag-decay-token-call-tool-retention-days-must-be-greater = decay.token_call_tool_retention_days precisa ser maior ou igual a zero (0 desativa a remoção de ferramentas das chamadas de tokens)
+diag-restore-skipped-pre-migration-non-data = ai-memory: { $value0 } entrada(s) que não são de dados do pacote de pré-migração foram ignoradas

@@ -138,8 +138,12 @@ A ordem é fixa; cada etapa condiciona a seguinte:
    além de "tudo parece correto → exclua o arquivo" e "algo
    está faltando → passos de restauração" (com link para `MIGRATION-2.0.md`).
 
-Reversão (rollback): restaure o arquivo de backup (direto, sem necessidade de conhecimento de git), ou o
-checkpoint git pré-migração + `reindex` (cirúrgico).
+Reversão (rollback): pare o servidor e execute `ai-memory restore --from
+<archive> --pre-migration-package --force` (direto, sem necessidade de
+conhecimento de git; extrai `wiki/`, `db/memory.sqlite`,
+`db/memory.sqlite-wal` e `config.toml` enquanto ignora entradas que não são de
+dados do snapshot completo do diretório de dados), ou restaure o checkpoint git
+pré-migração + `reindex` (cirúrgico).
 
 ### Reparos em bases já migradas
 

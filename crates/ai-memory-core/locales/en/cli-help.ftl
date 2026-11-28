@@ -244,6 +244,7 @@ cli-help-root-restore-from-help = { "Source tarball" }
 cli-help-root-restore-force-help = { "Overwrite an existing non-empty data dir" }
 cli-help-root-restore-with-config-help = { "Replace the live `config.toml` with the backup's. Without it an existing config is kept and the backup's is saved beside it as `config.toml.from-backup` for review: a config can run commands and redirect data, so adopt one only from a backup you trust" }
 cli-help-root-restore-accept-legacy-api-key-pepper-help = { "Confirm that the configured token pepper is the original one for a pre-verifier backup that already contains native API keys" }
+cli-help-root-restore-pre-migration-package-help = { "Restore from a boot-time pre-migration package, extracting `wiki/`, `db/memory.sqlite`, `db/memory.sqlite-wal`, and `config.toml` while skipping non-data entries from the full data-dir archive" }
 cli-help-root-restore-agents-about = { "Restore AI agent configurations, skills, and plugins from an archive" }
 cli-help-root-restore-agents-from-help = { "Source archive (`.tar.gz`)" }
 cli-help-root-restore-agents-agents-help = { "Optional comma-separated list of agents to restore. Defaults to all present in archive" }

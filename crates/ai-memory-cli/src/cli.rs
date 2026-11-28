@@ -2534,6 +2534,11 @@ pub struct RestoreArgs {
     /// pre-verifier backup that already contains native API keys.
     #[arg(long)]
     pub accept_legacy_api_key_pepper: bool,
+    /// Restore from a boot-time pre-migration package, extracting `wiki/`,
+    /// `db/memory.sqlite`, `db/memory.sqlite-wal`, and `config.toml` while
+    /// skipping non-data entries from the full data-dir archive.
+    #[arg(long)]
+    pub pre_migration_package: bool,
 }
 
 /// Arguments for `restore-agents`.
