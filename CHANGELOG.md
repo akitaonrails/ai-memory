@@ -132,6 +132,13 @@ version in [`docs/changelog/`](docs/changelog/):
   outlasts a proxy timeout is followed instead of cut off with `524`. Both forms
   share one single-flight slot and answer `409` while a compaction runs (#2547).
 
+- Added `ai-memory healthcheck` with `--timeout-ms` and
+  `AI_MEMORY_HEALTHCHECK_TIMEOUT_MS`, plus explicit remote probing via `--url`.
+  The default local probe is bounded, ignores client URL and proxy settings, and
+  skips authentication resolution; the Dockerfile uses it while Compose
+  templates inherit the selected image's healthcheck. It runs on the
+  current-thread runtime and avoids database-backed status diagnostics. (#NNN)
+
 ### Fixed
 
 - Completed the English and Brazilian Portuguese help and installer

@@ -2700,7 +2700,10 @@ fn derive_server_url_from_bind(config: &mut Config, explicit_server_url: bool) {
 /// server may bind `memory.lan:9000`, and resolving it here would both change
 /// which address the client dials and fail outright on a host this process
 /// cannot resolve but the server can.
-fn server_url_for_bind(bind: &str) -> Option<String> {
+///
+/// `healthcheck` reuses this mapping for its local probe target, so the two
+/// cannot disagree about which host a `bind` value names.
+pub(crate) fn server_url_for_bind(bind: &str) -> Option<String> {
     let bind = bind.trim();
     // Split on the LAST colon so an IPv6 literal in brackets, which contains
     // colons of its own, keeps its host in one piece.

@@ -165,6 +165,21 @@ impl ServerEndpoint {
     ///    container as `serve`, which already reads the same env var via
     ///    clap to nest its router).
     pub async fn from_config_resolving_auth(config: &Config) -> Self {
+        Self::resolving_auth(
+            config,
+            config.server_url.clone(),
+            config.server_url_configured(),
+        )
+        .await
+    }
+
+    /// Build an explicitly selected remote endpoint, resolving its bearer and
+    /// the same base-path fallback as the configured client target.
+    pub(crate) async fn from_url_resolving_auth(config: &Config, url: String) -> Self {
+        Self::resolving_auth(config, url, true).await
+    }
+
+    async fn resolving_auth(config: &Config, url: String, url_configured: bool) -> Self {
         let client = http_client();
         let token = crate::auth_bearer::resolve_bearer(
             &client,
@@ -173,9 +188,9 @@ impl ServerEndpoint {
         )
         .await;
         let mut endpoint = Self::build(
-            Some(config.server_url.clone()),
+            Some(url),
             token,
-            config.server_url_configured(),
+            url_configured,
             Some(config.base_path.clone()).filter(|s| !s.is_empty()),
         );
         endpoint.i18n = config.i18n.clone();

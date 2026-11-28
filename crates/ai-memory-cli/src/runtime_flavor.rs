@@ -22,18 +22,18 @@ pub enum RuntimeFlavor {
 }
 
 /// Global options that take a value and may precede the subcommand.
-const VALUE_GLOBAL_FLAGS: [&str; 2] = ["--data-dir", "--config"];
+const VALUE_GLOBAL_FLAGS: [&str; 3] = ["--data-dir", "--config", "--language"];
 
 impl RuntimeFlavor {
     /// The flavor for `command`, the subcommand name as clap spells it.
     ///
-    /// Only `hook` and `hook-drain` are single-threaded. Both are spawned on
-    /// an agent's hot path and answer one request, or drain one spool, before
-    /// exiting.
+    /// Only `hook`, `hook-drain` and `healthcheck` are single-threaded. They
+    /// are spawned on an agent's hot path or by a container healthcheck and
+    /// answer one request, or drain one spool, before exiting.
     #[must_use]
     pub fn for_command(command: Option<&str>) -> Self {
         match command {
-            Some("hook") | Some("hook-drain") => Self::CurrentThread,
+            Some("hook") | Some("hook-drain") | Some("healthcheck") => Self::CurrentThread,
             _ => Self::MultiThread,
         }
     }
@@ -84,13 +84,17 @@ mod tests {
     }
 
     #[test]
-    fn hook_commands_run_on_one_thread() {
+    fn hook_and_healthcheck_commands_run_on_one_thread() {
         assert_eq!(
             RuntimeFlavor::for_command(Some("hook")),
             RuntimeFlavor::CurrentThread
         );
         assert_eq!(
             RuntimeFlavor::for_command(Some("hook-drain")),
+            RuntimeFlavor::CurrentThread
+        );
+        assert_eq!(
+            RuntimeFlavor::for_command(Some("healthcheck")),
             RuntimeFlavor::CurrentThread
         );
     }
@@ -122,6 +126,10 @@ mod tests {
             RuntimeFlavor::CurrentThread
         );
         assert_eq!(
+            RuntimeFlavor::for_argv(&argv(&["healthcheck"])),
+            RuntimeFlavor::CurrentThread
+        );
+        assert_eq!(
             RuntimeFlavor::for_argv(&argv(&["--data-dir", "hook", "hook", "claude-code"])),
             RuntimeFlavor::CurrentThread,
             "a data dir named like the subcommand is a value, not the command"
@@ -139,6 +147,16 @@ mod tests {
             RuntimeFlavor::for_argv(&argv(&["--config", "/tmp/c.toml", "serve"])),
             RuntimeFlavor::MultiThread
         );
+        for args in [
+            &["--language", "pt-BR", "healthcheck"][..],
+            &["--language=pt-BR", "healthcheck"][..],
+        ] {
+            assert_eq!(
+                RuntimeFlavor::for_argv(&argv(args)),
+                RuntimeFlavor::CurrentThread,
+                "{args:?}"
+            );
+        }
         assert_eq!(
             RuntimeFlavor::for_argv(&argv(&[])),
             RuntimeFlavor::MultiThread,

@@ -160,6 +160,8 @@ pub enum Command {
     Setup(SetupArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// Probe the server's lightweight liveness endpoint for container checks.
+    Healthcheck(HealthcheckArgs),
     /// List every workspace/project pair the server knows about (plain,
     /// scriptable output — the read-only equivalent of hitting
     /// `GET /api/v1/projects` directly, falling back to `GET /admin/projects`
@@ -2248,6 +2250,21 @@ pub struct StatusArgs {
     /// Emit the report as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `healthcheck`.
+#[derive(Debug, Args)]
+pub struct HealthcheckArgs {
+    /// Probe this explicit remote base URL instead of the local bind address.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Maximum time to wait for `GET /healthz`, in milliseconds.
+    #[arg(
+        long,
+        env = "AI_MEMORY_HEALTHCHECK_TIMEOUT_MS",
+        default_value_t = 3_000
+    )]
+    pub timeout_ms: u64,
 }
 
 /// Arguments for `list-projects`.

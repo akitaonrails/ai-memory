@@ -31,12 +31,6 @@ services:
       - .env.production
     environment:
       - RUST_LOG=ai_memory=info,ai_memory_store=info,ai_memory_wiki=info,ai_memory_mcp=info,tracing_appender=warn
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/ai-memory", "status"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
 
   caddy:
     image: caddy:2-alpine

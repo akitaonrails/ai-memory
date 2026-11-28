@@ -101,11 +101,30 @@ services:
       AI_MEMORY_ALLOWED_HOSTS: "truenas.local,192.0.2.10,localhost,127.0.0.1"
 ```
 
-The image's healthcheck runs `ai-memory status`, so the app shows as healthy
-once the server answers. Point clients at `http://<nas>:49374` with the same
-token, as described below for any LAN server. Backups of the dataset follow
-[Backups](#backups): take `ai-memory backup` snapshots, not a copy of a live
-SQLite file.
+The image's healthcheck runs `ai-memory healthcheck --timeout-ms 3000`. By
+default it takes the host and port from `AI_MEMORY_BIND` and the normalized
+base path from `AI_MEMORY_BASE_PATH`, then requests
+`http://<host>:<port><base-path>/healthz`. Wildcard binds map to loopback
+(`0.0.0.0` to `127.0.0.1`, `[::]` to `[::1]`); an IP literal or `localhost`
+keeps its host, so `bind = "[::1]:49374"` is probed on `::1`. Any other host
+name is rejected before resolution with an explicit error. `localhost` may use
+the system resolver. Use `--url <base-url>` for an explicit probe of a hostname
+binding, or set `bind` to an IP literal or a wildcard address.
+It ignores `AI_MEMORY_SERVER_URL` and environment proxies, does not resolve or
+send authentication, and does not create log files. If `serve` receives a
+command-line-only `--bind` or `--base-path` override, set the corresponding
+environment variable too so the separate probe process sees the same target.
+The timeout starts after configuration loading and covers the local request.
+
+For an explicitly remote probe, run `ai-memory healthcheck --url <base-url>`.
+Only this mode uses configured bearer/OIDC authentication and normal client
+proxy settings; the timeout also covers that authentication step. Both modes
+accept only 2xx and never follow redirects. All four Compose templates inherit
+the selected image's `HEALTHCHECK` instead of overriding it, so an older pinned
+image keeps its own working probe. Point clients at `http://<nas>:49374` with
+the same token, as described below for any LAN server. Backups of the dataset
+follow [Backups](#backups): take `ai-memory backup` snapshots, not a copy of a
+live SQLite file.
 
 ## Security - bearer-token auth + encrypted transport
 
@@ -462,9 +481,10 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   container isn't up, or the port mapping is bound to `127.0.0.1`
   instead of `0.0.0.0`. Check `docker ps` on the homelab.
 - **`unhealthy`** status: the container is running but its embedded
-  `ai-memory status` healthcheck is failing. Most likely the data
-  dir's permissions don't match the container's user (uid 1000). Fix
-  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host. A slower-onset
+  `ai-memory healthcheck` probe is failing. Most likely the server is not
+  accepting HTTP connections or the data dir's permissions don't match the
+  container's user (uid 1000). Fix the data-dir permissions with
+  `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host. A slower-onset
   cause (days, not minutes) is fd exhaustion from dead-peer connections
   (laptop sleep, a VPN flap) accumulating without TCP keepalive; `serve`
   enables it by default (`tcp_keepalive_secs = 60`, `AI_MEMORY_TCP_KEEPALIVE_SECS`
