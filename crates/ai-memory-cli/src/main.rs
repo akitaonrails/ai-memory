@@ -46,12 +46,19 @@ fn run() -> Result<()> {
     // short request, and the multi-thread builder would spawn a worker per CPU
     // to run it (#1669).
     let argv: Vec<String> = std::env::args().collect();
+    // These process-level scheduler bounds are read once here, before
+    // `Config::load()` in `ai_memory_cli::run()`. They are not ai-memory
+    // settings: the one config-read path is unchanged, and unset or rejected
+    // values retain Tokio's native worker and blocking-pool resolution.
+    let bounds = ai_memory_cli::runtime_bounds::RuntimeBounds::from_process();
     let mut builder = match ai_memory_cli::runtime_flavor::RuntimeFlavor::for_argv(&argv) {
         ai_memory_cli::runtime_flavor::RuntimeFlavor::CurrentThread => {
             tokio::runtime::Builder::new_current_thread()
         }
         ai_memory_cli::runtime_flavor::RuntimeFlavor::MultiThread => {
-            tokio::runtime::Builder::new_multi_thread()
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            bounds.apply_to(&mut builder);
+            builder
         }
     };
     let runtime = builder.enable_all().build()?;
