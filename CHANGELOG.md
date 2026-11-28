@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped the profile harvester from stalling under `[profile] harvest_prompts
+  = "interactive"` when one batch of prompts came only from automation
+  sessions. The batch window is now counted over the prompts the filter keeps,
+  so the harvest mark moves on and later interactive prompts are read. (#2560)
+
 ## [3.6.5] - 2026-11-28
 
 ### Security
