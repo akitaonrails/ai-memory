@@ -473,3 +473,78 @@ async fn existing_projects_are_open_after_upgrade() {
     );
     assert!(bad.is_err(), "an unknown mode must not be storable");
 }
+/// `page_meta_by_id` / `page_meta_by_path` resolve a hit's scope only for a
+/// viewer allowed to read that repository. Search already filters its hits,
+/// but these helpers are reachable on their own and must fail closed too.
+#[tokio::test]
+async fn page_meta_lookups_apply_the_access_filter() {
+    let f = fixture().await;
+    f.store
+        .writer
+        .set_access_mode(f.project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let id = f
+        .store
+        .writer
+        .upsert_page(page(
+            f.ws,
+            f.project,
+            "decisions/shared.md",
+            "zebracrossing decision",
+            Some(f.writer),
+        ))
+        .await
+        .unwrap();
+
+    // A granted teammate and root resolve it.
+    assert!(
+        f.store
+            .reader
+            .page_meta_by_id(id, Some(f.reader))
+            .await
+            .unwrap()
+            .is_some(),
+        "a granted teammate resolves the page"
+    );
+    assert!(
+        f.store
+            .reader
+            .page_meta_by_id(id, None)
+            .await
+            .unwrap()
+            .is_some(),
+        "root resolves the page"
+    );
+
+    // The outsider gets nothing, by id or by path.
+    assert!(
+        f.store
+            .reader
+            .page_meta_by_id(id, Some(f.outsider))
+            .await
+            .unwrap()
+            .is_none(),
+        "an outsider must not resolve a restricted page by id"
+    );
+    assert!(
+        f.store
+            .reader
+            .page_meta_by_path("decisions/shared.md", Some(f.outsider))
+            .await
+            .unwrap()
+            .is_none(),
+        "an outsider must not resolve a restricted page by path"
+    );
+
+    // The teammate resolves it by path too.
+    assert!(
+        f.store
+            .reader
+            .page_meta_by_path("decisions/shared.md", Some(f.reader))
+            .await
+            .unwrap()
+            .is_some(),
+        "a granted teammate resolves the page by path"
+    );
+}

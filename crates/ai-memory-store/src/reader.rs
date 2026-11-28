@@ -11566,12 +11566,20 @@ impl ReaderPool {
 
     /// Look up a page's workspace and project names by page id.
     ///
+    /// `viewer` drops a page in a repository that user may not read, like
+    /// [`Self::search_pages`]; `None` resolves any workspace.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn page_meta_by_id(&self, page_id: PageId) -> StoreResult<Option<PageMeta>> {
+    pub async fn page_meta_by_id(
+        &self,
+        page_id: PageId,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Option<PageMeta>> {
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
             let created_expr = PAGE_FIRST_CREATED_EXPR;
+            let (visible, visible_params) = readable_repository_filter("pg.project_id", viewer, 2);
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
@@ -11583,10 +11591,12 @@ impl ReaderPool {
                  JOIN workspaces w ON w.id = pg.workspace_id \
                  LEFT JOIN pages sp ON sp.id = pg.supersedes \
                  LEFT JOIN users au ON au.id = pg.author_id \
-                 WHERE pg.id = ?1 AND pg.is_latest = 1"
+                 WHERE pg.id = ?1 AND pg.is_latest = 1{visible}"
             );
+            let mut bound: Vec<Value> = vec![Value::Blob(page_id.as_bytes().to_vec())];
+            bound.extend(visible_params);
             let row_opt = conn
-                .query_row(&sql, params![page_id.as_bytes()], page_meta_from_row)
+                .query_row(&sql, params_from_iter(bound.iter()), page_meta_from_row)
                 .optional()?;
             row_opt.transpose()
         })
@@ -11594,18 +11604,26 @@ impl ReaderPool {
     }
 
     /// Look up a page's workspace and project names by its path (across all
-    /// workspaces and projects). Returns the first `is_latest = 1` match.
+    /// workspaces and projects). Returns the first `is_latest = 1` match,
+    /// ordered by workspace then project name so the result is deterministic.
     ///
     /// Used by the web search handler to resolve workspace/project for a hit
-    /// without a per-hit SQL join.
+    /// without a per-hit SQL join. `viewer` drops a page in a repository that
+    /// user may not read, like [`Self::search_pages`]; `None` resolves any
+    /// workspace.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn page_meta_by_path(&self, path: &str) -> StoreResult<Option<PageMeta>> {
+    pub async fn page_meta_by_path(
+        &self,
+        path: &str,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Option<PageMeta>> {
         let path = path.to_owned();
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
             let created_expr = PAGE_FIRST_CREATED_EXPR;
+            let (visible, visible_params) = readable_repository_filter("pg.project_id", viewer, 2);
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
@@ -11617,11 +11635,14 @@ impl ReaderPool {
                  JOIN workspaces w ON w.id = pg.workspace_id \
                  LEFT JOIN pages sp ON sp.id = pg.supersedes \
                  LEFT JOIN users au ON au.id = pg.author_id \
-                 WHERE pg.path = ?1 AND pg.is_latest = 1 \
+                 WHERE pg.path = ?1 AND pg.is_latest = 1{visible} \
+                 ORDER BY w.name, p.name \
                  LIMIT 1"
             );
+            let mut bound: Vec<Value> = vec![Value::Text(path)];
+            bound.extend(visible_params);
             let row_opt = conn
-                .query_row(&sql, params![path], page_meta_from_row)
+                .query_row(&sql, params_from_iter(bound.iter()), page_meta_from_row)
                 .optional()?;
             row_opt.transpose()
         })
