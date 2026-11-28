@@ -1469,6 +1469,8 @@ struct HookRemoval {
 /// Remove ai-memory commands from one hook entry. Returns `(removed_any,
 /// remove_entry)`. Flat entries are removed whole; nested entries only lose the
 /// matching inner commands and survive when third-party inner hooks remain.
+/// A group that was already empty holds nothing of ours and stays, as
+/// `install-hooks` leaves it when it replaces its own entries.
 fn strip_hook_entry(entry: &mut serde_json::Value) -> (bool, bool) {
     if hook_entry_is_ours(entry) {
         return (true, true);
@@ -1477,7 +1479,7 @@ fn strip_hook_entry(entry: &mut serde_json::Value) -> (bool, bool) {
         let before = inner.len();
         inner.retain(|h| !hook_entry_is_ours(h));
         let removed = inner.len() != before;
-        return (removed, inner.is_empty());
+        return (removed, removed && inner.is_empty());
     }
     (false, false)
 }
@@ -3058,6 +3060,35 @@ mod tests {
         assert_eq!(
             inner[0]["command"].as_str(),
             Some("/home/u/scripts/my-stop.sh")
+        );
+    }
+
+    #[test]
+    fn strip_hooks_keeps_an_empty_group_it_did_not_empty() {
+        let content = r#"{
+      "hooks": {
+        "PreToolUse": [
+          {"matcher":"Bash","hooks":[]}
+        ],
+        "SessionStart": [
+          {"matcher":"","hooks":[
+            {"type":"command","command":"AI_MEMORY_HOOK_URL=x /a/start.sh"}
+          ]}
+        ]
+      }
+    }"#;
+
+        let out = strip_ai_memory_hooks(content).unwrap();
+        assert_eq!(out.removed_events, vec!["SessionStart".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert!(
+            v["hooks"].get("SessionStart").is_none(),
+            "the group our withdrawal emptied goes with its event"
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"],
+            serde_json::json!([{"matcher": "Bash", "hooks": []}]),
+            "a group that was already empty is the user's and stays"
         );
     }
 

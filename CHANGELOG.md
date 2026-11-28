@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped `ai-memory uninstall` from deleting a hook group whose `hooks` list
+  was already empty when it removed ai-memory's own hooks from the same
+  settings file. Only a group that the removal emptied is dropped, as
+  `install-hooks` and the ZCode path already did. (#2561)
+
 ## [3.6.5] - 2026-11-28
 
 ### Security
