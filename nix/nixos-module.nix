@@ -75,6 +75,23 @@ let
       "actor_proxy_bearer_token"
     ];
 
+  # Per-candidate `headers` in the freeform LLM profiles carry the same
+  # credential risk as `llm_headers`, and unlike it have no env form.
+  profileHeadersInSettings =
+    let
+      withHeaders = prefix: profiles:
+        lib.concatLists (lib.imap0
+          (i: p: lib.optional ((p.headers or null) != null) "${prefix}[${toString i}].headers")
+          profiles);
+      tasks = cfg.settings.llm or { };
+    in
+    withHeaders "llm_fallbacks" (cfg.settings.llm_fallbacks or [ ])
+    ++ lib.concatLists (lib.mapAttrsToList
+      (name: task:
+        lib.optional ((task.headers or null) != null) "llm.${name}.headers"
+        ++ withHeaders "llm.${name}.fallbacks" (task.fallbacks or [ ]))
+      tasks);
+
   execStartArgs =
     [
       (lib.getExe cfg.package)
@@ -165,7 +182,8 @@ in
 
         A small typed set covers common keys; `freeformType` accepts any other
         TOML key. Values here land in a world-readable Nix store path — never
-        put secrets in `settings` (including `llm_headers` / auth tokens);
+        put secrets in `settings` (including `llm_headers`, the `headers` of
+        LLM fallback and task profiles, or auth tokens);
         use `ageSecret`, `sopsSecret`, or `environmentFile` instead.
       '';
     };
@@ -269,6 +287,11 @@ in
             assertion = (cfg.settings.llm_headers or null) == null;
             message =
               "services.ai-memory.settings.llm_headers may contain credentials and must not enter the Nix store; use AI_MEMORY_LLM_HEADERS in ageSecret/sopsSecret/environmentFile";
+          }
+          {
+            assertion = profileHeadersInSettings == [ ];
+            message =
+              "services.ai-memory.settings must not set LLM profile headers (${lib.concatStringsSep ", " profileHeadersInSettings}); they may contain credentials and would enter the Nix store";
           }
           {
             assertion = (cfg.settings.bind or null) == null;

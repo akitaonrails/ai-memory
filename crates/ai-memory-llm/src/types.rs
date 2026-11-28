@@ -470,6 +470,20 @@ impl ExtraHeaders {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        Self::parse_labeled("AI_MEMORY_LLM_HEADERS", entries)
+    }
+
+    /// [`Self::parse`] for a list that is not `AI_MEMORY_LLM_HEADERS`, such
+    /// as one fallback profile's `headers`: errors name `source` so the
+    /// operator can find the offending list.
+    ///
+    /// # Errors
+    /// The same as [`Self::parse`].
+    pub fn parse_labeled<I, S>(source: &str, entries: I) -> crate::error::LlmResult<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         use reqwest::header::{HeaderName, HeaderValue};
 
         let mut map = reqwest::header::HeaderMap::new();
@@ -480,16 +494,16 @@ impl ExtraHeaders {
             }
             // 1-based: operators count list entries from one, and the index
             // is what the message can safely name — see `split_entry`.
-            let (raw_name, raw_value) = split_entry(entry, index + 1)?;
+            let (raw_name, raw_value) = split_entry(source, entry, index + 1)?;
             let name = HeaderName::try_from(raw_name).map_err(|_| {
                 crate::error::LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_HEADERS entry {}: {raw_name:?} is not a valid HTTP header name",
+                    "{source} entry {}: {raw_name:?} is not a valid HTTP header name",
                     index + 1
                 ))
             })?;
             if RESERVED_HEADERS.contains(&name.as_str()) {
                 return Err(crate::error::LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_HEADERS entry {}: {name} is set by ai-memory itself \
+                    "{source} entry {}: {name} is set by ai-memory itself \
                      and cannot be overridden",
                     index + 1
                 )));
@@ -497,7 +511,7 @@ impl ExtraHeaders {
             let mut value = HeaderValue::try_from(raw_value).map_err(|_| {
                 // Names the header, never the value.
                 crate::error::LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_HEADERS entry {}: the value for {name} is not a valid \
+                    "{source} entry {}: the value for {name} is not a valid \
                      HTTP header value",
                     index + 1
                 ))
@@ -536,6 +550,14 @@ impl ExtraHeaders {
         value: reqwest::header::HeaderValue,
     ) {
         self.0.insert(name, value);
+    }
+
+    /// Replace each header that `overrides` names with its value there,
+    /// keeping the rest. Names compare case-insensitively, as on the wire,
+    /// so a profile's `Anthropic-Workspace-Id` replaces a global
+    /// `anthropic-workspace-id` instead of sending both.
+    pub fn overlay(&mut self, overrides: Self) {
+        self.0.extend(overrides.0);
     }
 
     /// Whether `name` is configured (header-name comparison is
@@ -579,14 +601,18 @@ impl std::fmt::Debug for ExtraHeaders {
 ///
 /// Errors name the entry by position rather than echoing it: an entry with no
 /// separator at all may well be a bare token the operator pasted by mistake.
-fn split_entry(entry: &str, position: usize) -> crate::error::LlmResult<(&str, &str)> {
+fn split_entry<'a>(
+    source: &str,
+    entry: &'a str,
+    position: usize,
+) -> crate::error::LlmResult<(&'a str, &'a str)> {
     let at = match (entry.find(':'), entry.find('=')) {
         (Some(colon), Some(equals)) => colon.min(equals),
         (Some(colon), None) => colon,
         (None, Some(equals)) => equals,
         (None, None) => {
             return Err(crate::error::LlmError::NotConfigured(format!(
-                "AI_MEMORY_LLM_HEADERS entry {position} is neither `Name: Value` nor `Name=Value`"
+                "{source} entry {position} is neither `Name: Value` nor `Name=Value`"
             )));
         }
     };
@@ -764,6 +790,32 @@ mod tests {
     fn parse_rejects_headers_ai_memory_owns(#[case] entry: &str) {
         let err = ExtraHeaders::parse([entry]).expect_err("reserved header must fail closed");
         assert!(err.to_string().contains("set by ai-memory itself"), "{err}");
+    }
+
+    #[test]
+    fn overlay_replaces_same_named_headers_and_keeps_the_rest() {
+        let mut headers =
+            ExtraHeaders::parse(["anthropic-workspace-id: global", "x-tool: t"]).expect("valid");
+        headers.overlay(
+            ExtraHeaders::parse(["Anthropic-Workspace-Id: entry", "x-extra: e"]).expect("valid"),
+        );
+        assert_eq!(
+            headers,
+            ExtraHeaders::parse(["anthropic-workspace-id: entry", "x-tool: t", "x-extra: e"])
+                .expect("valid")
+        );
+    }
+
+    #[test]
+    fn parse_labeled_names_its_source_without_echoing_the_entry() {
+        let err = ExtraHeaders::parse_labeled("llm_fallbacks[2].headers", ["sk-pasted-token"])
+            .expect_err("must fail closed");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("llm_fallbacks[2].headers entry 1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("sk-pasted-token"), "{rendered}");
     }
 
     #[test]

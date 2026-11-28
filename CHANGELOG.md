@@ -37,6 +37,15 @@ version in [`docs/changelog/`](docs/changelog/):
   sessions that fit kept the same request. Completed stages are scoped by
   `(workspace, project, session, fingerprint)` and pruned after publication (#2550).
 
+- Added an optional `headers` list to each `[[llm_fallbacks]]` entry and to
+  `[llm.<task>]` primaries and fallbacks. It uses the `llm_headers` format and
+  validation, is sent by that candidate only, and replaces a global
+  `llm_headers` entry of the same name (case-insensitive). This lets a chain
+  mix keys that each need their own header value, such as Anthropic's
+  `anthropic-workspace-id` for workspace-scoped keys. Configs without it
+  behave as before. The NixOS module refuses these lists in `settings`, as it
+  refuses `llm_headers`. (#2553)
+
 - Included provider-reported input and output tokens from successful structured
   completions in workload health. An explicit zero counts as a usage report.
   Providers that return only JSON continue to contribute estimates.

@@ -40,9 +40,12 @@ Quando uma tarefa não possui perfil, ela compartilha a mesma instância de prov
 cadeia de fallback. O perfil de uma tarefa substitui essa cadeia por seu próprio primário e seus
 fallbacks ordenados; fallbacks globais não são anexados. Perfis de tarefas funcionam quando
 o provedor global não está definido, sem habilitar outras tarefas. Configurações existentes de timeout,
-compatibilidade, cabeçalhos e raciocínio se aplicam globalmente, assim como
+compatibilidade e raciocínio se aplicam globalmente, assim como
 `llm_quota_cooldown_secs` (veja
-[Exaustão de crédito e cota](#exaustão-de-crédito-e-cota)).
+[Exaustão de crédito e cota](#exaustão-de-crédito-e-cota)). `llm_headers`
+também se aplica a todos os candidatos, e um primário ou fallback de tarefa pode
+aplicar seus próprios `headers` por cima (veja
+[Cabeçalhos por candidato](#cabeçalhos-por-candidato)).
 
 Campos escalares possuem formas aninhadas de variáveis de ambiente, como
 `AI_MEMORY_LLM__BOOTSTRAP__PROVIDER` e `AI_MEMORY_LLM__BOOTSTRAP__MODEL`.
@@ -111,6 +114,48 @@ serviço), e não exportada em todo shell.
 
 O primário executa primeiro e, em seguida, os fallbacks na ordem de declaração. Perfis
 de fallback não possuem atalho por variável de ambiente.
+
+### Cabeçalhos por candidato
+
+`llm_headers` vai para todos os candidatos. Uma entrada de fallback, um primário
+de tarefa (`[llm.<task>]`) e um fallback de tarefa podem definir `headers`, uma
+lista no mesmo formato `Nome: Valor` ou `Nome=Valor`, enviada só por aquele
+candidato. A lista da entrada é aplicada por cima de `llm_headers`: um cabeçalho
+presente nas duas fica com o valor da entrada, e os nomes são comparados sem
+diferenciar maiúsculas, então exatamente um valor vai na requisição. Entradas
+sem `headers` mantêm `llm_headers` como está. Uma lista pode acrescentar ou
+substituir um cabeçalho, mas não removê-lo: numa cadeia que também tem um
+fallback `openai`, um `anthropic-workspace-id` em `llm_headers` chega também a
+esse fallback. Deixe cabeçalhos específicos de um provedor em `llm_headers` só
+quando todos os candidatos os aceitam.
+
+Isso atende chaves que precisam de um valor de cabeçalho diferente por chave.
+Uma chave da Anthropic que pertence a uma service account restrita a um
+workspace é recusada sem o cabeçalho `anthropic-workspace-id`, e um workspace id
+de outra organização é recusado como não encontrado, então um único valor
+global não serve duas dessas chaves:
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-haiku-4-5"
+llm_headers = ["anthropic-workspace-id: wrkspc_PRIMARY"]
+
+[[llm_fallbacks]]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+api_key_env = "SECOND_ANTHROPIC_KEY"
+headers = ["anthropic-workspace-id: wrkspc_SECOND"]
+```
+
+Cada lista é validada no carregamento como `llm_headers`, inclusive contra os
+cabeçalhos que o próprio ai-memory define (`authorization`, `x-api-key`,
+`anthropic-version`, ...), e um erro nomeia a lista
+(`llm_fallbacks[0].headers entry 1`) sem repetir a entrada. Os valores nunca
+aparecem em logs, status ou health. Ao contrário de `llm_headers`, que pode vir
+de `AI_MEMORY_LLM_HEADERS`, essas listas vivem só no `config.toml`, então mantenha
+esse arquivo privado se algum valor for uma credencial. O módulo NixOS as recusa
+em `settings` pelo mesmo motivo que recusa `llm_headers`: esse arquivo vai para o
+Nix store, legível por todos.
 
 ## Fronteira de implementação
 
