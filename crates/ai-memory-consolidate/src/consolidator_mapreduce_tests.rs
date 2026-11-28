@@ -87,13 +87,49 @@ fn map_block_fingerprint_is_content_derived() {
         20_000,
     )
     .unwrap();
-    assert_eq!(a[0].fingerprint, b[0].fingerprint);
+    assert_eq!(
+        map_block_fingerprint(&cfg("m1"), &a[0].parts),
+        map_block_fingerprint(&cfg("m1"), &b[0].parts)
+    );
     let mut changed = obs.clone();
     changed.body.push('x');
     let c = plan_map_blocks(SessionId::new(), &[changed], &cfg("m1"), 20_000).unwrap();
-    assert_ne!(a[0].fingerprint, c[0].fingerprint);
+    assert_ne!(
+        map_block_fingerprint(&cfg("m1"), &a[0].parts),
+        map_block_fingerprint(&cfg("m1"), &c[0].parts)
+    );
     let d = plan_map_blocks(SessionId::new(), &[obs], &cfg("m2"), 20_000).unwrap();
-    assert_ne!(a[0].fingerprint, d[0].fingerprint);
+    assert_ne!(
+        map_block_fingerprint(&cfg("m1"), &a[0].parts),
+        map_block_fingerprint(&cfg("m2"), &d[0].parts)
+    );
+}
+
+#[test]
+fn map_subblock_fingerprint_never_aliases_a_plain_block() {
+    let cfg = ChunkingConfig {
+        target_chars: 5_000,
+        model: "m1".into(),
+    };
+    let obs: Vec<Observation> = (0..4)
+        .map(|i| chunk_observation(format!("body {i}")))
+        .collect();
+    let parts = plan_map_parts(&obs);
+    // The same parts as a plain block and as a split sub-block must not
+    // collide, and neither must two different halves of the same split.
+    let plain = map_block_fingerprint(&cfg, &parts);
+    let whole_split = map_subblock_fingerprint(&cfg, &parts);
+    assert_ne!(plain, whole_split);
+    let left = map_subblock_fingerprint(&cfg, &parts[..2]);
+    let right = map_subblock_fingerprint(&cfg, &parts[2..]);
+    assert_ne!(left, right, "halves at different positions must differ");
+    assert_ne!(left, whole_split);
+    assert_ne!(left, map_block_fingerprint(&cfg, &parts[..2]));
+    assert_eq!(left, map_subblock_fingerprint(&cfg, &parts[..2]));
+    // A sub-block with parts in the other order is its own identity.
+    let mut swapped = parts.clone();
+    swapped[..2].reverse();
+    assert_ne!(left, map_subblock_fingerprint(&cfg, &swapped[..2]));
 }
 
 #[test]
@@ -258,15 +294,54 @@ fn extraction_reply(ids: Vec<String>) -> serde_json::Value {
     })
 }
 
+/// A well-formed observation id that is never inserted by a fixture, so a
+/// stage reply naming it cites an id outside its input.
+const FOREIGN_OBSERVATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+/// The incomplete-coverage shape the production model returned: every id
+/// but the last one accounted for. With a single id there is nothing left
+/// to cite, so the shape is zero extractions and an empty
+/// `no_durable_fact_ids` — the pure coverage hole, not a grounding break.
+fn incomplete_coverage_reply(ids: Vec<String>) -> serde_json::Value {
+    if ids.len() < 2 {
+        return serde_json::json!({
+            "extractions": [],
+            "rationale": "",
+            "no_durable_fact_ids": [],
+        });
+    }
+    extraction_reply(ids[..ids.len() - 1].to_vec())
+}
+
 /// Deterministic provider for the three stages. Map/reduce replies cite
 /// exactly the ids the request showed it; final replies a fixed page. The
 /// switches inject a crash before publication or an ungrounded map output.
+/// The coverage switches reply with one id LESS than the request showed,
+/// which is the incomplete-coverage shape production saw from real models.
 struct StagedLlm {
     map_calls: AtomicUsize,
     reduce_calls: AtomicUsize,
     final_calls: AtomicUsize,
     fail_final: AtomicBool,
     bad_map: AtomicBool,
+    /// When non-zero and a map request shows at least this many distinct
+    /// observation ids, the reply accounts for all but one id. Sticky.
+    incomplete_when_ids_at_least: AtomicUsize,
+    /// When non-zero, the Nth map call fails with an Auth error instead of
+    /// replying (simulating a process crash mid split-block).
+    fail_map_call: AtomicUsize,
+    /// When non-zero, the Nth map call cites an id outside its stage input
+    /// (a grounding break, which must stay terminal on every path).
+    bad_map_call: AtomicUsize,
+    /// The next map call replies with zero extractions and a
+    /// `no_durable_fact_ids` that repeats an input id and names one id
+    /// outside the stage input. Consumed once.
+    weird_no_durable_map: AtomicBool,
+    /// The next reduce call accounts for all but one of the ids its request
+    /// cited. Consumed once.
+    incomplete_reduce: AtomicBool,
+    /// Observation ids per map call, in request order.
+    map_request_ids: std::sync::Mutex<Vec<Vec<String>>>,
     final_user: std::sync::Mutex<String>,
     agent_page_on_final: std::sync::Mutex<Option<(Wiki, WorkspaceId, ProjectId, PagePath)>>,
 }
@@ -279,6 +354,12 @@ impl StagedLlm {
             final_calls: AtomicUsize::new(0),
             fail_final: AtomicBool::new(false),
             bad_map: AtomicBool::new(false),
+            incomplete_when_ids_at_least: AtomicUsize::new(0),
+            fail_map_call: AtomicUsize::new(0),
+            bad_map_call: AtomicUsize::new(0),
+            weird_no_durable_map: AtomicBool::new(false),
+            incomplete_reduce: AtomicBool::new(false),
+            map_request_ids: std::sync::Mutex::new(Vec::new()),
             final_user: std::sync::Mutex::new(String::new()),
             agent_page_on_final: std::sync::Mutex::new(None),
         }
@@ -290,6 +371,10 @@ impl StagedLlm {
             self.reduce_calls.load(Ordering::SeqCst),
             self.final_calls.load(Ordering::SeqCst),
         )
+    }
+
+    fn map_requests(&self) -> Vec<Vec<String>> {
+        self.map_request_ids.lock().unwrap().clone()
     }
 }
 
@@ -318,11 +403,35 @@ impl LlmProvider for StagedLlm {
             .as_deref()
             .is_some_and(|s| s.contains("map stage"))
         {
-            self.map_calls.fetch_add(1, Ordering::SeqCst);
+            let call_no = self.map_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let ids = observation_ids_in_map_request(&user);
+            self.map_request_ids.lock().unwrap().push(ids.clone());
             if self.bad_map.swap(false, Ordering::SeqCst) {
                 return Ok(extraction_reply(vec!["not-an-observation".into()]));
             }
-            return Ok(extraction_reply(observation_ids_in_map_request(&user)));
+            let fail_at = self.fail_map_call.load(Ordering::SeqCst);
+            if fail_at > 0 && call_no == fail_at {
+                return Err(LlmError::Auth("crash mid split-block".into()));
+            }
+            let bad_at = self.bad_map_call.load(Ordering::SeqCst);
+            if bad_at > 0 && call_no == bad_at {
+                return Ok(extraction_reply(vec![FOREIGN_OBSERVATION_ID.into()]));
+            }
+            if self.weird_no_durable_map.swap(false, Ordering::SeqCst) {
+                let mut no_durable: Vec<String> =
+                    ids.iter().chain(ids.iter().rev()).cloned().collect();
+                no_durable.push(FOREIGN_OBSERVATION_ID.into());
+                return Ok(serde_json::json!({
+                    "extractions": [],
+                    "rationale": "",
+                    "no_durable_fact_ids": no_durable,
+                }));
+            }
+            let floor = self.incomplete_when_ids_at_least.load(Ordering::SeqCst);
+            if floor > 0 && ids.len() >= floor {
+                return Ok(incomplete_coverage_reply(ids));
+            }
+            return Ok(extraction_reply(ids));
         }
         if request
             .system
@@ -330,7 +439,11 @@ impl LlmProvider for StagedLlm {
             .is_some_and(|s| s.contains("reduce stage"))
         {
             self.reduce_calls.fetch_add(1, Ordering::SeqCst);
-            return Ok(extraction_reply(observation_ids_in_reduce_request(&user)));
+            let ids = observation_ids_in_reduce_request(&user);
+            if self.incomplete_reduce.swap(false, Ordering::SeqCst) {
+                return Ok(incomplete_coverage_reply(ids));
+            }
+            return Ok(extraction_reply(ids));
         }
         self.final_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_final.swap(false, Ordering::SeqCst) {
@@ -713,6 +826,397 @@ async fn chunked_validation_failure_is_returned_on_the_first_call() {
         redacted_error_summary(&error),
         "consolidation failed: class=ungrounded-extractions status=none"
     );
+}
+
+/// Reads `page_sources` for one page.
+fn page_source_count(store: &ai_memory_store::Store, page_id: ai_memory_core::PageId) -> usize {
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM page_sources WHERE page_id = ?1",
+        [page_id.as_bytes()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn chunked_incomplete_map_coverage_remaps_the_block_in_halves() {
+    // Three oversized observations plan as blocks [p1], [p2, obs2], [obs3].
+    // Every reply that saw two or more ids drops one, so the middle block
+    // must be re-run as its two halves while the single-part blocks pass.
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[900, 900, 900]).await;
+    let llm = Arc::new(StagedLlm::new());
+    llm.incomplete_when_ids_at_least.store(2, Ordering::SeqCst);
+    let outcome = staged_consolidator(&store, wiki.clone(), llm.clone(), ws, proj, 6_000)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("incomplete map coverage must recover by re-mapping in halves, not fail");
+    assert_eq!(
+        llm.calls(),
+        (5, 0, 1),
+        "three block calls plus the two halves of the incomplete one"
+    );
+    let seq = llm.map_requests();
+    let shapes: Vec<usize> = seq.iter().map(Vec::len).collect();
+    assert_eq!(
+        shapes,
+        vec![1, 2, 1, 1, 1],
+        "the incomplete 2-id block is followed by its halves, in order"
+    );
+    assert_eq!(seq[2], vec![seq[1][0].clone()], "the left half runs first");
+    assert_eq!(
+        seq[3],
+        vec![seq[1][1].clone()],
+        "the right half runs second"
+    );
+    let page = wiki
+        .read_page(ws, proj, &outcome.path)
+        .expect("the session page must still be written");
+    assert!(page.frontmatter.get(CONSOLIDATION_MARKER_KEY).is_some());
+    assert_eq!(
+        page_source_count(&store, outcome.page_id.unwrap()),
+        3,
+        "page_sources must cover every id the (half) blocks cited"
+    );
+}
+
+#[tokio::test]
+async fn chunked_split_block_resumes_from_finished_subblock_checkpoints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[900, 900, 900]).await;
+    let first = Arc::new(StagedLlm::new());
+    first
+        .incomplete_when_ids_at_least
+        .store(2, Ordering::SeqCst);
+    first.fail_map_call.store(4, Ordering::SeqCst);
+    let error = staged_consolidator(&store, wiki.clone(), first.clone(), ws, proj, 6_000)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the run that crashes inside the split block must fail");
+    assert!(matches!(error, ConsolidatorError::Llm(_)));
+    assert_eq!(first.calls().0, 4);
+    let first_seq = first.map_requests();
+    assert_eq!(
+        first_seq[2..4].to_vec(),
+        vec![vec![first_seq[1][0].clone()], vec![first_seq[1][1].clone()],],
+        "the left half checkpoints first, then the crash lands on the right half"
+    );
+    // A fresh process: the finished left half must come from its checkpoint.
+    let second = Arc::new(StagedLlm::new());
+    second
+        .incomplete_when_ids_at_least
+        .store(2, Ordering::SeqCst);
+    let outcome = staged_consolidator(&store, wiki.clone(), second.clone(), ws, proj, 6_000)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("the resume must finish from checkpoints");
+    assert_eq!(
+        second.calls().0,
+        3,
+        "reused: the first block and the finished left half cost no call"
+    );
+    let seq = second.map_requests();
+    assert_eq!(
+        seq.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![2, 1, 1],
+        "only the parent, the unfinished half and the last block are re-run"
+    );
+    assert_eq!(
+        seq[0], first_seq[1],
+        "control: the parent block re-runs (it never checkpointed)"
+    );
+    assert_eq!(seq[1], vec![seq[0][1].clone()], "the right half runs");
+    assert_eq!(
+        wiki.read_page(ws, proj, &outcome.path).unwrap().body,
+        "Grounded by the evidence section."
+    );
+    assert_eq!(
+        page_source_count(&store, outcome.page_id.unwrap()),
+        3,
+        "every cited id reaches page_sources after the resume"
+    );
+}
+
+#[tokio::test]
+async fn chunked_failed_parent_block_records_no_checkpoint() {
+    // The split halves checkpoint; the block that failed coverage never
+    // may, or a resume would reuse the very result that failed validation.
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[900, 900, 900]).await;
+    let llm = Arc::new(StagedLlm::new());
+    llm.incomplete_when_ids_at_least.store(2, Ordering::SeqCst);
+    staged_consolidator(&store, wiki, llm.clone(), ws, proj, 6_000)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("recovered run publishes");
+    // The publish prunes every checkpoint, so re-run against a store where
+    // publication fails after the map: the surviving rows tell the story.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let (store2, wiki2, session2, ws2, proj2) =
+        chunked_fixture(tmp2.path(), &[900, 900, 900]).await;
+    let llm2 = Arc::new(StagedLlm::new());
+    llm2.incomplete_when_ids_at_least.store(2, Ordering::SeqCst);
+    llm2.fail_final.store(true, Ordering::SeqCst);
+    staged_consolidator(&store2, wiki2, llm2.clone(), ws2, proj2, 6_000)
+        .consolidate_session(
+            session2,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the interrupted run must fail");
+    assert_eq!(llm2.calls().0, 5);
+    let cfg = ChunkingConfig {
+        target_chars: 6_000 * 3 * 8 / 10,
+        model: "staged".into(),
+    };
+    let parts = plan_map_parts(
+        &store2
+            .reader
+            .observations_for_session_in_scope(ws2, proj2, session2)
+            .await
+            .unwrap(),
+    );
+    let rows = store2
+        .writer
+        .load_consolidation_chunks(ws2, proj2, session2)
+        .await
+        .unwrap();
+    let keys: Vec<String> = rows.into_iter().map(|r| r.chunk_fingerprint).collect();
+    let parent_parts = vec![parts[1].clone(), parts[2].clone()];
+    assert!(
+        !keys.contains(&map_block_fingerprint(&cfg, &parent_parts)),
+        "the failed parent block must not checkpoint"
+    );
+    assert!(
+        keys.contains(&map_block_fingerprint(&cfg, &[parts[0].clone()])),
+        "control: the complete single-part block checkpoints"
+    );
+    assert!(keys.contains(&map_subblock_fingerprint(&cfg, &[parts[1].clone()])));
+    assert!(keys.contains(&map_subblock_fingerprint(&cfg, &[parts[2].clone()])));
+}
+
+#[tokio::test]
+async fn chunked_single_part_incomplete_coverage_normalizes_and_publishes() {
+    // Every reply drops one id: a one-part block cannot split, so its hole
+    // becomes `no_durable_fact_ids` and the session still gets its page.
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[900, 900]).await;
+    let llm = Arc::new(StagedLlm::new());
+    llm.incomplete_when_ids_at_least.store(1, Ordering::SeqCst);
+    let outcome = staged_consolidator(&store, wiki.clone(), llm.clone(), ws, proj, 6_000)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("a one-part coverage hole must normalize, not fail the session");
+    assert_eq!(
+        llm.calls(),
+        (4, 0, 1),
+        "block 1 normalizes; block 2 splits into two normalizing halves"
+    );
+    let page = wiki
+        .read_page(ws, proj, &outcome.path)
+        .expect("the page is written even when nothing survives");
+    assert!(page.frontmatter.get(CONSOLIDATION_MARKER_KEY).is_some());
+    assert_eq!(
+        page_source_count(&store, outcome.page_id.unwrap()),
+        0,
+        "ids omitted everywhere never enter page_sources"
+    );
+}
+
+#[tokio::test]
+async fn chunked_reduce_incomplete_coverage_normalizes_and_publishes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sizes: Vec<usize> = (0..200).map(|_| 60).collect();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &sizes).await;
+    let total = store
+        .reader
+        .observations_for_session_in_scope(ws, proj, session)
+        .await
+        .unwrap()
+        .len();
+    let llm = Arc::new(StagedLlm::new());
+    llm.incomplete_reduce.store(true, Ordering::SeqCst);
+    let outcome = staged_consolidator(&store, wiki.clone(), llm.clone(), ws, proj, 1_400)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("a reduce group that drops one id must normalize, not fail");
+    let (maps, reduces, finals) = llm.calls();
+    assert!(
+        maps > 1 && reduces >= 1 && finals == 1,
+        "got {maps} {reduces} {finals}"
+    );
+    let page = wiki
+        .read_page(ws, proj, &outcome.path)
+        .expect("the page is written after the normalized reduce");
+    assert!(page.frontmatter.get(CONSOLIDATION_MARKER_KEY).is_some());
+    assert_eq!(
+        page_source_count(&store, outcome.page_id.unwrap()),
+        total - 1,
+        "the id dropped by the reduce group leaves the grounded set"
+    );
+}
+
+#[tokio::test]
+async fn chunked_duplicated_and_foreign_no_durable_ids_normalize() {
+    // The first map reply answers a one-part block with zero extractions
+    // and a `no_durable_fact_ids` that repeats the input id and names a
+    // foreign one. Both defects normalize; the run must not fail.
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[900, 900]).await;
+    let llm = Arc::new(StagedLlm::new());
+    llm.weird_no_durable_map.store(true, Ordering::SeqCst);
+    let outcome = staged_consolidator(&store, wiki.clone(), llm.clone(), ws, proj, 6_000)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("a duplicated or foreign no_durable id must normalize, not fail");
+    assert_eq!(llm.calls(), (2, 0, 1));
+    assert_eq!(
+        page_source_count(&store, outcome.page_id.unwrap()),
+        2,
+        "the ids the second block still cites stay grounded"
+    );
+}
+
+#[tokio::test]
+async fn chunked_grounding_break_on_a_splittable_block_stays_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, wiki, session, ws, proj) = chunked_fixture(tmp.path(), &[900, 900, 900]).await;
+    let llm = Arc::new(StagedLlm::new());
+    // Call 2 is the two-part block: coverage recovery must not launder an
+    // id cited outside the stage input.
+    llm.bad_map_call.store(2, Ordering::SeqCst);
+    let error = staged_consolidator(&store, wiki.clone(), llm.clone(), ws, proj, 6_000)
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a cited id outside the stage input must fail closed");
+    assert!(matches!(error, ConsolidatorError::UngroundedExtractions(_)));
+    assert_eq!(
+        llm.calls().0,
+        2,
+        "no split retries run for a grounding break"
+    );
+    assert_eq!(llm.calls().2, 0);
+    assert_eq!(
+        redacted_error_summary(&error),
+        "consolidation failed: class=ungrounded-extractions status=none"
+    );
+    let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+    assert!(
+        wiki.read_page(ws, proj, &path).is_err(),
+        "no page may be published when grounding fails"
+    );
+}
+
+#[test]
+fn normalize_coverage_repairs_only_coverage_and_passes_validation() {
+    let allowed: HashSet<String> = ["id-1".to_owned(), "id-2".to_owned(), "id-3".to_owned()].into();
+    let extraction = |ids: &[&str]| EvidenceExtraction {
+        observation_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+        kind: ExtractionKind::Fact,
+        title: "t".into(),
+        summary: "s".into(),
+        body_markdown: "b".into(),
+        tags: Vec::new(),
+        entities: Vec::new(),
+        confidence: 0.9,
+    };
+    // id-3 is unaccounted (joins), id-1 is cited AND listed (leaves), the
+    // listed duplicate and the foreign id drop out.
+    let mut result = ExtractionResult {
+        extractions: vec![extraction(&["id-1"])],
+        rationale: String::new(),
+        no_durable_fact_ids: vec![
+            "id-1".to_owned(),
+            "id-2".to_owned(),
+            "id-2".to_owned(),
+            FOREIGN_OBSERVATION_ID.to_owned(),
+        ],
+    };
+    let adjusted = normalize_coverage(&mut result, &allowed);
+    assert_eq!(adjusted, 4, "three drops plus one addition");
+    assert_eq!(
+        result.no_durable_fact_ids,
+        vec!["id-2".to_owned(), "id-3".to_owned()],
+        "legit entries keep their place, missing ids append sorted"
+    );
+    validate_extraction_result(&result, &allowed)
+        .expect("a normalized result passes the validator verbatim");
+    assert_eq!(
+        result.extractions[0].observation_ids,
+        vec!["id-1".to_owned()],
+        "extractions are untouched: grounding cannot be laundered"
+    );
+    // Control: an already-normalized result is byte-identical and free.
+    let mut clean = ExtractionResult {
+        extractions: result.extractions.clone(),
+        rationale: String::new(),
+        no_durable_fact_ids: result.no_durable_fact_ids.clone(),
+    };
+    assert_eq!(normalize_coverage(&mut clean, &allowed), 0);
+    assert_eq!(clean.no_durable_fact_ids, result.no_durable_fact_ids);
+    // Control: an extraction citing a foreign id still fails after repair.
+    let mut ungrounded = ExtractionResult {
+        extractions: vec![extraction(&["id-9"])],
+        rationale: String::new(),
+        no_durable_fact_ids: Vec::new(),
+    };
+    normalize_coverage(&mut ungrounded, &allowed);
+    assert!(matches!(
+        validate_extraction_result(&ungrounded, &allowed),
+        Err(ConsolidatorError::UngroundedExtractions(_))
+    ));
 }
 
 #[tokio::test]

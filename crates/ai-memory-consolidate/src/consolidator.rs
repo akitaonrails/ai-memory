@@ -74,7 +74,13 @@ pub enum ConsolidatorError {
     UngroundedExtractions(String),
 
     /// A map/reduce stage did not account for every observation id in its
-    /// input: an id was neither cited nor listed as having no durable fact.
+    /// input: an id was neither cited nor listed as having no durable fact,
+    /// or `no_durable_fact_ids` listed one twice or outside the stage input.
+    /// Fresh stage calls recover from this instead of failing: a map block
+    /// is re-mapped as its two halves and, at the limit, the holes are
+    /// normalized by [`normalize_coverage`]. The variant still surfaces as
+    /// the fail-closed guard when a reused checkpoint or a repaired result
+    /// contradicts the validator.
     #[error("consolidation stage left input observation ids unaccounted: {0}")]
     IncompleteCoverage(String),
 
@@ -1645,7 +1651,11 @@ impl Consolidator {
 
     /// Map every block in order. A checkpoint whose fingerprint matches is
     /// reused verbatim (still validated); otherwise one structured call runs
-    /// and its validated output is durably recorded before the next block.
+    /// and its validated (or coverage-repaired) output is durably recorded
+    /// before the next block. A fresh call that leaves ids unaccounted is
+    /// retried as the block's two halves, in order, recursively; the failed
+    /// block records no checkpoint, and each finished sub-block records its
+    /// own so a resume reuses them without another LLM call.
     async fn chunked_map_extractions(
         &self,
         run: &ChunkedRun,
@@ -1661,57 +1671,147 @@ impl Consolidator {
         let mut all = Vec::new();
         for (idx, block) in blocks.iter().enumerate() {
             let chunk_no = idx + 1;
-            let allowed: HashSet<String> = block.allowed_ids.iter().cloned().collect();
-            if let Some(json) = checkpoints.get(&block.fingerprint) {
-                let result: ExtractionResult = serde_json::from_str(json).map_err(|e| {
-                    ConsolidatorError::Serde(format!(
-                        "unreadable map checkpoint for block {chunk_no}: {e}"
-                    ))
-                })?;
-                validate_extraction_result(&result, &allowed)?;
-                debug!(
-                    session = %run.session,
-                    chunk = chunk_no,
-                    total = blocks.len(),
-                    "map block reused from durable checkpoint"
-                );
-                all.extend(result.extractions);
-                continue;
-            }
-            let request = build_map_request(run.session, &block.parts, chunk_no, blocks.len());
-            info!(
-                session = %run.session,
-                operation_id = %run.operation_id,
-                stage = "map",
-                chunk = chunk_no,
-                total = blocks.len(),
-                "map-reduce map call starting"
-            );
-            let result: ExtractionResult = complete_structured_with_retry(
-                &*self.llm,
-                request,
-                run.operation_id.clone(),
-                CONSOLIDATION_LLM_RETRY_DELAY,
-            )
-            .await?;
-            validate_extraction_result(&result, &allowed)?;
-            self.writer
-                .record_consolidation_chunk(
-                    run.ws,
-                    run.proj,
-                    run.session,
-                    block.fingerprint.clone(),
-                    serde_json::to_string(&result)?,
+            all.extend(
+                self.map_block_with_coverage_recovery(
+                    run,
+                    cfg,
+                    &checkpoints,
+                    &block.parts,
+                    chunk_no,
+                    blocks.len(),
+                    false,
                 )
-                .await?;
-            all.extend(result.extractions);
+                .await?,
+            );
         }
         Ok(all)
     }
 
+    /// One map block or split sub-block: reuse its checkpoint when present,
+    /// otherwise run one structured call and recover from coverage holes.
+    /// Grounding failures always propagate. A result that left ids
+    /// unaccounted is retried as the parts' two halves while at least two
+    /// parts remain; a one-part block has nothing smaller to retry, so its
+    /// holes are normalized into `no_durable_fact_ids` and the repaired
+    /// result is what the checkpoint stores. Only a result that passes
+    /// validation — fresh or repaired — is ever recorded.
+    // The split recursion threads the whole stage context (run, config,
+    // checkpoints, block position) plus its own parts and split state.
+    #[allow(clippy::too_many_arguments)]
+    async fn map_block_with_coverage_recovery(
+        &self,
+        run: &ChunkedRun,
+        cfg: &ChunkingConfig,
+        checkpoints: &HashMap<String, String>,
+        parts: &[ChunkPart],
+        chunk_no: usize,
+        total_chunks: usize,
+        split: bool,
+    ) -> ConsolidatorResult<Vec<EvidenceExtraction>> {
+        let allowed: HashSet<String> = parts.iter().map(|p| p.observation_id.clone()).collect();
+        let fingerprint = if split {
+            map_subblock_fingerprint(cfg, parts)
+        } else {
+            map_block_fingerprint(cfg, parts)
+        };
+        if let Some(json) = checkpoints.get(&fingerprint) {
+            let result: ExtractionResult = serde_json::from_str(json).map_err(|e| {
+                ConsolidatorError::Serde(format!(
+                    "unreadable {}map checkpoint for chunk {chunk_no}: {e}",
+                    if split { "sub-block " } else { "" }
+                ))
+            })?;
+            validate_extraction_result(&result, &allowed)?;
+            debug!(
+                session = %run.session,
+                chunk = chunk_no,
+                total = total_chunks,
+                split,
+                "map block reused from durable checkpoint"
+            );
+            return Ok(result.extractions);
+        }
+        let request = build_map_request(run.session, parts, chunk_no, total_chunks);
+        info!(
+            session = %run.session,
+            operation_id = %run.operation_id,
+            stage = "map",
+            chunk = chunk_no,
+            total = total_chunks,
+            split,
+            "map-reduce map call starting"
+        );
+        let mut result: ExtractionResult = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            run.operation_id.clone(),
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
+        if let Err(err) = validate_extraction_result(&result, &allowed) {
+            match err {
+                ConsolidatorError::IncompleteCoverage(_) if parts.len() >= 2 => {
+                    let mid = parts.len() / 2;
+                    // Boxed so the async recursion has a finite future.
+                    let mut extracted = Box::pin(self.map_block_with_coverage_recovery(
+                        run,
+                        cfg,
+                        checkpoints,
+                        &parts[..mid],
+                        chunk_no,
+                        total_chunks,
+                        true,
+                    ))
+                    .await?;
+                    extracted.extend(
+                        Box::pin(self.map_block_with_coverage_recovery(
+                            run,
+                            cfg,
+                            checkpoints,
+                            &parts[mid..],
+                            chunk_no,
+                            total_chunks,
+                            true,
+                        ))
+                        .await?,
+                    );
+                    return Ok(extracted);
+                }
+                ConsolidatorError::IncompleteCoverage(_) => {
+                    // One part: no smaller unit to re-map, so the unaccounted
+                    // ids count as without a durable fact and the session
+                    // keeps its page. Counts only — never observation text.
+                    let adjusted = normalize_coverage(&mut result, &allowed);
+                    validate_extraction_result(&result, &allowed)?;
+                    warn!(
+                        session = %run.session,
+                        stage = "map",
+                        chunk = chunk_no,
+                        adjusted,
+                        input = allowed.len(),
+                        "map coverage incomplete: unaccounted ids treated as without a durable fact"
+                    );
+                }
+                err => return Err(err),
+            }
+        }
+        self.writer
+            .record_consolidation_chunk(
+                run.ws,
+                run.proj,
+                run.session,
+                fingerprint,
+                serde_json::to_string(&result)?,
+            )
+            .await?;
+        Ok(result.extractions)
+    }
+
     /// Merge extractions until the FINAL request fits the configured
     /// ceiling — not merely one reduce request. Depth is bounded at
-    /// [`MAX_REDUCE_DEPTH`]; a list that cannot shrink fails closed.
+    /// [`MAX_REDUCE_DEPTH`]; a list that cannot shrink fails closed. A
+    /// fresh group whose coverage came back incomplete is normalized (its
+    /// unaccounted ids become `no_durable_fact_ids`), never failed.
     async fn chunked_reduce_extractions(
         &self,
         run: &ChunkedRun,
@@ -1793,14 +1893,34 @@ impl Consolidator {
                     total = groups.len(),
                     "map-reduce reduce call starting"
                 );
-                let result: ExtractionResult = complete_structured_with_retry(
+                let mut result: ExtractionResult = complete_structured_with_retry(
                     &*self.llm,
                     request,
                     run.operation_id.clone(),
                     CONSOLIDATION_LLM_RETRY_DELAY,
                 )
                 .await?;
-                validate_extraction_result(&result, &allowed)?;
+                if let Err(err) = validate_extraction_result(&result, &allowed) {
+                    match err {
+                        // A reduce group is never split further: its
+                        // coverage holes are normalized so the session
+                        // keeps its page. Grounding failures stay terminal.
+                        ConsolidatorError::IncompleteCoverage(_) => {
+                            let adjusted = normalize_coverage(&mut result, &allowed);
+                            validate_extraction_result(&result, &allowed)?;
+                            warn!(
+                                session = %run.session,
+                                stage = "reduce",
+                                depth,
+                                group = group_no,
+                                adjusted,
+                                input = allowed.len(),
+                                "reduce coverage incomplete: unaccounted ids treated as without a durable fact"
+                            );
+                        }
+                        err => return Err(err),
+                    }
+                }
                 self.writer
                     .record_consolidation_chunk(
                         run.ws,
@@ -2032,16 +2152,19 @@ struct ChunkPart {
     text: String,
 }
 
-/// A greedy map block and its content-derived identity.
+/// A greedy map block. The checkpoint fingerprint is derived from `parts`
+/// at map time (`map_block_fingerprint` / `map_subblock_fingerprint`).
 struct MapBlock {
-    fingerprint: String,
     parts: Vec<ChunkPart>,
-    allowed_ids: Vec<String>,
 }
 
 const MAP_PROMPT_VERSION: u32 = 1;
 const REDUCE_PROMPT_VERSION: u32 = 1;
 const FINAL_PROMPT_VERSION: u32 = 1;
+/// Marks a map checkpoint recorded for a half of a split block. Not a
+/// prompt version: the prompts are unchanged, so plain-block fingerprints
+/// and their checkpoints stay valid.
+const MAP_SPLIT_MARKER: &str = "coverage-halves-v1";
 const MAX_CHUNK_PART_CHARS: usize = 12_000;
 const MAX_EXTRACTIONS_PER_STAGE: usize = 10;
 const MAX_MAP_BLOCKS: usize = 64;
@@ -2275,11 +2398,7 @@ fn plan_map_blocks(
                 if out.len() >= MAX_MAP_BLOCKS {
                     return Err(ConsolidatorError::ChunkDoesNotFit);
                 }
-                out.push(MapBlock {
-                    fingerprint: map_block_fingerprint(cfg, &block),
-                    allowed_ids: block.iter().map(|p| p.observation_id.clone()).collect(),
-                    parts: block,
-                });
+                out.push(MapBlock { parts: block });
                 continue;
             }
             if block.len() == 1 {
@@ -2296,8 +2415,25 @@ fn plan_map_blocks(
 }
 
 fn map_block_fingerprint(cfg: &ChunkingConfig, parts: &[ChunkPart]) -> String {
+    // Plain map blocks keep this payload byte-for-byte: checkpoints recorded
+    // before split recovery stay reusable, so no prompt version bumps here.
     let payload = serde_json::json!({
         "stage": format!("map-v{MAP_PROMPT_VERSION}"),
+        "model": cfg.model,
+        "parts": parts,
+    });
+    sha256_hex(&payload.to_string())
+}
+
+/// Split sub-blocks carry [`MAP_SPLIT_MARKER`] in the payload so a half of
+/// one block can never alias the fingerprint of a plain block (or of the
+/// parent it was split from) built from the same parts. Parts embed their
+/// observation id, so sub-blocks at different positions hash apart unless
+/// their content is genuinely identical.
+fn map_subblock_fingerprint(cfg: &ChunkingConfig, parts: &[ChunkPart]) -> String {
+    let payload = serde_json::json!({
+        "stage": format!("map-v{MAP_PROMPT_VERSION}"),
+        "split_marker": MAP_SPLIT_MARKER,
         "model": cfg.model,
         "parts": parts,
     });
@@ -2513,9 +2649,16 @@ fn build_final_request_single(
     }
 }
 
-/// Fail closed on ungrounded or incomplete map/reduce output. Error details
-/// name ids, never observation bodies; `redacted_error_summary` drops them
-/// entirely before the queue or MCP sees them.
+/// Fail closed on ungrounded or incomplete map/reduce output. Grounding
+/// failures are terminal and the callers propagate them untouched. Coverage
+/// failures are the callers' recovery signal: a fresh map block re-runs as
+/// its two halves, and a one-part block or a reduce group repairs itself
+/// through [`normalize_coverage`], so a session keeps its page. This
+/// function itself is unchanged by that recovery: reused checkpoints and
+/// repaired results are still validated against it, and a normalized
+/// result passes it verbatim. Error details name ids, never observation
+/// bodies; `redacted_error_summary` drops them entirely before the queue
+/// or MCP sees them.
 fn validate_extraction_result(
     result: &ExtractionResult,
     allowed_ids: &HashSet<String>,
@@ -2581,6 +2724,52 @@ fn validate_extraction_result(
         )));
     }
     Ok(())
+}
+
+/// Coverage-only repair of a stage result whose extractions already passed
+/// the grounding checks of [`validate_extraction_result`]: input ids the
+/// model left unaccounted join `no_durable_fact_ids`, ids an extraction
+/// already cites leave it, and ids it names twice or outside the stage
+/// input drop out. Extractions are never touched, so grounding cannot be
+/// laundered through this path, and the repaired result passes
+/// `validate_extraction_result` verbatim. Returns how many ids the repair
+/// moved, for a warn-level count log that carries no observation text.
+fn normalize_coverage(result: &mut ExtractionResult, allowed_ids: &HashSet<String>) -> usize {
+    let mut adjusted = 0usize;
+    let mut kept: Vec<String> = Vec::with_capacity(result.no_durable_fact_ids.len());
+    // The `cited` borrow over `result.extractions` must end before the
+    // write-back to `result.no_durable_fact_ids`, so it lives in a block.
+    let mut missing: Vec<&String> = {
+        let cited: HashSet<&str> = result
+            .extractions
+            .iter()
+            .flat_map(|ex| ex.observation_ids.iter().map(String::as_str))
+            .collect();
+        let mut listed: HashSet<String> = HashSet::new();
+        for id in std::mem::take(&mut result.no_durable_fact_ids) {
+            let drop = !allowed_ids.contains(id.as_str())
+                || cited.contains(id.as_str())
+                || listed.contains(&id);
+            if drop {
+                adjusted += 1;
+            } else {
+                listed.insert(id.clone());
+                kept.push(id);
+            }
+        }
+        // Sorted so the same repair records the same checkpoint bytes
+        // wherever the HashSet iteration order would differ.
+        let mut missing: Vec<&String> = allowed_ids
+            .iter()
+            .filter(|id| !cited.contains(id.as_str()) && !listed.contains(id.as_str()))
+            .collect();
+        missing.sort();
+        missing
+    };
+    adjusted += missing.len();
+    kept.extend(missing.drain(..).cloned());
+    result.no_durable_fact_ids = kept;
+    adjusted
 }
 
 fn chunked_source_ids(

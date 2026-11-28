@@ -140,6 +140,14 @@ version in [`docs/changelog/`](docs/changelog/):
   observer by using the same path rendering as its lifecycle hooks. (#2486)
 - Fixed OpenCode 2 token capture for native step completion events that
   identify the response with `assistantMessageID`. (#2486)
+- A map-reduce stage whose model reply left input observation ids unaccounted
+  no longer failed the session: an incomplete map block was re-mapped as its
+  two halves, recursively, and at the limit — a one-part block or any reduce
+  group — the unaccounted ids were counted as without a durable fact, so the
+  session kept its page instead of losing it. Finished sub-blocks checkpointed
+  under their own fingerprints, so a resume reused them without another LLM
+  call. Grounding stayed strict: an id cited outside the stage input still
+  failed terminally. (#2558)
 
 ## [3.6.5] - 2026-11-28
 

@@ -1480,9 +1480,16 @@ alvo de empacotamento dos estágios, não um teto por chamada. O map divide corp
 em partes ordenadas de no máximo 12.000 caracteres, mantendo o id de cada
 observação, e empacota essas partes em blocos até esse alvo; uma parte maior
 abre seu próprio bloco. Toda chamada tem teto rígido em `max_input_tokens`.
-Todo id do bloco precisa ser citado por uma extração fundamentada ou listado
-como sem fato durável; caso contrário a tarefa falha de forma terminal na
-primeira tentativa. O reduce funde as extrações até que o prompt final da página
+O grounding continua estrito: um id citado fora do input do estágio, ou uma
+extração vazia, acima do teto ou com confiança fora da faixa, derruba a tarefa
+de forma terminal. Buraco de cobertura não derruba: um bloco do map cuja
+resposta nova deixa ids do input sem contagem é refeito em duas metades, em
+ordem, recursivamente, e no limite — um bloco de uma parte só, ou qualquer
+grupo do reduce — os ids sem contagem entram em `no_durable_fact_ids` (um id
+citado e listado ao mesmo tempo sai da lista; um listado duas vezes ou fora do
+input do estágio é descartado), e a sessão mantém sua página. O ajuste é
+registrado em warn apenas com contagens, nunca texto de observação. O reduce
+funde as extrações até que o prompt final da página
 caiba em `max_input_tokens` (no máximo oito níveis). A página publicada leva um
 `consolidation_marker` no frontmatter: uma queda entre publicação e limpeza dos
 checkpoints reconcilia sem outra chamada ao LLM, enquanto uma página escrita pelo
@@ -1491,7 +1498,11 @@ agente nunca é reconciliada nem sobrescrita.
 Estágios concluídos ficam em `consolidation_chunk_progress`, com chave
 `(workspace_id, project_id, session_id, chunk_fingerprint)`. As fingerprints vêm
 de conteúdo (versões dos prompts, modelo, texto e ids das observações, posição no
-estágio), nunca de timestamp; as linhas são removidas após a publicação. Um
+estágio e, em uma metade re-mapeada, o marcador de divisão), nunca de
+timestamp; as linhas são removidas após a publicação. Uma metade re-mapeada
+grava checkpoint com fingerprint próprio, que nunca aliasa o de um bloco
+normal, e o bloco que falhou cobertura não grava nenhum — uma retomada reusa
+os sub-blocos prontos sem nova chamada ao LLM. Um
 checkpoint de outro escopo é invisível para uma retomada. A chave não pode
 ultrapassar `max_input_tokens`, e um valor positivo precisa deixar espaço para
 uma parte mínima do map mais os prompts fixos, com a margem de segurança
