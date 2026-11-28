@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept the ending of a long Cline prompt. The native hook's client cap, which
+  keeps the beginning and ending of a long prompt, did not look inside
+  Cline's `userPromptSubmit.prompt`, so the server cut the prompt to its
+  beginning and a trailing correction was lost. (#2562)
+
 ## [3.6.5] - 2026-11-28
 
 ### Security
