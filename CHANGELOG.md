@@ -137,7 +137,7 @@ version in [`docs/changelog/`](docs/changelog/):
   The default local probe is bounded, ignores client URL and proxy settings, and
   skips authentication resolution; the Dockerfile uses it while Compose
   templates inherit the selected image's healthcheck. It runs on the
-  current-thread runtime and avoids database-backed status diagnostics. (#NNN)
+  current-thread runtime and avoids database-backed status diagnostics. (#2554)
 
 ### Fixed
 
