@@ -47,6 +47,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `UMask=0077`, kernel/control-group restrictions). The unit still runs as the
   invoking user with a writable data directory ([#2537](https://github.com/akitaonrails/ai-memory/pull/2537))
 
+### Fixed
+
+- Preserved query signals when a project purge received a mismatched workspace and project ID (#2541).
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed
