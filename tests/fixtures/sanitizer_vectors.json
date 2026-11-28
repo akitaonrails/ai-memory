@@ -13,7 +13,10 @@
     {"input": "cfg foo_sk-abcdefghijklmnopqrstuvwxyz0123 done", "secret": "abcdefghijklmnop", "kept": ["cfg foo_", " done"]},
     {"input": "日本sk-abcdefghijklmnopqrstuvwxyz0123", "secret": "abcdefghijklmnop", "kept": ["日本"]},
     {"input": "?api_key%3Dsk-abcdefghijklmnopqrstuvwxyz0123", "secret": "abcdefghijklmnop", "kept": ["?api_key%3D"]},
-    {"input": "v9sk-abcdefghijklmnopqrstuvwxyz0123", "secret": "abcdefghijklmnop", "kept": ["v9"]}
+    {"input": "v9sk-abcdefghijklmnopqrstuvwxyz0123", "secret": "abcdefghijklmnop", "kept": ["v9"]},
+    {"input": "wordaim_ZZZZZZZZZZZZZZZZZZZ_sk-AAAAAAAAAAAAAAAAAAAA done", "secret": "ZZZZZZZZZZZZZZZZZZZ", "kept": ["word", " done"]},
+    {"input": "Authorization: Bearer aim_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZA.YYYYYYY end", "secret": "YYYYYYY", "kept": ["Authorization:", " end"]},
+    {"input": "\"Bearer ABCDEFGHIJ\\u200bBearer a\\u0069m_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZA=YYYYYYY\"", "secret": "YYYYYYY", "kept": ["\""]}
   ],
   "invisibles": [
     "\u200b",

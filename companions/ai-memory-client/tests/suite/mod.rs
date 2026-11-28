@@ -462,3 +462,61 @@ fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
         );
     }
 }
+
+/// Overlapping credential and bearer rules must merge spans before rewriting so
+/// inner matches never inject `[` and leave outer prefix/suffix fragments in
+/// clear, and one-layer JSON string escapes (`\u0069`, `\u200b`) must not hide
+/// a credential or let an earlier `Bearer` swallow a later one
+/// (GHSA-m7mm-crc8-ffcq).
+#[test]
+fn overlapping_credential_and_bearer_rules_leave_no_clear_fragment() {
+    let z19 = "Z".repeat(19);
+    let a20 = "A".repeat(20);
+    let z42 = "Z".repeat(42);
+
+    // 1. `sk-…` embedded inside an `aim_…` key.
+    let aim_with_sk = format!("wordaim_{z19}_sk-{a20}");
+    let out = sanitize_external_text(&aim_with_sk);
+    assert_eq!(out, "word[REDACTED CREDENTIAL]");
+    assert!(!out.contains(&z19) && !out.contains(&a20) && !out.contains("aim_"));
+    assert_eq!(sanitize_external_text(&out), out);
+
+    // 2. `aim_…` inside a `Bearer` token with a `.YYYYYYY` suffix.
+    let bearer_aim = format!("Authorization: Bearer aim_{z42}A.YYYYYYY");
+    let out = sanitize_external_text(&bearer_aim);
+    assert_eq!(out, "Authorization: Bearer [REDACTED CREDENTIAL]");
+    assert!(!out.contains(&z42) && !out.contains("YYYYYYY") && !out.contains("aim_"));
+    assert_eq!(sanitize_external_text(&out), out);
+
+    // 3. One-layer JSON-escaped prefix (`a\u0069m_…`).
+    let escaped_aim = format!(r#""a\u0069m_{z42}A""#);
+    let out = sanitize_external_text(&escaped_aim);
+    assert_eq!(out, r#""[REDACTED CREDENTIAL]""#);
+    assert!(!out.contains(&z42));
+    assert_eq!(sanitize_external_text(&out), out);
+
+    // 4. JSON string escaping both an invisible boundary (`\u200b`) and a
+    // prefix letter (`\u0069`).
+    let escaped_bearer = format!(r#""Bearer ABCDEFGH\u200bBearer a\u0069m_{z42}A=YYYYYYY""#);
+    let out = sanitize_external_text(&escaped_bearer);
+    assert!(
+        !out.contains("ABCDEFGH")
+            && !out.contains(&z42)
+            && !out.contains("YYYYYYY")
+            && !out.contains(r"a\u0069m_"),
+        "{escaped_bearer} -> {out}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&out).is_ok(),
+        "redaction must preserve valid JSON: {out}"
+    );
+    assert_eq!(sanitize_external_text(&out), out);
+
+    // Controls: Bearer-only emits `[REDACTED]`, and benign text stays unchanged.
+    let bearer_only = sanitize_external_text("Authorization: Bearer abcdefghijklmnop");
+    assert_eq!(bearer_only, "Authorization: Bearer [REDACTED]");
+    assert_eq!(sanitize_external_text(&bearer_only), bearer_only);
+
+    let benign = "wordaim_short and ordinary prose";
+    assert_eq!(sanitize_external_text(benign), benign);
+}
