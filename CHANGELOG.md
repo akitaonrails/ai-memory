@@ -135,7 +135,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Added `AI_MEMORY_WORKER_THREADS` and `AI_MEMORY_MAX_BLOCKING_THREADS` as
   process-level controls for the multi-thread Tokio runtime. Unset, malformed,
   or over-limit values independently preserve Tokio's native worker resolution
-  and default blocking cap. (#NNN)
+  and default blocking cap. (#2555)
 
 ### Fixed
 
