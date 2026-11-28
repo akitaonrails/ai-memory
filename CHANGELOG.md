@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Preferred `workspace_roots[0]` over per-command `cwd` for Cursor hook
+  payloads (identified by `cursor_version` or `agent=cursor`, including Cursor
+  running `~/.claude/settings.json` hooks) across the server, native CLI,
+  shell, and PowerShell extractors, falling back to `cwd` only when
+  `workspace_roots` is missing or empty. (#2546)
+
 ## [3.6.4] - 2026-11-27
 
 ### Fixed

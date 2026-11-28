@@ -159,6 +159,26 @@ pub fn extract_cwd(payload: &serde_json::Value) -> Option<String> {
 /// Fixture-backed canonical routing context shared by native marker routing and
 /// pre-spool capture. Only explicit agent payload shapes are accepted.
 pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option<String>) {
+    canonical_context_with_cursor(payload, false)
+}
+
+/// [`canonical_context`] with knowledge of the declared harness.
+///
+/// When `agent` is [`ai_memory_core::AgentKind::Cursor`] (or the payload carries
+/// a non-empty `cursor_version`), `workspace_roots[0]` takes precedence over
+/// top-level `cwd` so Cursor tool events stay anchored to the workspace root
+/// (#2546).
+pub fn canonical_context_for_agent(
+    agent: ai_memory_core::AgentKind,
+    payload: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    canonical_context_with_cursor(payload, agent == ai_memory_core::AgentKind::Cursor)
+}
+
+fn canonical_context_with_cursor(
+    payload: &serde_json::Value,
+    is_cursor_agent: bool,
+) -> (Option<String>, Option<String>) {
     let direct = |keys: &[&str]| {
         keys.iter().find_map(|key| {
             payload
@@ -176,9 +196,10 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
             .map(str::to_owned)
     };
     // `workspacePaths` is Antigravity's spelling, `workspace_roots` is
-    // Cursor's, and `workspaceRoots` is Cline's. Cursor never sends a usable top-level `cwd` — `sessionStart`
-    // / `sessionEnd` omit it and its tool events send `cwd: ""` — so without
-    // this the whole session resolves to no cwd and lands in `default/scratch`.
+    // Cursor's, and `workspaceRoots` is Cline's. Cursor tool events may carry
+    // either `cwd: ""` or a per-command directory alongside `workspace_roots`;
+    // prefer `workspace_roots[0]` for Cursor payloads and fall back to `cwd`
+    // only when `workspace_roots` is missing or empty (#2546).
     let first_array_path = |keys: &[&str]| {
         keys.iter().find_map(|key| {
             payload
@@ -193,21 +214,28 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
                 .map(str::to_owned)
         })
     };
-    let cwd = direct(&["cwd", "current_dir", "working_dir", "directory"])
-        .or_else(|| first_array_path(&["workspacePaths", "workspace_roots", "workspaceRoots"]))
-        .or_else(|| {
-            [
-                ["path", "cwd"].as_slice(),
-                ["info", "directory"].as_slice(),
-                ["properties", "info", "directory"].as_slice(),
-                ["event", "properties", "info", "directory"].as_slice(),
-                ["payload", "path", "cwd"].as_slice(),
-                ["payload", "info", "directory"].as_slice(),
-                ["payload", "properties", "info", "directory"].as_slice(),
-            ]
-            .iter()
-            .find_map(|path| nested(path))
-        });
+    let is_cursor = is_cursor_agent || direct(&["cursor_version"]).is_some();
+    let cwd = if is_cursor {
+        first_array_path(&["workspace_roots"])
+            .or_else(|| direct(&["cwd", "current_dir", "working_dir", "directory"]))
+            .or_else(|| first_array_path(&["workspacePaths", "workspaceRoots"]))
+    } else {
+        direct(&["cwd", "current_dir", "working_dir", "directory"])
+            .or_else(|| first_array_path(&["workspacePaths", "workspace_roots", "workspaceRoots"]))
+    }
+    .or_else(|| {
+        [
+            ["path", "cwd"].as_slice(),
+            ["info", "directory"].as_slice(),
+            ["properties", "info", "directory"].as_slice(),
+            ["event", "properties", "info", "directory"].as_slice(),
+            ["payload", "path", "cwd"].as_slice(),
+            ["payload", "info", "directory"].as_slice(),
+            ["payload", "properties", "info", "directory"].as_slice(),
+        ]
+        .iter()
+        .find_map(|path| nested(path))
+    });
     let session = direct(&[
         "session_id",
         "sessionId",
@@ -1966,6 +1994,52 @@ mod tests {
         assert_eq!(
             canonical_context(&tool_event).0,
             Some("/checkouts/repo-a".into())
+        );
+
+        // Cursor tool events carrying a non-empty per-command `cwd` alongside
+        // `workspace_roots` must prefer `workspace_roots[0]` (#2546).
+        for hook_event_name in ["postToolUse", "beforeShellExecution"] {
+            let tool_with_cwd = serde_json::json!({
+                "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+                "hook_event_name": hook_event_name,
+                "cursor_version": "2026.11.01",
+                "cwd": "/home/u/.config/foo",
+                "workspace_roots": ["/checkouts/repo-a"]
+            });
+            assert_eq!(
+                canonical_context(&tool_with_cwd).0,
+                Some("/checkouts/repo-a".into())
+            );
+        }
+
+        // Declared Cursor agent without `cursor_version` also prefers `workspace_roots`.
+        let no_version = serde_json::json!({
+            "session_id": "s-cursor",
+            "cwd": "/home/u/.config/foo",
+            "workspace_roots": ["/checkouts/repo-a"]
+        });
+        assert_eq!(
+            canonical_context_for_agent(ai_memory_core::AgentKind::Cursor, &no_version).0,
+            Some("/checkouts/repo-a".into())
+        );
+
+        // Empty `workspace_roots` falls back to `cwd`.
+        let empty_roots = serde_json::json!({
+            "session_id": "s-cursor",
+            "hook_event_name": "postToolUse",
+            "cursor_version": "2026.11.01",
+            "cwd": "/home/u/.config/foo",
+            "workspace_roots": []
+        });
+        assert_eq!(
+            canonical_context(&empty_roots).0,
+            Some("/home/u/.config/foo".into())
+        );
+
+        // Non-Cursor payload without `cursor_version` keeps `cwd`.
+        assert_eq!(
+            canonical_context(&no_version).0,
+            Some("/home/u/.config/foo".into())
         );
     }
 

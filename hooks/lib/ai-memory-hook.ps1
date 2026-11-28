@@ -1,15 +1,31 @@
-function Get-AiMemoryCwd {
-    param([string] $Payload)
+﻿function Get-AiMemoryCwd {
+    param([string] $Payload, [string] $Agent = "")
     if (-not $Payload) { return $null }
+    $IsCursorAgent = ($Agent -eq "cursor")
     try {
         $Parsed = $Payload | ConvertFrom-Json -ErrorAction Stop
+        $CursorVersion = $Parsed.cursor_version
+        $IsCursor = $IsCursorAgent -or ($CursorVersion -is [string] -and $CursorVersion.Trim().Length -gt 0)
+        # Cursor tool events send a per-command top-level `cwd` alongside
+        # `workspace_roots`. Prefer `workspace_roots[0]` for Cursor payloads
+        # and fall back to `cwd` only when `workspace_roots` is missing or empty (#2546).
+        if ($IsCursor) {
+            $Roots = $Parsed.workspace_roots
+            if ($Roots -is [System.Array]) {
+                foreach ($Root in $Roots) {
+                    if ($Root -is [string] -and $Root.Trim().Length -gt 0) {
+                        return $Root
+                    }
+                }
+            }
+        }
         foreach ($Name in @("cwd", "current_dir", "working_dir", "directory")) {
             $Value = $Parsed.$Name
             if ($Value -is [string] -and $Value.Length -gt 0) { return $Value }
         }
         # `workspacePaths` is Antigravity's spelling, `workspace_roots`
-        # Cursor's. Cursor never sends a usable `cwd` (session events omit it,
-        # tool events send ""), so the empty checks above fall through here.
+        # Cursor's. Older Cursor payloads omit `cwd` on session events and
+        # send `cwd: ""` on tool events, so the empty checks above fall through.
         foreach ($Name in @("workspacePaths", "workspace_roots")) {
             $Paths = $Parsed.$Name
             if ($null -ne $Paths -and $Paths.Count -gt 0 -and $Paths[0] -is [string] -and $Paths[0].Length -gt 0) {
@@ -17,6 +33,11 @@ function Get-AiMemoryCwd {
             }
         }
     } catch {
+    }
+    $IsCursorRegex = $IsCursorAgent -or [regex]::IsMatch($Payload, '"cursor_version"\s*:\s*"[^"\s][^"]*"')
+    if ($IsCursorRegex) {
+        $cursorRootMatch = [regex]::Match($Payload, '"workspace_roots"\s*:\s*\[\s*"([^"]+)"')
+        if ($cursorRootMatch.Success) { return $cursorRootMatch.Groups[1].Value }
     }
     $match = [regex]::Match($Payload, '"cwd"\s*:\s*"([^"]+)"')
     if ($match.Success) { return $match.Groups[1].Value }
@@ -29,7 +50,7 @@ function Get-AiMemoryCwd {
 
 function Resolve-AiMemoryCwd {
     param([string] $Payload, [string] $Agent)
-    $Cwd = Get-AiMemoryCwd -Payload $Payload
+    $Cwd = Get-AiMemoryCwd -Payload $Payload -Agent $Agent
     if ($Cwd) { return $Cwd }
     if ($Agent -eq "devin" -and $env:DEVIN_PROJECT_DIR) { return $env:DEVIN_PROJECT_DIR }
     if ($Agent -eq "devin") {
